@@ -1673,4 +1673,3 @@ uint32_t llama_model_quantize(
         return 1;
     }
 }
-

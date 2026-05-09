@@ -4,7 +4,11 @@
 #include "common.h"
 #include "reasoning-budget.cpp"
 
+#include <limits>
 #include <random>
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#endif
 #include <nlohmann/json.hpp>
 using json = nlohmann::ordered_json;
 
@@ -161,6 +165,9 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
                 break;
         }
     }
+
+    result->elb_idx = 0;
+    result->elb_search_pos = 0;
 
     return result;
 }
@@ -605,6 +612,10 @@ static llama_token_data_array llama_sampling_prepare_impl(
         llama_sample_apply_guidance(ctx_main, logits, logits_guidance, params.cfg_scale);
     }
 
+    if (ctx_sampling->elb_states.size() > ctx_sampling->elb_idx) {
+        common_expiring_logit_bias_apply(ctx_sampling, logits);
+    }
+
     cur.resize(n_vocab);
 
     if ((ctx_sampling->server_biases != nullptr) && (ctx_sampling->server_biases->size() == n_vocab)) {
@@ -699,6 +710,10 @@ void common_sampler_accept(
     if (ctx_sampling->smpl) {
         llama_sampler_dry_accept(ctx_sampling->smpl, token);
     }
+
+    if (ctx_sampling->elb_states.size() > ctx_sampling->elb_idx) {
+        common_expiring_logit_bias_accept(ctx_sampling, ctx_main);
+    }
 }
 
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
@@ -745,6 +760,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
+        gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
+
         common_sampler_accept(gsmpl, ctx, id, true);
 
         result.push_back(id);
@@ -757,6 +774,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
+        gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
+
         common_sampler_accept(gsmpl, ctx, id, true);
 
         result.push_back(id);
@@ -765,8 +784,85 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return result;
 }
 
+void common_expiring_logit_bias_apply(struct common_sampler* ctx_sampling, float* logits) {
+    auto index_first_inactive = [](auto countup, auto& tokens) {
+        return std::distance(
+            tokens.begin(),
+            std::upper_bound(tokens.begin(), tokens.end(), countup, [](const auto& countup, const auto& token) {
+                return countup > token.duration;
+            })
+        );
+    };
 
+    const auto& elb = ctx_sampling->elb_states[ctx_sampling->elb_idx];
 
+    std::string combined_text;
+    const std::string* search_window = &combined_text;
+    if (!ctx_sampling->drafted_text.empty()) {
+        // add speculated tokens
+        combined_text = ctx_sampling->to_generated_text != nullptr ? (
+            ctx_sampling->to_generated_text->substr(std::max(0, int32_t(ctx_sampling->to_generated_text->length()) - elb.max_cond_len))
+        ) : "" + ctx_sampling->drafted_text;
+    } else if (ctx_sampling->to_generated_text != nullptr) {
+        search_window = ctx_sampling->to_generated_text;
+    }
+
+    if (!search_window->empty() && !elb.other_tokens.empty() && (elb.other_tokens.front().duration > elb.countup)) {
+        const auto ifi = index_first_inactive(elb.countup, elb.other_tokens);
+        for (size_t j = 0; j < ifi; ++j) {
+            const auto& [id, bias, _, cond] = elb.other_tokens[j];
+            if (string_ends_with(*search_window, cond)) {
+                logits[id] += bias;
+            }
+        }
+    }
+
+    if (!elb.first_tokens.empty() && (elb.first_tokens.front().duration > elb.countup)) {
+        const auto ifi = index_first_inactive(elb.countup, elb.first_tokens);
+        if (search_window->empty()) {
+            // empty case here
+            for (size_t j = 0; j < ifi; ++j) {
+                logits[elb.first_tokens[j].id] += elb.first_tokens[j].bias;
+            }
+        } else {
+            for (size_t j = 0; j < ifi; ++j) {
+                const auto& [id, bias, _, cond] = elb.first_tokens[j];
+                // no bias if seen (probably too late)
+                if (!string_ends_with(*search_window, cond)) {
+                    logits[id] += bias;
+                }
+            }
+        }
+    }
+}
+
+void common_expiring_logit_bias_accept(struct common_sampler* ctx_sampling, struct llama_context * ctx_main) {
+    if (ctx_sampling->to_generated_text == nullptr) {
+        // prompt processing
+        return;
+    }
+
+    auto& elb = ctx_sampling->elb_states[ctx_sampling->elb_idx];
+    const int32_t exitword_len = elb.exitword.length();
+    if ((elb.delay > ++elb.countup) || (exitword_len == 0)) {
+        return;
+    }
+
+    const std::string search_window = ctx_sampling->to_generated_text->substr(std::min(
+        ctx_sampling->to_generated_text->length(),
+        size_t(ctx_sampling->elb_search_pos)
+    )) + common_token_to_piece(ctx_main, ctx_sampling->prev.back(), true);
+
+    const auto exitword_pos = search_window.find(elb.exitword);
+    if (exitword_pos != std::string::npos) {
+        ++ctx_sampling->elb_idx;
+        // no double counting characters that matched
+        ctx_sampling->elb_search_pos += exitword_pos + exitword_len;
+    } else {
+        // move search position to include next token
+        ctx_sampling->elb_search_pos += std::max(0, int32_t(search_window.length()) - exitword_len + 1);
+    }
+}
 
 
 template <>
@@ -792,22 +888,118 @@ common_grammar_trigger common_grammar_trigger::from_json(const json& in) {
     return out;
 }
 
-llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob) {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+__attribute__((target("avx2")))
+static bool common_sampler_speculative_top2_avx2(
+        const float * logits,
+        const int     n_vocab,
+        int &         best_id,
+        float &       max_val,
+        float &       second_val) {
+    if (n_vocab < 8) {
+        return false;
+    }
+
+    __m256  max_v    = _mm256_loadu_ps(logits);
+    __m256  second_v = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
+    __m256i id_v     = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+    const __m256i step = _mm256_set1_epi32(8);
+    __m256i cur_id = _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15);
+
+    int i = 8;
+    for (; i + 7 < n_vocab; i += 8) {
+        const __m256 x = _mm256_loadu_ps(logits + i);
+        const __m256 old_max = max_v;
+        const __m256 gt_max = _mm256_cmp_ps(x, max_v, _CMP_GT_OQ);
+
+        const __m256 second_no_max = _mm256_max_ps(second_v, x);
+        second_v = _mm256_blendv_ps(second_no_max, old_max, gt_max);
+        max_v = _mm256_blendv_ps(max_v, x, gt_max);
+        id_v = _mm256_blendv_epi8(id_v, cur_id, _mm256_castps_si256(gt_max));
+        cur_id = _mm256_add_epi32(cur_id, step);
+    }
+
+    alignas(32) float max_buf[8];
+    alignas(32) float second_buf[8];
+    alignas(32) int id_buf[8];
+    _mm256_store_ps(max_buf, max_v);
+    _mm256_store_ps(second_buf, second_v);
+    _mm256_store_si256((__m256i *) id_buf, id_v);
+
+    best_id = id_buf[0];
+    max_val = max_buf[0];
+    second_val = second_buf[0];
+
+    auto consider = [&](const float value, const int id) {
+        if (value > max_val) {
+            second_val = max_val;
+            max_val = value;
+            best_id = id;
+        } else if (value >= second_val) {
+            second_val = value;
+        }
+    };
+
+    for (int j = 1; j < 8; ++j) {
+        consider(max_buf[j], id_buf[j]);
+        consider(second_buf[j], -1);
+    }
+    for (; i < n_vocab; ++i) {
+        consider(logits[i], i);
+    }
+
+    return true;
+}
+#endif
+
+llama_token common_sampler_sample_speculative(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, float * out_prob, bool fast_p_min) {
     GGML_UNUSED(gsmpl);
 
     float * logits = llama_get_logits_ith(ctx, idx);
+    if (!logits) {
+        if (out_prob) {
+            *out_prob = 0.0f;
+        }
+        return -1;
+    }
+
     const int n_vocab = llama_n_vocab(llama_get_model(ctx));
 
+    const bool fast_prob = fast_p_min;
+    const bool track_second = out_prob && fast_prob;
+
     int best_id = 0;
+    float second_val = -std::numeric_limits<float>::infinity();
     float max_val = logits[0];
-    for (int i = 1; i < n_vocab; ++i) {
-        if (logits[i] > max_val) {
-            max_val = logits[i];
-            best_id = i;
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    static const bool has_avx2 = __builtin_cpu_supports("avx2");
+    const bool used_avx2 = track_second && has_avx2 &&
+        common_sampler_speculative_top2_avx2(logits, n_vocab, best_id, max_val, second_val);
+#else
+    const bool used_avx2 = false;
+#endif
+    if (!used_avx2) {
+        for (int i = 1; i < n_vocab; ++i) {
+            if (logits[i] > max_val) {
+                if (track_second) {
+                    second_val = max_val;
+                }
+                max_val = logits[i];
+                best_id = i;
+            } else if (track_second && logits[i] >= second_val) {
+                second_val = logits[i];
+            }
         }
     }
 
     if (out_prob) {
+        if (fast_prob) {
+            const double margin = (double)(max_val - second_val);
+            *out_prob = (float)(1.0 / (1.0 + exp(-margin)));
+            return best_id;
+        }
+
         double sum_exp = 0.0;
         for (int i = 0; i < n_vocab; ++i) {
             sum_exp += exp((double)(logits[i] - max_val));
