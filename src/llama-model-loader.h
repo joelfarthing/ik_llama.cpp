@@ -83,6 +83,7 @@ struct llama_model_loader {
     std::vector<ggml_context *> contexts;
 
     std::string arch_name;
+    llm_arch    arch      = LLM_ARCH_UNKNOWN;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
     llama_expert_tensor_index expert_tensor_index;
 
@@ -125,7 +126,7 @@ struct llama_model_loader {
 
     const std::string& get_arch_name() const { return arch_name; }
 
-    enum llm_arch get_arch() const { return llm_kv.arch; }
+    enum llm_arch get_arch() const { return arch; }
 
     const char * get_tensor_name(int i) const;
 
