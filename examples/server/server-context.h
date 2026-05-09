@@ -29,7 +29,7 @@ struct server_speculative_checkpoint {
     llama_token sampled = LLAMA_TOKEN_NULL;
     common_sampler * sampler = nullptr; // saved sampler state
 
-    void clear();
+    void clear(bool free_sampler = true);
 };
 
 struct server_slot {
@@ -167,6 +167,9 @@ struct server_slot {
     struct common_params_sampling sparams;
     common_sampler * ctx_sampling = nullptr;
 
+    // expiring logit bias
+    decltype(ctx_sampling->elb_states) elb_prev_states;
+
     bool has_mtp = false;
     std::vector<float> mtp_hidden_state;
 
@@ -176,6 +179,14 @@ struct server_slot {
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    int64_t t_spec_ckpt_save_us = 0;
+    int64_t t_spec_ckpt_restore_us = 0;
+    int64_t t_mtp_hidden_copy_us = 0;
+    int64_t t_mtp_accept_us = 0;
+    size_t n_spec_ckpt_save = 0;
+    size_t n_spec_ckpt_restore = 0;
+    size_t n_mtp_hidden_rows = 0;
+    size_t n_mtp_accept = 0;
 
     int32_t n_past_se = 0; // self-extend
 
@@ -250,6 +261,7 @@ struct server_context {
     std::vector<control_vector_container> control_vectors;
 
     std::vector<std::string> vocab_pieces;
+    size_t max_piece_len = 0;
 
     gpt_params params_base;
 
