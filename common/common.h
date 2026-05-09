@@ -177,6 +177,7 @@ struct common_params_speculative {
 
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min = 0.75f; // minimum speculative decoding probability (greedy)
+    bool    p_min_fast = false; // use margin-confidence proxy for speculative p_min
 
     // ngram-based speculative decoding
 
@@ -777,3 +778,5 @@ std::string string_format(const char* fmt, ...);
 //
 
 std::tuple<uint32_t, uint32_t, std::string, float> argparse_allowlist_unicode_rule(std::string argstr);
+
+void argparse_expiring_logit_bias(const std::string& content, common_params_sampling& sparams);
