@@ -38,6 +38,9 @@ llama_tokens common_speculative_draft(
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
+// feeds wall-clock feedback to the speculative autotuner after accept/reject maintenance is complete
+void common_speculative_feedback(common_speculative * spec, uint16_t n_accepted);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec, double slot_tps = 0.0, int n_decoded = 0, int n_past = 0, common_params_speculative * active_params = nullptr);
 
@@ -58,6 +61,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     struct llama_context * ctx,
     int n_draft,
     float p_min,
+    bool fast_p_min,
     llama_token id_last,
     int32_t n_past,
     llama_seq_id seq_id);
@@ -68,5 +72,6 @@ void mtp_accept_tokens(
     struct llama_context * ctx,
     const std::vector<llama_token> & ids,
     int32_t n_past_base,
-    llama_seq_id seq_id
+    llama_seq_id seq_id,
+    bool fast_p_min = false
 );
