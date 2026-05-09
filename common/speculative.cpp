@@ -11,6 +11,7 @@
 #include "suffix-tree.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -153,12 +154,13 @@ struct common_speculative_state {
 struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt;
     llama_context * ctx_mtp = nullptr;
-    common_sampler * smpl;
+    common_sampler * smpl = nullptr;
 
     common_speculative_state_mtp(
             enum common_speculative_type type,
             llama_context * ctx_tgt,
-            const llama_context_params & mtp_cparams)
+            const llama_context_params & mtp_cparams,
+            llama_context * ctx_mtp_preloaded = nullptr)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
     {
@@ -166,11 +168,16 @@ struct common_speculative_state_mtp : public common_speculative_state {
         params.samplers_sequence = {
             llama_sampler_type::DIST,
         };
-        smpl = common_sampler_init(llama_get_model(ctx_tgt), params);
 
         const llama_model * model = llama_get_model(ctx_tgt);
-        ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), mtp_cparams);
+        if (ctx_mtp_preloaded) {
+            ctx_mtp = ctx_mtp_preloaded;
+            LOG_INF("%s: using preloaded MTP sibling context (n_ctx=%d)\n", __func__, llama_n_ctx(ctx_mtp));
+        } else {
+            ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), mtp_cparams);
+        }
         if (ctx_mtp) {
+            smpl = common_sampler_init(llama_get_model(ctx_mtp), params);
             LOG_INF("%s: created MTP context (n_ctx=%d)\n", __func__, llama_n_ctx(ctx_mtp));
         } else {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
@@ -209,6 +216,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             ctx,
             params.n_max,
             params.p_min,
+            params.p_min_fast,
             id_last,
             n_past,
             seq_id
@@ -1104,8 +1112,10 @@ common_speculative * common_speculative_init(
             case COMMON_SPECULATIVE_TYPE_MTP: {
                 auto mtp_state = std::make_unique<common_speculative_state_mtp>(config.type,
                     /* .ctx_tgt      = */ ctx_tgt,
-                    /* .mtp_cparams  = */ params.cparams_dft
+                    /* .mtp_cparams  = */ params.cparams_dft,
+                    /* .ctx_mtp_preloaded = */ ctx_dft
                 );
+                ctx_dft = nullptr;
                 if (!mtp_state->ctx_mtp) {
                     LOG_ERR("%s: failed to create MTP context\n", __func__);
                     return nullptr;
@@ -1219,6 +1229,15 @@ struct mtp_last_embd {
     int   last_id = -1;
 };
 
+struct mtp_accept_profile {
+    size_t  n_calls = 0;
+    size_t  n_tokens = 0;
+    int64_t t_batch_us = 0;
+    int64_t t_update_us = 0;
+    int64_t t_sample_us = 0;
+    int64_t t_free_us = 0;
+};
+
 // Hopefully never called concurrently from multiple threads
 static mtp_last_embd & mtp_get_last_embd(const llama_context * ctx) {
     static std::unordered_map<const llama_context *, mtp_last_embd> map;
@@ -1228,6 +1247,32 @@ static mtp_last_embd & mtp_get_last_embd(const llama_context * ctx) {
         last.embd.resize(n_embd);
     }
     return last;
+}
+
+static mtp_accept_profile & mtp_get_accept_profile(const llama_context * ctx) {
+    static std::unordered_map<const llama_context *, mtp_accept_profile> map;
+    return map[ctx];
+}
+
+static void mtp_print_accept_profile(const llama_context * ctx) {
+    if (std::getenv("IK_MTP_PROFILE") == nullptr) {
+        return;
+    }
+    if (!ctx) {
+        return;
+    }
+    const auto & prof = mtp_get_accept_profile(ctx);
+    if (prof.n_calls == 0) {
+        return;
+    }
+
+    LOG_INF("statistics mtp accept: #calls = %zu, #tokens = %zu, batch = %.3f ms, update = %.3f ms, sample = %.3f ms, free = %.3f ms\n",
+            prof.n_calls,
+            prof.n_tokens,
+            prof.t_batch_us / 1000.0,
+            prof.t_update_us / 1000.0,
+            prof.t_sample_us / 1000.0,
+            prof.t_free_us / 1000.0);
 }
 
 llama_tokens common_speculative_draft(
@@ -1275,15 +1320,6 @@ llama_tokens common_speculative_draft(
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
-    if (spec->tuner && spec->tuner->enabled && spec->t_step_start_us > 0) {
-        int64_t step_time_us = ggml_time_us() - spec->t_step_start_us;
-        double step_tps = (step_time_us > 100)
-            ? (n_accepted + 1.0) * 1e6 / (double)step_time_us
-            : 0.0;
-        spec->tuner->accept_feedback(n_accepted, spec->last_n_drafted, step_tps);
-        spec->t_step_start_us = 0;
-    }
-
     common_speculative_state * impl = spec->curr_impl;
 
     if (!impl) {
@@ -1299,6 +1335,17 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
 
         impl->accept(n_accepted);
         impl->n_call_accept++;
+    }
+}
+
+void common_speculative_feedback(common_speculative * spec, uint16_t n_accepted) {
+    if (spec->tuner && spec->tuner->enabled && spec->t_step_start_us > 0) {
+        int64_t step_time_us = ggml_time_us() - spec->t_step_start_us;
+        double step_tps = (step_time_us > 100)
+            ? (n_accepted + 1.0) * 1e6 / (double)step_time_us
+            : 0.0;
+        spec->tuner->accept_feedback(n_accepted, spec->last_n_drafted, step_tps);
+        spec->t_step_start_us = 0;
     }
 }
 
@@ -1327,6 +1374,13 @@ void common_speculative_print_stats(const common_speculative * spec, double slot
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_perf.c_str());
+
+        if (impl->type == COMMON_SPECULATIVE_TYPE_MTP) {
+            const auto * mtp_state = dynamic_cast<const common_speculative_state_mtp *>(impl.get());
+            if (mtp_state) {
+                mtp_print_accept_profile(mtp_state->ctx_mtp);
+            }
+        }
     }
 
     if (spec->tuner && spec->tuner->enabled && slot_tps > 0.0 && n_decoded > 0) {
@@ -1375,6 +1429,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     struct llama_context * ctx,
     int n_draft,
     float p_min,
+    bool fast_p_min,
     llama_token id_last,
     int32_t n_past,
     llama_seq_id seq_id) {
@@ -1398,8 +1453,11 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     auto & last = mtp_get_last_embd(ctx);
     int i0 = 0;
+
     if (last.last_id >= 0) {
         if (last.prob < p_min) {
+            llama_batch_free(mtp_batch);
+            llama_set_mtp_op_type(ctx, MTP_OP_NONE);
             return drafts;
         }
         current_input_id = last.last_id;
@@ -1418,9 +1476,12 @@ std::vector<llama_token> mtp_speculative_gen_draft(
             break;
         }
 
-        llama_token id_next = common_sampler_sample_speculative(smpl, ctx, 0, prob_ptr);
+        llama_token id_next = common_sampler_sample_speculative(smpl, ctx, 0, prob_ptr, fast_p_min);
+        if (id_next < 0) {
+            break;
+        }
         if (i > 0 && prob_ptr && prob < p_min) {
-            return drafts;
+            break;
         }
 
         drafts.push_back(id_next);
@@ -1472,13 +1533,19 @@ void mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, b
     llama_batch mtp_batch = batch;
     if (is_prompt_warmup) {
         llama_set_mtp_op_type(ctx, MTP_OP_WARMUP);
+        // We don't need the logits when doing warmup
+        for (int i = 0; i < mtp_batch.n_tokens; ++i) {
+            mtp_batch.logits[i] = false;
+        }
+        // This is just in case to not run into empty tensor issues
+        mtp_batch.logits[mtp_batch.n_tokens-1] = true;
     } else {
         llama_set_mtp_op_type(ctx, MTP_OP_UPDATE_ACCEPTED);
+        for (int i = 0; i < mtp_batch.n_tokens; ++i) {
+            mtp_batch.logits[i] = i == mtp_batch.n_tokens - 1;
+        }
     }
 
-    for (int i = 0; i < mtp_batch.n_tokens; ++i) {
-        mtp_batch.logits[i] = true;
-    }
     llama_decode(ctx, mtp_batch);
     llama_set_mtp_op_type(ctx, MTP_OP_NONE);
 }
@@ -1487,25 +1554,38 @@ void mtp_accept_tokens(
     struct llama_context * ctx,
     const std::vector<llama_token> & ids,
     int32_t n_past_base,
-    llama_seq_id seq_id) {
+    llama_seq_id seq_id,
+    bool fast_p_min) {
     if (ids.empty()) {
         return;
     }
 
+    auto & prof = mtp_get_accept_profile(ctx);
+    prof.n_calls++;
+    prof.n_tokens += ids.size();
+
+    const int64_t t_batch_start_us = ggml_time_us();
     llama_batch accepted_batch = llama_batch_init(ids.size(), 0, 1);
     for (size_t i = 0; i < ids.size(); ++i) {
         common_batch_add(accepted_batch, ids[i], n_past_base + i, { seq_id }, true);
     }
+    prof.t_batch_us += ggml_time_us() - t_batch_start_us;
 
+    const int64_t t_update_start_us = ggml_time_us();
     mtp_update_kv_cache(ctx, accepted_batch, false);
+    prof.t_update_us += ggml_time_us() - t_update_start_us;
 
+    const int64_t t_sample_start_us = ggml_time_us();
     auto & last = mtp_get_last_embd(ctx);
     auto embd = llama_get_embeddings_ith(ctx, ids.size() - 1);
     if (embd) {
         std::memcpy(last.embd.data(), embd, last.embd.size()*sizeof(float));
         llama_set_draft_input_hidden_state(ctx, last.embd.data());
-        last.last_id = common_sampler_sample_speculative(nullptr, ctx, ids.size() - 1, &last.prob);
+        last.last_id = common_sampler_sample_speculative(nullptr, ctx, ids.size() - 1, &last.prob, fast_p_min);
     }
+    prof.t_sample_us += ggml_time_us() - t_sample_start_us;
 
+    const int64_t t_free_start_us = ggml_time_us();
     llama_batch_free(accepted_batch);
+    prof.t_free_us += ggml_time_us() - t_free_start_us;
 }

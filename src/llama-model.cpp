@@ -503,6 +503,10 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_GATE_SHEXP,     "blk.%d.ffn_gate_shexp" },
             { LLM_TENSOR_FFN_DOWN_SHEXP,     "blk.%d.ffn_down_shexp" },
             { LLM_TENSOR_FFN_UP_SHEXP,       "blk.%d.ffn_up_shexp" },
+            { LLM_TENSOR_NEXTN_EH_PROJ,      "blk.%d.nextn.eh_proj" },
+            { LLM_TENSOR_NEXTN_ENORM,        "blk.%d.nextn.enorm" },
+            { LLM_TENSOR_NEXTN_HNORM,        "blk.%d.nextn.hnorm" },
+            { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "blk.%d.nextn.shared_head_norm" },
         },
     },
     {
@@ -1612,6 +1616,17 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
     },
 };
 
+static llm_arch llm_arch_for_tensor_names(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35MOE_MTP:
+            return LLM_ARCH_QWEN35MOE;
+        case LLM_ARCH_QWEN35_MTP:
+            return LLM_ARCH_QWEN35;
+        default:
+            return arch;
+    }
+}
+
 std::string LLM_TN::operator()(llm_tensor tensor) const {
     auto& map = LLM_TENSOR_NAMES.at(arch);
     if (auto it = map.find(tensor); it != map.end()) {
@@ -1874,7 +1889,12 @@ bool llama_model_is_hybrid(const llama_model * model) {
 }
 
 bool llama_model_has_recurrent(const llama_model * model) {
-    return llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch);
+    for (uint32_t i = 0; i < model->hparams.n_layer; ++i) {
+        if (model->hparams.is_recurrent(i)) {
+            return true;
+        }
+    }
+    return llm_arch_is_recurrent(model->arch);
 }
 
 bool llama_model_is_split_mode_graph(const struct llama_model * model) {
@@ -1882,7 +1902,7 @@ bool llama_model_is_split_mode_graph(const struct llama_model * model) {
 }
 
 llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int il) {
-    auto it = LLM_TENSOR_NAMES.find(arch);
+    auto it = LLM_TENSOR_NAMES.find(llm_arch_for_tensor_names(arch));
     if (it == LLM_TENSOR_NAMES.end()) {
         printf("%s: Oops, did not find arch\n", __func__);
         return LLM_TENSOR_UNKNOWN;
@@ -1914,6 +1934,10 @@ llm_tensor llm_tensor_type(llm_arch arch, const std::string & tensor_name, int i
 
 size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const {
     if (il < 0 || il >= hparams.n_layer) return 0;
+    const bool mtp_only = arch == LLM_ARCH_QWEN35_MTP || arch == LLM_ARCH_QWEN35MOE_MTP;
+    if (mtp_only && hparams.nextn_predict_layers > 0 && il < hparams.n_layer - hparams.nextn_predict_layers) {
+        return 0;
+    }
     if (hparams.recurrent_layer_arr[il]) {
         auto state_sots = std::min<uint32_t>(std::max<uint32_t>(1, n_seq_max), kv_size);
         return hparams.n_embd_v_s() * state_sots * sizeof(float);
