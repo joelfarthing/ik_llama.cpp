@@ -29,7 +29,8 @@ bool common_speculative_is_compat(llama_context * ctx_tgt);
 
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt);
+        llama_context             * ctx_tgt,
+        llama_context             * ctx_mtp_shared = nullptr);
 
 void common_speculative_free(common_speculative * spec);
 

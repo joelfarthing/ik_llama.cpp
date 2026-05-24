@@ -67,6 +67,12 @@ static bool server_mtp_profile_enabled() {
     return enabled;
 }
 
+static bool server_mtp_shared_context_enabled() {
+    static const bool enabled = std::getenv("IK_MTP_SHARED_CONTEXT") != nullptr ||
+                                std::getenv("IK_MTP_SHARED_CTX") != nullptr;
+    return enabled;
+}
+
 static server_mtp_profile & server_mtp_prof() {
     static server_mtp_profile profile;
     return profile;
@@ -280,6 +286,30 @@ static bool server_speculative_has_mtp(const common_params_speculative & spec) {
     return spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
 }
 
+static bool server_batch_has_seq_id_other_than(const llama_batch & batch, llama_seq_id seq_id) {
+    if (batch.n_tokens <= 0) {
+        return false;
+    }
+
+    if (batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        return true;
+    }
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] <= 0 || batch.seq_id[i] == nullptr) {
+            return true;
+        }
+
+        for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
+            if (batch.seq_id[i][j] != seq_id) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 static bool server_speculative_same_stage_types(
         const common_params_speculative & lhs,
         const common_params_speculative & rhs) {
@@ -396,6 +426,10 @@ server_context::~server_context() {
         common_speculative_free(slot.spec);
         llama_batch_free(slot.batch_spec);
     }
+    if (ctx_mtp_shared) {
+        llama_free(ctx_mtp_shared);
+        ctx_mtp_shared = nullptr;
+    }
 
     llama_batch_free(batch);
 }
@@ -419,20 +453,43 @@ bool server_context::load_model(const gpt_params& params_) {
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
 
+    bool has_draft_model = !params_base.speculative.model.empty() || !params_base.speculative.params.empty();
     if (params_base.has_mtp && params_base.n_parallel > 1) {
-        LOG_WARNING("MTP is not supported with parallel slots yet, disabling MTP to avoid cross-slot corruption.\n", {
-            {"n_parallel", params_base.n_parallel},
-        });
-        params_base.has_mtp = false;
-        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
-            params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+        const bool recurrent_flash_attn = llama_model_has_recurrent(model) && params_base.flash_attn;
+        const bool can_use_shared_self_mtp = server_mtp_shared_context_enabled() && !has_draft_model && !recurrent_flash_attn;
+        if (can_use_shared_self_mtp) {
+            LOG_WARNING("experimental shared MTP context enabled for parallel slots\n", {
+                {"n_parallel", params_base.n_parallel},
+            });
+            if (llama_model_has_recurrent(model) &&
+                    params_base.speculative.recurrent_ckpt_mode != LLAMA_SPEC_CKPT_CPU) {
+                // The GPU per-step recurrent checkpoint buffers are currently context-global.
+                // Until they are made multi-slot aware, shared parallel MTP must use the CPU path.
+                LOG_WARNING("forcing CPU recurrent checkpoints for experimental shared parallel MTP\n", {
+                    {"n_parallel", params_base.n_parallel},
+                });
+                params_base.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_CPU;
+            }
+        } else {
+            if (server_mtp_shared_context_enabled() && !has_draft_model && recurrent_flash_attn) {
+                LOG_WARNING("experimental shared MTP context with recurrent parallel slots requires --no-flash-attn; disabling MTP\n", {
+                    {"n_parallel", params_base.n_parallel},
+                });
+            }
+            LOG_WARNING("MTP is not supported with parallel slots yet, disabling MTP to avoid cross-slot corruption.\n", {
+                {"n_parallel", params_base.n_parallel},
+            });
+            params_base.has_mtp = false;
+            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+            }
+            params_base.speculative.model.clear();
+            params_base.speculative.params.clear();
+            params_base.speculative.model_dft = nullptr;
+            has_draft_model = false;
         }
-        params_base.speculative.model.clear();
-        params_base.speculative.params.clear();
-        params_base.speculative.model_dft = nullptr;
     }
 
-    bool has_draft_model = !params_base.speculative.model.empty() || !params_base.speculative.params.empty();
     std::string& mmproj_path = params_base.mmproj.path;
     if (!mmproj_path.empty()) {
         mtmd_context_params mparams = mtmd_context_params_default();
@@ -596,6 +653,16 @@ void server_context::init() {
                 slot.has_mtp = true;
                 slot.params.speculative.cparams_dft = params_base.speculative.cparams_dft;
 
+                if (server_mtp_shared_context_enabled() && params_base.n_parallel > 1 &&
+                        params_base.speculative.model_dft == nullptr && ctx_mtp_shared == nullptr) {
+                    ctx_mtp_shared = llama_init_from_model(model, params_base.speculative.cparams_dft);
+                    if (ctx_mtp_shared == nullptr) {
+                        SRV_ERR("%s", "failed to initialize shared MTP context\n");
+                        throw std::runtime_error("shared MTP context initialization failed");
+                    }
+                    SRV_INF("shared MTP context initialized for %d parallel slots\n", params_base.n_parallel);
+                }
+
                 slot.batch_spec = llama_batch_init(slot.params.speculative.get_max_stage_n_max() + 1, 0, 1);
                 SLT_DBG(slot, "batch_spec contains %d tokens\n", slot.batch_spec.n_tokens);
 
@@ -622,7 +689,10 @@ void server_context::init() {
         }
         // try speculative decoding
         if (can_spec && requested_spec) {
-            slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
+            llama_context * ctx_mtp_shared_for_slot = slot.has_mtp && server_mtp_shared_context_enabled()
+                ? ctx_mtp_shared
+                : nullptr;
+            slot.spec = common_speculative_init(params_base.speculative, slot.ctx, ctx_mtp_shared_for_slot);
             if (slot.spec) {
                 if (mctx && !slot.has_mtp) {
                     SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
@@ -4093,6 +4163,13 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     continue;
                 }
 
+                // Hybrid recurrent models keep local state per sequence. Avoid prompt batches that
+                // mix repeated tokens from more than one sequence; decode batches with one token per
+                // active slot can still be batched by add_sampled_tokens().
+                if (llama_model_has_recurrent(model) && server_batch_has_seq_id_other_than(batch, slot.id)) {
+                    continue;
+                }
+
                 // keep only the common part
                 // remove the non-common part from the cache
                 if (slot.n_past < 0)
@@ -4181,6 +4258,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 int32_t ga_n = slot.ga_n;
                 int32_t ga_w = slot.ga_w;
 
+                const int32_t batch_tokens_before_prompt = batch.n_tokens;
+
                 // add prompt tokens for processing in the current batch
                 // TODO: the self-extend stuff here is a mess - simplify and/or abstract it somehow
                 while (slot.n_past_prompt < slot.n_prompt_tokens && batch.n_tokens < n_batch) {
@@ -4248,6 +4327,10 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         {"n_ctx",    n_ctx},
                         {"n_tokens", batch.n_tokens},
                         });
+                }
+
+                if (llama_model_has_recurrent(model) && batch.n_tokens > batch_tokens_before_prompt) {
+                    break;
                 }
             }
 

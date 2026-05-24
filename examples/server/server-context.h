@@ -269,6 +269,7 @@ struct server_context {
     // For speculative decoding
     llama_model* model_draft = nullptr;
     llama_context* ctx_draft = nullptr;
+    llama_context* ctx_mtp_shared = nullptr;
     llama_context_params cparams_dft;
 
     int32_t n_ctx; // total context for all clients / slots
