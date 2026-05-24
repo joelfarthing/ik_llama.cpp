@@ -4,7 +4,9 @@
 #include "json-schema-to-grammar.h"
 #include <nlohmann/json_fwd.hpp>
 
+#include <climits>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 
@@ -389,7 +391,7 @@ struct server_context {
 
     void extend_context(const int32_t n_tokens);
 
-    void speculative_decoding_accept();
+    void speculative_decoding_accept(int32_t batch_start = 0, int32_t batch_end = INT32_MAX);
 
     bool accept_special_token(const server_slot& slot, const llama_token token);
 

@@ -12,6 +12,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -30,6 +31,8 @@ struct server_mtp_profile {
     server_mtp_profile_phase add_sampled_total;
     server_mtp_profile_phase ensure_hidden;
     server_mtp_profile_phase speculative_draft;
+    server_mtp_profile_phase speculative_draft_batched;
+    server_mtp_profile_phase defer_active_for_prompt;
     server_mtp_profile_phase process_batch_decode;
     server_mtp_profile_phase prompt_mtp_warmup;
 
@@ -73,6 +76,12 @@ static bool server_mtp_shared_context_enabled() {
     return enabled;
 }
 
+static bool server_mtp_batched_draft_enabled() {
+    static const bool enabled = std::getenv("IK_MTP_BATCH_DRAFT") != nullptr ||
+                                std::getenv("IK_MTP_BATCHED_DRAFT") != nullptr;
+    return enabled;
+}
+
 static server_mtp_profile & server_mtp_prof() {
     static server_mtp_profile profile;
     return profile;
@@ -87,6 +96,14 @@ static void server_mtp_prof_add(server_mtp_profile_phase & phase, int64_t t0, si
         return;
     }
     phase.us += ggml_time_us() - t0;
+    phase.calls++;
+    phase.events += events;
+}
+
+static void server_mtp_prof_count(server_mtp_profile_phase & phase, size_t events = 1) {
+    if (!server_mtp_profile_enabled()) {
+        return;
+    }
     phase.calls++;
     phase.events += events;
 }
@@ -127,10 +144,12 @@ static void server_mtp_profile_print() {
     }
 
     const auto & p = server_mtp_prof();
-    LOG_INF("profile mtp server loop: %s, %s, %s, %s, %s\n",
+    LOG_INF("profile mtp server loop: %s, %s, %s, %s, %s, %s, %s\n",
             server_mtp_prof_fmt("add_sampled_total", p.add_sampled_total).c_str(),
             server_mtp_prof_fmt("ensure_hidden", p.ensure_hidden).c_str(),
             server_mtp_prof_fmt("spec_draft", p.speculative_draft).c_str(),
+            server_mtp_prof_fmt("spec_draft_batched", p.speculative_draft_batched).c_str(),
+            server_mtp_prof_fmt("defer_active_for_prompt", p.defer_active_for_prompt).c_str(),
             server_mtp_prof_fmt("main_decode", p.process_batch_decode).c_str(),
             server_mtp_prof_fmt("prompt_mtp_warmup", p.prompt_mtp_warmup).c_str());
     LOG_INF("profile mtp server ckpt_save: %s, %s, %s, %s, %s\n",
@@ -308,6 +327,31 @@ static bool server_batch_has_seq_id_other_than(const llama_batch & batch, llama_
     }
 
     return false;
+}
+
+static bool server_batch_needs_recurrent_seq_split(const llama_batch & batch, int32_t begin, int32_t n_tokens) {
+    if (n_tokens <= 1 || batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        return false;
+    }
+
+    std::vector<llama_seq_id> seen;
+    seen.reserve(n_tokens);
+    bool has_repeated_seq = false;
+
+    for (int32_t i = begin; i < begin + n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr) {
+            return true;
+        }
+
+        const llama_seq_id seq_id = batch.seq_id[i][0];
+        if (std::find(seen.begin(), seen.end(), seq_id) != seen.end()) {
+            has_repeated_seq = true;
+        } else {
+            seen.push_back(seq_id);
+        }
+    }
+
+    return has_repeated_seq && seen.size() > 1;
 }
 
 static bool server_speculative_same_stage_types(
@@ -3747,17 +3791,130 @@ void server_context::context_shift() {
     }
 }
 
+static void server_add_speculative_tokens_to_batch(server_slot & slot, llama_batch & batch, llama_tokens draft) {
+    const int n_draft_max = slot.get_n_draft_max();
+
+    if (draft.size() > (size_t)n_draft_max) {
+        if (slot.params.speculative.autotune) {
+            // expected near end-of-response when autotune shrinks n_max
+            SLT_DBG(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+        } else {
+            SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
+        }
+        draft.resize(n_draft_max);
+    }
+
+    // add the sampled token to the batch
+    slot.i_batch_dft.push_back(batch.n_tokens);
+    common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
+    slot.cache_tokens.push_back(slot.sampled);
+
+    const int min_usable_draft = slot.params.speculative.get_min_usable_stage_n_min();
+    if (min_usable_draft > (int)draft.size()) {
+        SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int)draft.size(), min_usable_draft);
+        // fallback to normal decoding
+        slot.i_batch = slot.i_batch_dft[0];
+        slot.drafted.clear();
+        slot.drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+        slot.i_batch_dft.clear();
+    } else {
+        // keep track of total number of drafted tokens tested
+        slot.n_draft_total += draft.size();
+
+        // add all drafted tokens to the batch
+        for (size_t i = 0; i < draft.size(); i++) {
+            slot.i_batch_dft.push_back(batch.n_tokens);
+            common_batch_add(batch, draft[i], slot.cache_tokens.pos_next(), { slot.id }, true);
+            slot.cache_tokens.push_back(draft[i]);
+        }
+        slot.drafted = std::move(draft);
+    }
+}
+
 void server_context::add_sampled_tokens() {
     server_mtp_profile_scope scope(server_mtp_prof().add_sampled_total);
-    for (auto& slot : slots) {
+    for (auto & slot : slots) {
         slot.released = false;
+    }
+
+    const bool defer_active_for_pending_prompt =
+        server_mtp_batched_draft_enabled() &&
+        ctx_mtp_shared != nullptr &&
+        llama_model_has_recurrent(model) &&
+        std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT;
+        });
+
+    std::vector<int> batch_drafted_slot_ids;
+    if (server_mtp_batched_draft_enabled() && ctx_mtp_shared != nullptr) {
+        std::vector<server_slot *> batch_slots;
+        std::vector<common_speculative_mtp_draft_input> batch_inputs;
+
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_IDLE || !slot.has_mtp || slot.spec == nullptr) {
+                continue;
+            }
+            if (slot.params.speculative.has_composite_stage_chain() || slot.params.speculative.autotune) {
+                continue;
+            }
+            if (slot.get_n_draft_max() <= 0 || common_speculative_get_companion_ctx(slot.spec) != ctx_mtp_shared) {
+                continue;
+            }
+
+            const llama_pos draft_base_pos = slot.cache_tokens.pos_next();
+            const int64_t t0 = server_mtp_prof_now();
+            if (!common_speculative_ensure_sequence_hidden(slot.spec, ctx, slot.id, draft_base_pos - 1)) {
+                LOG_ERROR("MTP hidden state is empty during batched speculation", {});
+                continue;
+            }
+            server_mtp_prof_add(server_mtp_prof().ensure_hidden, t0);
+
+            batch_slots.push_back(&slot);
+            batch_inputs.push_back(common_speculative_mtp_draft_input {
+                slot.spec,
+                &slot.params.speculative,
+                slot.sampled,
+                draft_base_pos,
+                slot.id,
+            });
+        }
+
+        if (batch_inputs.size() > 1) {
+            std::vector<llama_tokens> batch_drafts;
+            const int64_t t0 = server_mtp_prof_now();
+            if (common_speculative_draft_mtp_batch(batch_inputs, batch_drafts)) {
+                server_mtp_prof_add(server_mtp_prof().speculative_draft, t0, batch_inputs.size());
+                server_mtp_prof_add(server_mtp_prof().speculative_draft_batched, t0, batch_inputs.size());
+                for (size_t i = 0; i < batch_slots.size(); ++i) {
+                    auto & slot = *batch_slots[i];
+                    slot.drafted_spec_type = common_speculative_current_type(slot.spec);
+                    server_add_speculative_tokens_to_batch(slot, batch, std::move(batch_drafts[i]));
+                    slot.n_past = slot.cache_tokens.n_tokens();
+                    batch_drafted_slot_ids.push_back(slot.id);
+                }
+            }
+        }
+    }
+
+    for (auto& slot : slots) {
         if (slot.state == SLOT_STATE_IDLE) {
             continue;
         }
+        if (defer_active_for_pending_prompt &&
+            slot.has_mtp &&
+            slot.spec != nullptr &&
+            common_speculative_get_companion_ctx(slot.spec) == ctx_mtp_shared) {
+            server_mtp_prof_count(server_mtp_prof().defer_active_for_prompt);
+            SLT_DBG(slot, "%s", "deferring active MTP generation until pending recurrent prompt reaches decode\n");
+            continue;
+        }
+        if (std::find(batch_drafted_slot_ids.begin(), batch_drafted_slot_ids.end(), slot.id) != batch_drafted_slot_ids.end()) {
+            continue;
+        }
 
-        // generate draft tokens in speculative decoding mode
-        // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
-        //       perform the speculative drafting for all sequences at the same time in a single batch
+        // Generate draft tokens in speculative decoding mode. The env-gated
+        // shared self-MTP path above covers [TAG_SERVER_SPEC_REWORK]; keep this
+        // serial fallback for non-MTP, composite, autotune, and unsupported shapes.
         const int n_draft_max_pre = slot.get_n_draft_max();
         if (n_draft_max_pre > 0) {
             if (mctx && !slot.has_mtp) {
@@ -3792,43 +3949,7 @@ void server_context::add_sampled_tokens() {
             server_mtp_prof_add(server_mtp_prof().speculative_draft, t0);
             slot.drafted_spec_type = common_speculative_current_type(slot.spec);
 
-            const int n_draft_max = slot.get_n_draft_max();
-
-            if (draft.size() > (size_t)n_draft_max) {
-                if (slot.params.speculative.autotune) {
-                    // expected near end-of-response when autotune shrinks n_max
-                    SLT_DBG(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
-                } else {
-                    SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
-                }
-                draft.resize(n_draft_max);
-            }
-
-            // add the sampled token to the batch
-            slot.i_batch_dft.push_back(batch.n_tokens);
-            common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
-            slot.cache_tokens.push_back(slot.sampled);
-
-            const int min_usable_draft = slot.params.speculative.get_min_usable_stage_n_min();
-            if (min_usable_draft > (int)draft.size()) {
-                SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int)draft.size(), min_usable_draft);
-                // fallback to normal decoding
-                slot.i_batch = slot.i_batch_dft[0];
-                slot.drafted.clear();
-                slot.drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
-                slot.i_batch_dft.clear();
-            } else {
-                // keep track of total number of drafted tokens tested
-                slot.n_draft_total += draft.size();
-
-                // add all drafted tokens to the batch
-                for (size_t i = 0; i < draft.size(); i++) {
-                    slot.i_batch_dft.push_back(batch.n_tokens);
-                    common_batch_add(batch, draft[i], slot.cache_tokens.pos_next(), { slot.id }, true);
-                    slot.cache_tokens.push_back(draft[i]);
-                }
-                slot.drafted = std::move(draft);
-            }
+            server_add_speculative_tokens_to_batch(slot, batch, std::move(draft));
         }
         else {
             // no speculative decoding
@@ -4492,10 +4613,19 @@ static void restore_speculative_checkpoint(
     discard_speculative_checkpoint(slot, ctx);
 }
 
-void server_context::speculative_decoding_accept() {
+void server_context::speculative_decoding_accept(int32_t batch_start, int32_t batch_end) {
     for (auto& slot : slots) {
         if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
             continue;
+        }
+        if (!std::all_of(slot.i_batch_dft.begin(), slot.i_batch_dft.end(), [&](int32_t i_batch) {
+            return i_batch >= batch_start && i_batch < batch_end;
+        })) {
+            continue;
+        }
+
+        for (int32_t & i_batch : slot.i_batch_dft) {
+            i_batch -= batch_start;
         }
 
         server_mtp_profile_scope scope(server_mtp_prof().spec_accept_total, slot.drafted.size());
@@ -4924,8 +5054,7 @@ void server_context::update_allowlist_state(server_slot& slot) {
 }
 
 void server_context::process_batch_tokens(int32_t & n_batch) {
-    for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
-        const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+    auto process_range = [&](int32_t i, int32_t n_tokens) -> bool {
         extend_context(n_tokens);
 
         llama_batch batch_view = {
@@ -4943,7 +5072,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         const int ret = llama_decode(ctx, batch_view);
         server_mtp_prof_add(server_mtp_prof().process_batch_decode, t0, n_tokens);
         if (ret != 0) {
-            if (n_batch == 1 || ret < 0) {
+            if (n_tokens == 1 || ret < 0) {
                 int user_cancel = -3;
                 if (ret == user_cancel) {
                     LLAMA_LOG_INFO("Decode process is cancelled by user.\n");
@@ -4972,11 +5101,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                         send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
                     }
                 }
-                break; // break loop of n_batch
+                return true; // fatal for active slots, but no retry for this range
             }
             // retry with half the batch size to try to find a free slot in the KV cache
-            n_batch /= 2;
-            i -= n_batch;
+            n_batch = std::max<int32_t>(1, n_tokens / 2);
 
             LOG_WARNING("failed to find free space in the KV cache, retrying with smaller batch size - try increasing it via the context size or enable defragmentation", {
                 {"i",   i},
@@ -4984,27 +5112,27 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 {"ret",   ret},
                 });
 
-            continue; // continue loop of n_batch
+            return false; // retry from this range with the smaller n_batch
         }
 
-    if (server_speculative_has_mtp(params_base.speculative)) {
-        for (auto & slot : slots) {
-            if (!slot.spec || !slot.has_mtp) {
-                continue;
-            }
+        if (server_speculative_has_mtp(params_base.speculative)) {
+            for (auto & slot : slots) {
+                if (!slot.spec || !slot.has_mtp) {
+                    continue;
+                }
 
-            if ((slot.state != SLOT_STATE_PROCESSING || slot.n_decoded != 0) &&
-                (slot.state != SLOT_STATE_IDLE || slot.command != SLOT_COMMAND_LOAD_PROMPT)) {
-                continue;
-            }
+                if ((slot.state != SLOT_STATE_PROCESSING || slot.n_decoded != 0) &&
+                    (slot.state != SLOT_STATE_IDLE || slot.command != SLOT_COMMAND_LOAD_PROMPT)) {
+                    continue;
+                }
 
-            t0 = server_mtp_prof_now();
-            if (common_speculative_on_target_seq_batch(slot.spec, ctx, batch_view, slot.id, true) != 0) {
-                LOG_ERROR("failed to warm up MTP state from prompt batch for slot %d\n", slot.id);
+                t0 = server_mtp_prof_now();
+                if (common_speculative_on_target_seq_batch(slot.spec, ctx, batch_view, slot.id, true) != 0) {
+                    LOG_ERROR("failed to warm up MTP state from prompt batch for slot %d\n", slot.id);
+                }
+                server_mtp_prof_add(server_mtp_prof().prompt_mtp_warmup, t0, n_tokens);
             }
-            server_mtp_prof_add(server_mtp_prof().prompt_mtp_warmup, t0, n_tokens);
         }
-    }
 
         for (auto& slot : slots) {
             bool is_active_slot = (slot.state == SLOT_STATE_PROCESSING);
@@ -5121,7 +5249,41 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             slot.i_batch = -1;
         }
         // speculative decoding - main model sample and accept
-        speculative_decoding_accept();
+        speculative_decoding_accept(i, i + n_tokens);
+        return true;
+    };
+
+    for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
+        const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+
+        if (llama_model_has_recurrent(model) && server_batch_needs_recurrent_seq_split(batch, i, n_tokens)) {
+            int32_t j = i;
+            while (j < i + n_tokens) {
+                int32_t k = j + 1;
+                if (batch.n_seq_id != nullptr && batch.seq_id != nullptr &&
+                    batch.n_seq_id[j] == 1 && batch.seq_id[j] != nullptr) {
+                    const llama_seq_id seq_id = batch.seq_id[j][0];
+                    while (k < i + n_tokens &&
+                           batch.n_seq_id[k] == 1 &&
+                           batch.seq_id[k] != nullptr &&
+                           batch.seq_id[k][0] == seq_id) {
+                        ++k;
+                    }
+                }
+
+                if (!process_range(j, k - j)) {
+                    i = j - n_batch;
+                    break;
+                }
+                j = k;
+            }
+            continue;
+        }
+
+        if (!process_range(i, n_tokens)) {
+            i -= n_batch;
+            continue;
+        }
     }
 }
 

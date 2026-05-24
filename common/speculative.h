@@ -7,6 +7,14 @@
 
 struct common_speculative;
 
+struct common_speculative_mtp_draft_input {
+    common_speculative       * spec = nullptr;
+    common_params_speculative * params = nullptr;
+    llama_token                id_last = LLAMA_TOKEN_NULL;
+    llama_pos                  draft_base_pos = -1;
+    llama_seq_id               seq_id = 0;
+};
+
 using common_speculative_feature_kind = llama_spec_feature_kind;
 using common_speculative_feature_row_view = llama_spec_feature_row_view;
 using common_speculative_feature_view = llama_spec_feature_view;
@@ -46,6 +54,14 @@ llama_tokens common_speculative_draft(
                             llama_token   id_last,
                             llama_pos     draft_base_pos = -1,
                             llama_seq_id  draft_seq_id = 0);
+
+// Env/experiment helper for self-MTP server batching: draft the same MTP step for
+// multiple sequences in one companion-context decode. Returns false if the inputs
+// are not a narrow pure-MTP shared-context shape; callers should fall back to the
+// regular per-slot common_speculative_draft path.
+bool common_speculative_draft_mtp_batch(
+        const std::vector<common_speculative_mtp_draft_input> & inputs,
+        std::vector<llama_tokens> & results);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);

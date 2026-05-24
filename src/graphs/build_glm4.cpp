@@ -20,7 +20,7 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
     if (cparams.mtp_op_type != MTP_OP_NONE) {
         ggml_tensor* hidden_states_from_main_model;
 
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
+        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED || n_tokens > 1) {
             hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
         } else {
             hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);

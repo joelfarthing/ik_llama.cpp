@@ -2482,6 +2482,257 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     return drafts;
 }
 
+bool common_speculative_draft_mtp_batch(
+        const std::vector<common_speculative_mtp_draft_input> & inputs,
+        std::vector<llama_tokens> & results) {
+    results.clear();
+    results.resize(inputs.size());
+
+    if (inputs.size() < 2) {
+        return false;
+    }
+
+    struct mtp_batch_item {
+        common_speculative * spec = nullptr;
+        common_speculative_state * impl = nullptr;
+        common_speculative_state_mtp * state = nullptr;
+        common_params_speculative params;
+        llama_seq_id seq_id = 0;
+        llama_pos n_past = 0;
+        llama_pos current_n_past = 0;
+        llama_token current_input_id = LLAMA_TOKEN_NULL;
+        mtp_last_embd * last = nullptr;
+        std::vector<float> hidden;
+        int n_draft = 0;
+        int i = 0;
+        int i0 = 0;
+        int n_decode = 0;
+        float p_min = 0.0f;
+        bool active = false;
+    };
+
+    std::vector<mtp_batch_item> items;
+    items.reserve(inputs.size());
+
+    llama_context * ctx = nullptr;
+    int n_embd = 0;
+
+    for (const auto & input : inputs) {
+        if (input.spec == nullptr || input.params == nullptr || input.draft_base_pos < 0) {
+            return false;
+        }
+        if (input.params->autotune || (input.spec->tuner && input.spec->tuner->enabled)) {
+            return false;
+        }
+        if (input.spec->impls.size() != 1 || input.spec->configs.size() != 1) {
+            return false;
+        }
+
+        auto * impl = input.spec->impls[0].get();
+        auto * state = dynamic_cast<common_speculative_state_mtp *>(impl);
+        if (impl == nullptr || state == nullptr || state->ctx_mtp == nullptr || state->constant_draft_positions) {
+            return false;
+        }
+
+        if (ctx == nullptr) {
+            ctx = state->ctx_mtp;
+            n_embd = state->n_embd;
+        } else if (ctx != state->ctx_mtp || n_embd != state->n_embd) {
+            return false;
+        }
+
+        const auto runtime_stages = input.params->get_resolved_stages();
+        const bool use_runtime_stage_overrides = common_speculative_stage_chain_matches(runtime_stages, input.spec->configs);
+        const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[0] : input.spec->configs[0].stage;
+        if (runtime_stage.type != COMMON_SPECULATIVE_TYPE_MTP) {
+            return false;
+        }
+
+        auto hidden_it = state->target_hidden_by_seq.find(input.seq_id);
+        if (hidden_it == state->target_hidden_by_seq.end() || (int) hidden_it->second.size() != n_embd) {
+            return false;
+        }
+
+        mtp_batch_item item;
+        item.spec = input.spec;
+        item.impl = impl;
+        item.state = state;
+        item.params = common_speculative_get_runtime_params(input.spec->configs[0], *input.params, runtime_stage);
+        item.seq_id = input.seq_id;
+        item.n_past = input.draft_base_pos;
+        item.current_n_past = input.draft_base_pos;
+        item.current_input_id = input.id_last;
+        item.last = &mtp_get_last_embd(*state, input.seq_id);
+        item.hidden = hidden_it->second;
+        item.n_draft = item.params.n_max;
+        item.p_min = item.params.p_min;
+
+        if (item.n_draft <= 0) {
+            mtp_invalidate_cached_draft(*state, input.seq_id);
+            items.push_back(std::move(item));
+            continue;
+        }
+
+        int64_t t0 = mtp_profile_now();
+        common_sampler_reset(state->smpl);
+        mtp_profile_add(mtp_profile().gen_sampler_reset, t0);
+
+        if (item.last->last_id >= 0) {
+            if (item.last->prob < item.p_min) {
+                item.n_draft = 1;
+            }
+            item.current_input_id = item.last->last_id;
+            item.last->last_id = -1;
+            results[items.size()].push_back(item.current_input_id);
+            item.current_n_past++;
+            t0 = mtp_profile_now();
+            item.hidden = item.last->embd;
+            mtp_profile_add(mtp_profile().gen_set_cached_hidden, t0, item.hidden.size());
+            item.i0 = 1;
+            item.i = 1;
+        }
+
+        item.active = item.i < item.n_draft && (int) item.hidden.size() == n_embd;
+        items.push_back(std::move(item));
+    }
+
+    if (ctx == nullptr || n_embd <= 0) {
+        return false;
+    }
+
+    const int64_t t_batch_start = ggml_time_us();
+    int64_t t0 = mtp_profile_now();
+    llama_batch mtp_batch = llama_batch_init(inputs.size(), 0, 1);
+    mtp_profile_add(mtp_profile().gen_batch_init, t0);
+    t0 = mtp_profile_now();
+    llama_set_mtp_op_type(ctx, MTP_OP_DRAFT_GEN);
+    mtp_profile_add(mtp_profile().gen_set_op, t0);
+
+    bool any_active = true;
+    while (any_active) {
+        any_active = false;
+        mtp_batch.n_tokens = 0;
+
+        std::vector<size_t> active_items;
+        active_items.reserve(items.size());
+        std::vector<float> hidden_rows;
+        hidden_rows.reserve(items.size() * (size_t) n_embd);
+
+        for (size_t i = 0; i < items.size(); ++i) {
+            auto & item = items[i];
+            if (!item.active) {
+                continue;
+            }
+
+            any_active = true;
+            const llama_pos draft_pos = item.current_n_past;
+            t0 = mtp_profile_now();
+            common_batch_add(mtp_batch, item.current_input_id, draft_pos, { item.seq_id }, true);
+            mtp_profile_add(mtp_profile().gen_add_batch, t0);
+            hidden_rows.insert(hidden_rows.end(), item.hidden.begin(), item.hidden.end());
+            active_items.push_back(i);
+            item.n_decode++;
+        }
+
+        if (!any_active) {
+            break;
+        }
+
+        t0 = mtp_profile_now();
+        if (!llama_set_draft_input_hidden_state_copy(ctx, hidden_rows.data(), hidden_rows.size())) {
+            mtp_profile_add(mtp_profile().gen_set_hidden, t0, hidden_rows.size());
+            break;
+        }
+        mtp_profile_add(mtp_profile().gen_set_hidden, t0, hidden_rows.size());
+
+        t0 = mtp_profile_now();
+        if (llama_decode(ctx, mtp_batch) != 0) {
+            mtp_profile_add(mtp_profile().gen_decode, t0, active_items.size());
+            break;
+        }
+        mtp_profile_add(mtp_profile().gen_decode, t0, active_items.size());
+
+        for (size_t row = 0; row < active_items.size(); ++row) {
+            auto & item = items[active_items[row]];
+
+            float prob = 0.0f;
+            float * prob_ptr = item.p_min > 0 ? &prob : nullptr;
+            t0 = mtp_profile_now();
+            const llama_token id_next = common_sampler_sample_speculative(item.state->smpl, ctx, row, prob_ptr);
+            mtp_profile_add(mtp_profile().gen_sample, t0);
+
+            if (item.i > 0 && prob_ptr && prob < item.p_min) {
+                item.active = false;
+                continue;
+            }
+
+            results[active_items[row]].push_back(id_next);
+
+            t0 = mtp_profile_now();
+            const float * emb = llama_get_embeddings_ith(ctx, row);
+            mtp_profile_add(mtp_profile().gen_get_embd, t0);
+            if (emb == nullptr) {
+                item.active = false;
+                continue;
+            }
+
+            t0 = mtp_profile_now();
+            memcpy(item.last->embd.data(), emb, n_embd * sizeof(float));
+            mtp_profile_add(mtp_profile().gen_copy_hidden, t0, n_embd);
+            item.hidden = item.last->embd;
+
+            item.current_input_id = id_next;
+            item.current_n_past++;
+            item.i++;
+
+            if (prob_ptr && prob < item.p_min) {
+                item.active = false;
+            } else {
+                item.active = item.i < item.n_draft;
+            }
+        }
+    }
+
+    t0 = mtp_profile_now();
+    llama_batch_free(mtp_batch);
+    mtp_profile_add(mtp_profile().gen_batch_free, t0);
+    t0 = mtp_profile_now();
+    llama_set_mtp_op_type(ctx, MTP_OP_NONE);
+    mtp_profile_add(mtp_profile().gen_reset_op, t0);
+
+    for (auto & item : items) {
+        if (item.n_decode > 0) {
+            t0 = mtp_profile_now();
+            llama_kv_cache_seq_rm(ctx, item.seq_id, item.n_past + 1 - item.i0, item.n_past + item.n_decode + 2);
+            mtp_profile_add(mtp_profile().gen_kv_rm, t0);
+        }
+    }
+
+    const int64_t t_elapsed = ggml_time_us() - t_batch_start;
+    const int64_t t_per_item = t_elapsed / (int64_t) std::max<size_t>(1, items.size());
+    mtp_profile_add(mtp_profile().draft_total, t_batch_start, items.size());
+    mtp_profile_add(mtp_profile().gen_total, t_batch_start, items.size());
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        auto & item = items[i];
+        item.spec->t_step_start_us = ggml_time_us();
+        item.spec->curr_impl = nullptr;
+        item.impl->t_draft_us += t_per_item;
+        item.impl->n_call_draft++;
+        item.spec->last_n_drafted = (int) results[i].size();
+
+        if (results[i].empty()) {
+            continue;
+        }
+
+        item.spec->curr_impl = item.impl;
+        item.impl->n_gen_drafts++;
+        item.impl->n_gen_tokens += results[i].size();
+    }
+
+    return true;
+}
+
 
 int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup, bool need_last_logits) {
     mtp_profile_scope scope(mtp_profile().update_total, batch.n_tokens);
