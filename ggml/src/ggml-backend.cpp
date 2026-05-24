@@ -1340,6 +1340,50 @@ static char * fmt_size(size_t size) {
     return buffer;
 }
 
+static bool ggml_backend_sched_moe_copy_ledger_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_MOE_COPY_LEDGER");
+        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_backend_sched_moe_plan_ledger_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_MOE_PLAN_LEDGER");
+        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_backend_sched_moe_copy_ledger_layer(const char * name) {
+    const char * p = strstr(name, "blk.");
+    if (p == nullptr) {
+        return -1;
+    }
+
+    p += 4;
+    char * end = nullptr;
+    const long layer = strtol(p, &end, 10);
+    return end != p ? (int) layer : -1;
+}
+
+static const char * ggml_backend_sched_moe_copy_ledger_family(const char * name) {
+    if (strstr(name, "ffn_gate_up_exps") != nullptr) {
+        return "ffn_gate_up_exps";
+    }
+    if (strstr(name, "ffn_gate_exps") != nullptr) {
+        return "ffn_gate_exps";
+    }
+    if (strstr(name, "ffn_up_exps") != nullptr) {
+        return "ffn_up_exps";
+    }
+    if (strstr(name, "ffn_down_exps") != nullptr) {
+        return "ffn_down_exps";
+    }
+    return "unknown";
+}
+
 static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     int cur_split = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -1972,8 +2016,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
-        std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
+        std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * & last_ids_tensor) {
     if (split->n_inputs < 1) return;
+    const bool moe_copy_ledger = ggml_backend_sched_moe_copy_ledger_enabled();
+    const bool moe_plan_ledger = ggml_backend_sched_moe_plan_ledger_enabled();
     constexpr bool k_set_sync = false;
     int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2033,12 +2079,19 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
 
                 int n_expert = node->src[0]->ne[2];
 
+                bool ids_cache_hit = ids_tensor == last_ids_tensor;
+                int64_t ids_get_us = 0;
+                int64_t ids_sync_us = 0;
+                int64_t unique_us = 0;
                 if (ids_tensor != last_ids_tensor) {
+                    const int64_t ids_get_start_us = moe_plan_ledger ? ggml_time_us() : 0;
                     ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
 
                     ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
 
+                    const int64_t ids_sync_start_us = moe_plan_ledger ? ggml_time_us() : 0;
                     ggml_backend_synchronize(ids_backend);
+                    const int64_t unique_start_us = moe_plan_ledger ? ggml_time_us() : 0;
                     needs_sync[tensor_backend_id(ids_tensor)] = k_set_sync;
 
                     unique_ids.resize((n_expert + 31)/32);
@@ -2049,6 +2102,12 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                             unique_ids[id >> 5] |= (1u << (id & 31));
                         }
                     }
+                    if (moe_plan_ledger) {
+                        const int64_t unique_end_us = ggml_time_us();
+                        ids_get_us = ids_sync_start_us - ids_get_start_us;
+                        ids_sync_us = unique_start_us - ids_sync_start_us;
+                        unique_us = unique_end_us - unique_start_us;
+                    }
 
                     last_ids_tensor = ids_tensor;
                 }
@@ -2056,18 +2115,34 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 const size_t expert_size = input->ne[2] > 1 ? input->nb[2] : input->nb[1];
 
                 if (input->ne[2] > 1) {
+                    int ledger_spans = 0;
+                    int ledger_unique_experts = 0;
+                    size_t ledger_ideal_bytes = 0;
+                    size_t ledger_copied_bytes = 0;
+                    size_t ledger_padding_bytes = 0;
+                    int64_t span_plan_us = 0;
+                    int64_t copy_submit_us = 0;
 
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = 512;
                         const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
+                        const size_t copy_size = expert_size_copy + padding_end;
+
+                        if (moe_copy_ledger) {
+                            ledger_spans++;
+                            ledger_unique_experts += last_id - first_id + 1;
+                            ledger_ideal_bytes += expert_size_copy;
+                            ledger_copied_bytes += copy_size;
+                            ledger_padding_bytes += padding_end;
+                        }
 
                         ggml_backend_tensor_set_async(split_backend,
                                 input_cpy,
                                 (const uint8_t *)input->data + expert_offset, expert_offset,
                                 // copy a bit extra to ensure there are no NaNs in the padding
-                                expert_size_copy + padding_end);
+                                copy_size);
 
                     };
 
@@ -2080,16 +2155,147 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                         return id;
                     };
 
-                    int first_id = next_on_id(0);
-                    while (first_id < n_expert) {
-                        int last_id = next_off_id(first_id+1);
-                        copy_experts(first_id, last_id-1);
-                        first_id = next_on_id(last_id);
+                    if (moe_plan_ledger) {
+                        struct span {
+                            int32_t first;
+                            int32_t last;
+                        };
+
+                        std::vector<span> spans;
+                        spans.reserve(n_expert);
+
+                        const int64_t span_plan_start_us = ggml_time_us();
+                        int first_id = next_on_id(0);
+                        while (first_id < n_expert) {
+                            int last_id = next_off_id(first_id+1);
+                            spans.push_back({ first_id, last_id - 1 });
+                            first_id = next_on_id(last_id);
+                        }
+                        span_plan_us = ggml_time_us() - span_plan_start_us;
+
+                        const int64_t copy_submit_start_us = ggml_time_us();
+                        for (const auto & span : spans) {
+                            copy_experts(span.first, span.last);
+                        }
+                        copy_submit_us = ggml_time_us() - copy_submit_start_us;
+                    } else {
+                        int first_id = next_on_id(0);
+                        while (first_id < n_expert) {
+                            int last_id = next_off_id(first_id+1);
+                            copy_experts(first_id, last_id-1);
+                            first_id = next_on_id(last_id);
+                        }
+                    }
+
+                    if (moe_copy_ledger) {
+                        fprintf(stderr,
+                                "ggml_moe_copy_ledger mode=active_spans op=%s node=%s tensor=%s family=%s layer=%d "
+                                "backend_src=%s backend_dst=%s ids_tensor=%s ids_ptr=%p ids_ne0=%lld ids_ne1=%lld "
+                                "total_experts=%d unique_experts=%d spans=%d expert_size=%zu tensor_bytes=%zu "
+                                "ideal_bytes=%zu copied_bytes=%zu padding_bytes=%zu\n",
+                                ggml_op_name(node->op),
+                                node->name,
+                                input->name,
+                                ggml_backend_sched_moe_copy_ledger_family(input->name),
+                                ggml_backend_sched_moe_copy_ledger_layer(input->name),
+                                input_backend ? ggml_backend_name(input_backend) : "unknown",
+                                ggml_backend_name(split_backend),
+                                ids_tensor->name,
+                                (void *) ids_tensor,
+                                (long long) ids_tensor->ne[0],
+                                (long long) ids_tensor->ne[1],
+                                n_expert,
+                                ledger_unique_experts,
+                                ledger_spans,
+                                expert_size,
+                                ggml_nbytes(input),
+                                ledger_ideal_bytes,
+                                ledger_copied_bytes,
+                                ledger_padding_bytes);
+                    }
+
+                    if (moe_plan_ledger) {
+                        fprintf(stderr,
+                                "ggml_moe_plan_ledger mode=active_spans op=%s node=%s tensor=%s family=%s layer=%d "
+                                "ids_tensor=%s ids_ptr=%p ids_cache_hit=%d ids_bytes=%zu ids_ne0=%lld ids_ne1=%lld "
+                                "total_experts=%d unique_experts=%d spans=%d ids_get_us=%lld ids_sync_us=%lld "
+                                "unique_us=%lld span_plan_us=%lld copy_submit_us=%lld copied_bytes=%zu\n",
+                                ggml_op_name(node->op),
+                                node->name,
+                                input->name,
+                                ggml_backend_sched_moe_copy_ledger_family(input->name),
+                                ggml_backend_sched_moe_copy_ledger_layer(input->name),
+                                ids_tensor->name,
+                                (void *) ids_tensor,
+                                ids_cache_hit ? 1 : 0,
+                                ggml_nbytes(ids_tensor),
+                                (long long) ids_tensor->ne[0],
+                                (long long) ids_tensor->ne[1],
+                                n_expert,
+                                ledger_unique_experts,
+                                ledger_spans,
+                                (long long) ids_get_us,
+                                (long long) ids_sync_us,
+                                (long long) unique_us,
+                                (long long) span_plan_us,
+                                (long long) copy_submit_us,
+                                ledger_copied_bytes);
                     }
 
                 } else {
+                    const int64_t copy_submit_start_us = moe_plan_ledger ? ggml_time_us() : 0;
                     auto copy_size = ggml_nbytes(input);
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, copy_size);
+                    const int64_t copy_submit_us = moe_plan_ledger ? ggml_time_us() - copy_submit_start_us : 0;
+
+                    if (moe_copy_ledger) {
+                        fprintf(stderr,
+                                "ggml_moe_copy_ledger mode=full_tensor op=%s node=%s tensor=%s family=%s layer=%d "
+                                "backend_src=%s backend_dst=%s ids_tensor=%s ids_ptr=%p ids_ne0=%lld ids_ne1=%lld "
+                                "total_experts=%d unique_experts=0 spans=0 expert_size=%zu tensor_bytes=%zu "
+                                "ideal_bytes=%zu copied_bytes=%zu padding_bytes=0\n",
+                                ggml_op_name(node->op),
+                                node->name,
+                                input->name,
+                                ggml_backend_sched_moe_copy_ledger_family(input->name),
+                                ggml_backend_sched_moe_copy_ledger_layer(input->name),
+                                input_backend ? ggml_backend_name(input_backend) : "unknown",
+                                ggml_backend_name(split_backend),
+                                ids_tensor->name,
+                                (void *) ids_tensor,
+                                (long long) ids_tensor->ne[0],
+                                (long long) ids_tensor->ne[1],
+                                n_expert,
+                                expert_size,
+                                ggml_nbytes(input),
+                                copy_size,
+                                copy_size);
+                    }
+
+                    if (moe_plan_ledger) {
+                        fprintf(stderr,
+                                "ggml_moe_plan_ledger mode=full_tensor op=%s node=%s tensor=%s family=%s layer=%d "
+                                "ids_tensor=%s ids_ptr=%p ids_cache_hit=%d ids_bytes=%zu ids_ne0=%lld ids_ne1=%lld "
+                                "total_experts=%d unique_experts=0 spans=0 ids_get_us=%lld ids_sync_us=%lld "
+                                "unique_us=%lld span_plan_us=0 copy_submit_us=%lld copied_bytes=%zu\n",
+                                ggml_op_name(node->op),
+                                node->name,
+                                input->name,
+                                ggml_backend_sched_moe_copy_ledger_family(input->name),
+                                ggml_backend_sched_moe_copy_ledger_layer(input->name),
+                                ids_tensor->name,
+                                (void *) ids_tensor,
+                                ids_cache_hit ? 1 : 0,
+                                ggml_nbytes(ids_tensor),
+                                (long long) ids_tensor->ne[0],
+                                (long long) ids_tensor->ne[1],
+                                n_expert,
+                                (long long) ids_get_us,
+                                (long long) ids_sync_us,
+                                (long long) unique_us,
+                                (long long) copy_submit_us,
+                                copy_size);
+                    }
                 }
 
             } else
