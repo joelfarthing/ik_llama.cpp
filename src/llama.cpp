@@ -101,11 +101,13 @@ void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_conte
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <functional>
 #include <future>
+#include <iomanip>
 #include <initializer_list>
 #include <locale>
 #include <map>
@@ -582,6 +584,164 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
            u_batch.n_tokens == the_prev->n_tokens &&
            cparams.mtp_op_type == the_prev->mtp_op_type &&
            update_cache_copies();
+}
+
+struct llama_mtp_decode_profile_phase {
+    uint64_t calls = 0;
+    uint64_t tokens = 0;
+    uint64_t outputs = 0;
+    uint64_t graph_reuse_hits = 0;
+    uint64_t graph_reuse_misses = 0;
+    uint64_t final_resets = 0;
+
+    int64_t total_us = 0;
+    int64_t prelude_us = 0;
+    int64_t reuse_check_us = 0;
+    int64_t sched_reset_us = 0;
+    int64_t build_graph_us = 0;
+    int64_t alloc_graph_us = 0;
+    int64_t prepare_mtp_inputs_us = 0;
+    int64_t set_inputs_us = 0;
+    int64_t graph_compute_us = 0;
+    int64_t logits_us = 0;
+    int64_t embeddings_us = 0;
+    int64_t final_reset_us = 0;
+};
+
+struct llama_mtp_decode_profile_state {
+    std::array<llama_mtp_decode_profile_phase, 4> phases;
+    std::mutex mutex;
+};
+
+struct llama_mtp_decode_profile_call {
+    bool enabled = false;
+    llama_mtp_op_type op = MTP_OP_NONE;
+    uint64_t tokens = 0;
+    uint64_t outputs = 0;
+    uint64_t graph_reuse_hits = 0;
+    uint64_t graph_reuse_misses = 0;
+
+    int64_t t_start_us = 0;
+    int64_t prelude_us = 0;
+    int64_t reuse_check_us = 0;
+    int64_t sched_reset_us = 0;
+    int64_t build_graph_us = 0;
+    int64_t alloc_graph_us = 0;
+    int64_t prepare_mtp_inputs_us = 0;
+    int64_t set_inputs_us = 0;
+    int64_t graph_compute_us = 0;
+    int64_t logits_us = 0;
+    int64_t embeddings_us = 0;
+};
+
+static bool llama_mtp_decode_profile_enabled() {
+    static const bool enabled = std::getenv("IK_MTP_DECODE_PROFILE") != nullptr ||
+                                std::getenv("IK_MTP_SERVER_PROFILE") != nullptr ||
+                                std::getenv("IK_MTP_PROFILE") != nullptr;
+    return enabled;
+}
+
+static bool llama_mtp_decode_profile_sync() {
+    static const bool enabled = std::getenv("IK_MTP_DECODE_PROFILE_SYNC") != nullptr;
+    return enabled;
+}
+
+static llama_mtp_decode_profile_state & llama_mtp_decode_profile() {
+    static llama_mtp_decode_profile_state profile;
+    return profile;
+}
+
+static const char * llama_mtp_decode_profile_op_name(llama_mtp_op_type op) {
+    switch (op) {
+        case MTP_OP_WARMUP:          return "warmup";
+        case MTP_OP_UPDATE_ACCEPTED: return "update_accepted";
+        case MTP_OP_DRAFT_GEN:       return "draft_gen";
+        case MTP_OP_NONE:            return "none";
+    }
+
+    return "unknown";
+}
+
+static bool llama_mtp_decode_profile_is_profiled_op(llama_mtp_op_type op) {
+    return op == MTP_OP_WARMUP || op == MTP_OP_UPDATE_ACCEPTED || op == MTP_OP_DRAFT_GEN;
+}
+
+static void llama_mtp_decode_profile_commit(const llama_mtp_decode_profile_call & call) {
+    if (!call.enabled || !llama_mtp_decode_profile_is_profiled_op(call.op)) {
+        return;
+    }
+
+    auto & profile = llama_mtp_decode_profile();
+    std::lock_guard<std::mutex> lock(profile.mutex);
+    auto & phase = profile.phases[(int) call.op];
+    phase.calls++;
+    phase.tokens += call.tokens;
+    phase.outputs += call.outputs;
+    phase.graph_reuse_hits += call.graph_reuse_hits;
+    phase.graph_reuse_misses += call.graph_reuse_misses;
+    phase.total_us += ggml_time_us() - call.t_start_us;
+    phase.prelude_us += call.prelude_us;
+    phase.reuse_check_us += call.reuse_check_us;
+    phase.sched_reset_us += call.sched_reset_us;
+    phase.build_graph_us += call.build_graph_us;
+    phase.alloc_graph_us += call.alloc_graph_us;
+    phase.prepare_mtp_inputs_us += call.prepare_mtp_inputs_us;
+    phase.set_inputs_us += call.set_inputs_us;
+    phase.graph_compute_us += call.graph_compute_us;
+    phase.logits_us += call.logits_us;
+    phase.embeddings_us += call.embeddings_us;
+}
+
+static void llama_mtp_decode_profile_add_final_reset(llama_mtp_op_type op, int64_t elapsed_us) {
+    if (!llama_mtp_decode_profile_enabled() || !llama_mtp_decode_profile_is_profiled_op(op)) {
+        return;
+    }
+
+    auto & profile = llama_mtp_decode_profile();
+    std::lock_guard<std::mutex> lock(profile.mutex);
+    auto & phase = profile.phases[(int) op];
+    phase.final_resets++;
+    phase.final_reset_us += elapsed_us;
+}
+
+static std::string llama_mtp_decode_profile_phase_fmt(const llama_mtp_decode_profile_phase & phase) {
+    std::ostringstream oss;
+    oss << "calls=" << phase.calls
+        << ", tokens=" << phase.tokens
+        << ", outputs=" << phase.outputs
+        << ", reuse=" << phase.graph_reuse_hits << "/" << phase.graph_reuse_misses
+        << ", final_resets=" << phase.final_resets
+        << ", total=" << std::fixed << std::setprecision(3) << phase.total_us / 1000.0 << "ms"
+        << ", prelude=" << phase.prelude_us / 1000.0 << "ms"
+        << ", reuse_check=" << phase.reuse_check_us / 1000.0 << "ms"
+        << ", sched_reset=" << phase.sched_reset_us / 1000.0 << "ms"
+        << ", build_graph=" << phase.build_graph_us / 1000.0 << "ms"
+        << ", alloc_graph=" << phase.alloc_graph_us / 1000.0 << "ms"
+        << ", prepare_mtp_inputs=" << phase.prepare_mtp_inputs_us / 1000.0 << "ms"
+        << ", set_inputs=" << phase.set_inputs_us / 1000.0 << "ms"
+        << ", graph_compute" << (llama_mtp_decode_profile_sync() ? "_sync" : "") << "=" << phase.graph_compute_us / 1000.0 << "ms"
+        << ", logits=" << phase.logits_us / 1000.0 << "ms"
+        << ", embeddings=" << phase.embeddings_us / 1000.0 << "ms"
+        << ", final_reset=" << phase.final_reset_us / 1000.0 << "ms";
+    return oss.str();
+}
+
+void llama_mtp_decode_profile_print() {
+    if (!llama_mtp_decode_profile_enabled()) {
+        return;
+    }
+
+    auto & profile = llama_mtp_decode_profile();
+    std::lock_guard<std::mutex> lock(profile.mutex);
+    for (const llama_mtp_op_type op : { MTP_OP_WARMUP, MTP_OP_UPDATE_ACCEPTED, MTP_OP_DRAFT_GEN }) {
+        const auto & phase = profile.phases[(int) op];
+        if (phase.calls == 0 && phase.final_resets == 0) {
+            continue;
+        }
+
+        const std::string text = llama_mtp_decode_profile_phase_fmt(phase);
+        LLAMA_LOG_INFO("profile mtp decode %s: %s\n", llama_mtp_decode_profile_op_name(op), text.c_str());
+    }
 }
 
 /*
@@ -5218,6 +5378,16 @@ static int llama_decode_internal(
             u_batch.seq_id = seq_id_arr.data();
         }
 
+        llama_mtp_decode_profile_call mtp_decode_prof;
+        if (llama_mtp_decode_profile_enabled() && cparams.mtp_op_type != MTP_OP_NONE) {
+            mtp_decode_prof.enabled = true;
+            mtp_decode_prof.op = cparams.mtp_op_type;
+            mtp_decode_prof.tokens = n_tokens;
+            mtp_decode_prof.outputs = lctx.n_outputs;
+            mtp_decode_prof.t_start_us = ggml_time_us();
+        }
+
+        int64_t mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
         // non-causal masks do not use the KV cache
         if (hparams.causal_attn) {
             int32_t ret = llama_kv_cache_update(&lctx);
@@ -5244,6 +5414,9 @@ static int llama_decode_internal(
                 kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(max_cell, pad)));
             }
         }
+        if (mtp_decode_prof.enabled) {
+            mtp_decode_prof.prelude_us += ggml_time_us() - mtp_decode_phase_start_us;
+        }
 
 #if IK_PRINT_TIMING
         auto tim2 = ggml_time_us();
@@ -5255,9 +5428,21 @@ static int llama_decode_internal(
 #endif
         auto & prev = cparams.mtp_op_type == MTP_OP_NONE ? lctx.prev : lctx.prev_mtp;
         ggml_cgraph * gf = nullptr;
-        if (!lctx.can_reuse_graph(u_batch)) {
+        mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
+        const bool can_reuse_graph = lctx.can_reuse_graph(u_batch);
+        if (mtp_decode_prof.enabled) {
+            mtp_decode_prof.reuse_check_us += ggml_time_us() - mtp_decode_phase_start_us;
+        }
+        if (!can_reuse_graph) {
+            if (mtp_decode_prof.enabled) {
+                mtp_decode_prof.graph_reuse_misses++;
+            }
+            mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
             lctx.reset_scheduler();
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            if (mtp_decode_prof.enabled) {
+                mtp_decode_prof.sched_reset_us += ggml_time_us() - mtp_decode_phase_start_us;
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_reset(...): %d us\n", int(tim2-tim1));
@@ -5266,7 +5451,11 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
+            mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
             gf = llm_build_context::llama_build_graph(lctx, u_batch, false);
+            if (mtp_decode_prof.enabled) {
+                mtp_decode_prof.build_graph_us += ggml_time_us() - mtp_decode_phase_start_us;
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("build_graph(...): %d us\n", int(tim2-tim1));
@@ -5275,7 +5464,11 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
+            mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (mtp_decode_prof.enabled) {
+                mtp_decode_prof.alloc_graph_us += ggml_time_us() - mtp_decode_phase_start_us;
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -5290,13 +5483,24 @@ static int llama_decode_internal(
                         cparams.mtp_op_type, gf});
             }
         } else {
+            if (mtp_decode_prof.enabled) {
+                mtp_decode_prof.graph_reuse_hits++;
+            }
             //printf("Reusing graph with n_kv = %d, n_tokens = %d\n", (int)prev->n_kv, (int)prev->n_tokens);
             gf = prev->graph;
         }
 
         if (cparams.mtp_op_type != MTP_OP_NONE) {
+            mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
             if (!prepare_mtp_graph_inputs(lctx, cur_token, n_tokens, n_tokens_all)) {
+                if (mtp_decode_prof.enabled) {
+                    mtp_decode_prof.prepare_mtp_inputs_us += ggml_time_us() - mtp_decode_phase_start_us;
+                    llama_mtp_decode_profile_commit(mtp_decode_prof);
+                }
                 return GGML_STATUS_FAILED;
+            }
+            if (mtp_decode_prof.enabled) {
+                mtp_decode_prof.prepare_mtp_inputs_us += ggml_time_us() - mtp_decode_phase_start_us;
             }
         }
 
@@ -5343,7 +5547,11 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING == 1
         tim1 = ggml_time_us();
 #endif
+        mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
         llama_set_inputs(lctx, u_batch);
+        if (mtp_decode_prof.enabled) {
+            mtp_decode_prof.set_inputs_us += ggml_time_us() - mtp_decode_phase_start_us;
+        }
 #if IK_PRINT_TIMING == 1
         tim2 = ggml_time_us();
         printf("set_inputs(...): %d us\n", int(tim2-tim1));
@@ -5352,7 +5560,14 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
 #endif
+        mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
         llama_graph_compute(lctx, gf, n_threads);
+        if (mtp_decode_prof.enabled && llama_mtp_decode_profile_sync()) {
+            llama_synchronize(&lctx);
+        }
+        if (mtp_decode_prof.enabled) {
+            mtp_decode_prof.graph_compute_us += ggml_time_us() - mtp_decode_phase_start_us;
+        }
 #if IK_PRINT_TIMING
         llama_synchronize(&lctx);
         tim2 = ggml_time_us();
@@ -5383,6 +5598,7 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
+            mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
             // Do not process logits if MTP is only updating the KV cache.
             if (cparams.mtp_op_type != MTP_OP_WARMUP) { // && cparams.mtp_op_type != MTP_OP_UPDATE_ACCEPTED) {
                 ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
@@ -5413,6 +5629,9 @@ static int llama_decode_internal(
                     }
                 }
             }
+            if (mtp_decode_prof.enabled) {
+                mtp_decode_prof.logits_us += ggml_time_us() - mtp_decode_phase_start_us;
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("get_result(...): %d us\n", int(tim2-tim1));
@@ -5425,6 +5644,7 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
+            mtp_decode_phase_start_us = mtp_decode_prof.enabled ? ggml_time_us() : 0;
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(lctx.sched, embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -5464,6 +5684,9 @@ static int llama_decode_internal(
                         GGML_ABORT("unknown pooling type");
                     }
             }
+            if (mtp_decode_prof.enabled) {
+                mtp_decode_prof.embeddings_us += ggml_time_us() - mtp_decode_phase_start_us;
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("get_embedding(...): %d us\n", int(tim2-tim1));
@@ -5478,6 +5701,7 @@ static int llama_decode_internal(
             // empty context, but for the sake of correctness let's just do it.
             lctx.prev.reset();
         }
+        llama_mtp_decode_profile_commit(mtp_decode_prof);
         if (stop_internal_decode) {
             return -3;
         }
@@ -5507,8 +5731,13 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
     auto tim1 = ggml_time_us();
 #endif
+    const int64_t mtp_decode_final_reset_start_us =
+        (llama_mtp_decode_profile_enabled() && cparams.mtp_op_type != MTP_OP_NONE && !lctx.prev) ? ggml_time_us() : 0;
     if (!lctx.prev) {
         lctx.reset_scheduler();
+    }
+    if (mtp_decode_final_reset_start_us != 0) {
+        llama_mtp_decode_profile_add_final_reset(cparams.mtp_op_type, ggml_time_us() - mtp_decode_final_reset_start_us);
     }
 #if IK_PRINT_TIMING
         auto tim2 = ggml_time_us();

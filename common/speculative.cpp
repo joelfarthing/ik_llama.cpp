@@ -186,7 +186,7 @@ static std::vector<llama_token> mtp_speculative_gen_draft(
     llama_seq_id seq_id,
     bool constant_draft_positions = false);
 
-static int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch & batch, bool is_prompt_warmup);
+static int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch & batch, bool is_prompt_warmup, bool need_last_logits = true);
 
 struct mtp_last_embd {
     std::vector<float> embd;
@@ -1429,6 +1429,11 @@ static bool mtp_profile_enabled() {
     return enabled;
 }
 
+static bool mtp_disable_accept_last_cache() {
+    static const bool disabled = std::getenv("IK_MTP_DISABLE_ACCEPT_LAST_CACHE") != nullptr;
+    return disabled;
+}
+
 static mtp_profile_common & mtp_profile() {
     static mtp_profile_common profile;
     return profile;
@@ -2063,6 +2068,7 @@ void common_speculative_print_stats(const common_speculative * spec, double slot
                     mtp_profile_fmt("apply_hidden_rows", p.apply_hidden_rows).c_str(),
                     mtp_profile_fmt("apply_on_batch", p.apply_hidden_rows_on_batch).c_str(),
                     mtp_profile_fmt("seq_batch_free", p.target_seq_batch_free).c_str());
+            llama_mtp_decode_profile_print();
         }
     }
 
@@ -2212,11 +2218,19 @@ static int32_t mtp_accept_batch(
     mtp_profile_add(mtp_profile().accept_set_hidden, t0, hidden_rows_floats);
 
     t0 = mtp_profile_now();
-    if (mtp_update_kv_cache(state.ctx_mtp, accepted_batch, false) != 0) {
+    const bool cache_last = !mtp_disable_accept_last_cache();
+    if (mtp_update_kv_cache(state.ctx_mtp, accepted_batch, false, cache_last) != 0) {
         mtp_profile_add(mtp_profile().accept_update_kv, t0, accepted_batch.n_tokens);
         return -1;
     }
     mtp_profile_add(mtp_profile().accept_update_kv, t0, accepted_batch.n_tokens);
+
+    if (!cache_last) {
+        auto & last = mtp_get_last_embd(state, seq_id);
+        last.last_id = -1;
+        last.prob = 0.0f;
+        return 0;
+    }
 
     auto & last = mtp_get_last_embd(state, seq_id);
     t0 = mtp_profile_now();
@@ -2461,7 +2475,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 }
 
 
-int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup) {
+int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch, bool is_prompt_warmup, bool need_last_logits) {
     mtp_profile_scope scope(mtp_profile().update_total, batch.n_tokens);
     if (batch.n_tokens == 0) {
         return 0;
@@ -2487,7 +2501,7 @@ int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch
     for (int i = 0; i < mtp_batch.n_tokens; ++i) {
         mtp_batch.logits[i] = false;
     }
-    mtp_batch.logits[mtp_batch.n_tokens-1] = true;
+    mtp_batch.logits[mtp_batch.n_tokens-1] = need_last_logits;
     mtp_profile_add(mtp_profile().update_flags, t0, mtp_batch.n_tokens);
     t0 = mtp_profile_now();
     if (is_prompt_warmup) {

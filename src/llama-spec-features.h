@@ -52,3 +52,5 @@ bool llama_spec_copy_hidden_rows_from_output_indices(
         struct llama_context * ctx,
         const std::vector<int32_t> & output_indices,
         std::vector<float> & hidden_rows);
+
+void llama_mtp_decode_profile_print();
