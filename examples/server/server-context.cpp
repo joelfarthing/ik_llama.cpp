@@ -12,10 +12,147 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <regex>
 #include <exception>
+
+struct server_mtp_profile_phase {
+    int64_t us = 0;
+    size_t calls = 0;
+    size_t events = 0;
+};
+
+struct server_mtp_profile {
+    server_mtp_profile_phase add_sampled_total;
+    server_mtp_profile_phase ensure_hidden;
+    server_mtp_profile_phase speculative_draft;
+    server_mtp_profile_phase process_batch_decode;
+    server_mtp_profile_phase prompt_mtp_warmup;
+
+    server_mtp_profile_phase save_ckpt_total;
+    server_mtp_profile_phase save_ckpt_init;
+    server_mtp_profile_phase save_ckpt_save;
+    server_mtp_profile_phase save_ckpt_sampler_init;
+    server_mtp_profile_phase save_ckpt_sampler_clone;
+
+    server_mtp_profile_phase spec_accept_total;
+    server_mtp_profile_phase spec_accept_sample;
+    server_mtp_profile_phase spec_accept_pre_copy_hidden;
+    server_mtp_profile_phase spec_accept_feedback;
+    server_mtp_profile_phase spec_accept_restore;
+    server_mtp_profile_phase spec_accept_commit_output;
+    server_mtp_profile_phase spec_accept_kv_rm;
+    server_mtp_profile_phase spec_accept_discard;
+    server_mtp_profile_phase spec_accept_process_outputs;
+
+    server_mtp_profile_phase restore_total;
+    server_mtp_profile_phase restore_per_step_call;
+    server_mtp_profile_phase restore_fallback_call;
+    server_mtp_profile_phase restore_sampler_clone;
+    server_mtp_profile_phase restore_sampler_accept;
+    server_mtp_profile_phase restore_commit_hidden;
+    server_mtp_profile_phase restore_redecode_batch_init;
+    server_mtp_profile_phase restore_redecode_decode;
+    server_mtp_profile_phase restore_commit_output;
+    server_mtp_profile_phase restore_redecode_batch_free;
+};
+
+static bool server_mtp_profile_enabled() {
+    static const bool enabled = std::getenv("IK_MTP_SERVER_PROFILE") != nullptr ||
+                                std::getenv("IK_MTP_PROFILE") != nullptr;
+    return enabled;
+}
+
+static server_mtp_profile & server_mtp_prof() {
+    static server_mtp_profile profile;
+    return profile;
+}
+
+static int64_t server_mtp_prof_now() {
+    return server_mtp_profile_enabled() ? ggml_time_us() : 0;
+}
+
+static void server_mtp_prof_add(server_mtp_profile_phase & phase, int64_t t0, size_t events = 1) {
+    if (!server_mtp_profile_enabled() || t0 == 0) {
+        return;
+    }
+    phase.us += ggml_time_us() - t0;
+    phase.calls++;
+    phase.events += events;
+}
+
+struct server_mtp_profile_scope {
+    server_mtp_profile_phase * phase = nullptr;
+    int64_t t0 = 0;
+    size_t events = 0;
+
+    explicit server_mtp_profile_scope(server_mtp_profile_phase & phase, size_t events = 1)
+        : phase(server_mtp_profile_enabled() ? &phase : nullptr),
+          t0(this->phase ? ggml_time_us() : 0),
+          events(events) {
+    }
+
+    ~server_mtp_profile_scope() {
+        if (phase != nullptr && t0 != 0) {
+            phase->us += ggml_time_us() - t0;
+            phase->calls++;
+            phase->events += events;
+        }
+    }
+
+    server_mtp_profile_scope(const server_mtp_profile_scope &) = delete;
+    server_mtp_profile_scope & operator=(const server_mtp_profile_scope &) = delete;
+};
+
+static std::string server_mtp_prof_fmt(const char * name, const server_mtp_profile_phase & phase) {
+    std::ostringstream oss;
+    oss << name << "=" << phase.calls << "/" << phase.events << "/";
+    oss << std::fixed << std::setprecision(3) << phase.us / 1000.0 << "ms";
+    return oss.str();
+}
+
+static void server_mtp_profile_print() {
+    if (!server_mtp_profile_enabled()) {
+        return;
+    }
+
+    const auto & p = server_mtp_prof();
+    LOG_INF("profile mtp server loop: %s, %s, %s, %s, %s\n",
+            server_mtp_prof_fmt("add_sampled_total", p.add_sampled_total).c_str(),
+            server_mtp_prof_fmt("ensure_hidden", p.ensure_hidden).c_str(),
+            server_mtp_prof_fmt("spec_draft", p.speculative_draft).c_str(),
+            server_mtp_prof_fmt("main_decode", p.process_batch_decode).c_str(),
+            server_mtp_prof_fmt("prompt_mtp_warmup", p.prompt_mtp_warmup).c_str());
+    LOG_INF("profile mtp server ckpt_save: %s, %s, %s, %s, %s\n",
+            server_mtp_prof_fmt("total", p.save_ckpt_total).c_str(),
+            server_mtp_prof_fmt("init", p.save_ckpt_init).c_str(),
+            server_mtp_prof_fmt("save", p.save_ckpt_save).c_str(),
+            server_mtp_prof_fmt("sampler_init", p.save_ckpt_sampler_init).c_str(),
+            server_mtp_prof_fmt("sampler_clone", p.save_ckpt_sampler_clone).c_str());
+    LOG_INF("profile mtp server spec_accept: %s, %s, %s, %s, %s, %s, %s, %s, %s\n",
+            server_mtp_prof_fmt("total", p.spec_accept_total).c_str(),
+            server_mtp_prof_fmt("sample_accept", p.spec_accept_sample).c_str(),
+            server_mtp_prof_fmt("pre_copy_hidden", p.spec_accept_pre_copy_hidden).c_str(),
+            server_mtp_prof_fmt("feedback", p.spec_accept_feedback).c_str(),
+            server_mtp_prof_fmt("restore", p.spec_accept_restore).c_str(),
+            server_mtp_prof_fmt("commit_output", p.spec_accept_commit_output).c_str(),
+            server_mtp_prof_fmt("kv_rm", p.spec_accept_kv_rm).c_str(),
+            server_mtp_prof_fmt("discard", p.spec_accept_discard).c_str(),
+            server_mtp_prof_fmt("process_outputs", p.spec_accept_process_outputs).c_str());
+    LOG_INF("profile mtp server restore: %s, %s, %s, %s, %s, %s, %s, %s\n",
+            server_mtp_prof_fmt("total", p.restore_total).c_str(),
+            server_mtp_prof_fmt("per_step_call", p.restore_per_step_call).c_str(),
+            server_mtp_prof_fmt("fallback_call", p.restore_fallback_call).c_str(),
+            server_mtp_prof_fmt("sampler_clone", p.restore_sampler_clone).c_str(),
+            server_mtp_prof_fmt("sampler_accept", p.restore_sampler_accept).c_str(),
+            server_mtp_prof_fmt("commit_hidden", p.restore_commit_hidden).c_str(),
+            server_mtp_prof_fmt("redecode", p.restore_redecode_decode).c_str(),
+            server_mtp_prof_fmt("commit_output", p.restore_commit_output).c_str());
+}
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1, int32_t offset = 0) {
     if (pos_min == -1) {
@@ -90,31 +227,40 @@ static void discard_speculative_checkpoint(server_slot & slot, llama_context * c
 }
 
 static bool save_speculative_checkpoint(server_slot & slot, llama_model * model, llama_context * ctx, int ckpt_mode) {
+    server_mtp_profile_scope scope(server_mtp_prof().save_ckpt_total);
     slot.spec_ckpt.clear();
     const int32_t n_pre_spec_tokens = slot.cache_tokens.n_tokens() - (int32_t)(slot.drafted.size() + 1);
     slot.spec_ckpt.n_past = slot.cache_tokens.pos_next(n_pre_spec_tokens);
     slot.spec_ckpt.sampled = slot.sampled;
 
     const int max_tokens = (int)slot.drafted.size() + 1;
+    int64_t t0 = server_mtp_prof_now();
     const int actual_mode = llama_spec_ckpt_init(ctx, ckpt_mode, max_tokens);
+    server_mtp_prof_add(server_mtp_prof().save_ckpt_init, t0, max_tokens);
     if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
         return false;
     }
     slot.spec_ckpt.per_step_enabled = (actual_mode == LLAMA_SPEC_CKPT_PER_STEP);
 
+    t0 = server_mtp_prof_now();
     slot.spec_ckpt.valid = llama_spec_ckpt_save(ctx, slot.id);
+    server_mtp_prof_add(server_mtp_prof().save_ckpt_save, t0, max_tokens);
     if (!slot.spec_ckpt.valid) {
         llama_spec_ckpt_discard(ctx);
         return false;
     }
 
+    t0 = server_mtp_prof_now();
     slot.spec_ckpt.sampler = common_sampler_init(model, slot.sparams);
+    server_mtp_prof_add(server_mtp_prof().save_ckpt_sampler_init, t0);
     if (slot.spec_ckpt.sampler == nullptr) {
         discard_speculative_checkpoint(slot, ctx);
         return false;
     }
 
+    t0 = server_mtp_prof_now();
     common_sampler_clone(slot.ctx_sampling, slot.spec_ckpt.sampler);
+    server_mtp_prof_add(server_mtp_prof().save_ckpt_sampler_clone, t0);
     return true;
 }
 
@@ -914,6 +1060,7 @@ void server_slot::print_timings() const {
     }
     common_speculative_print_stats(spec, n_gen_second, n_decoded, n_past,
         const_cast<common_params_speculative *>(&params.speculative));
+    server_mtp_profile_print();
 }
 
 void server_metrics::init() {
@@ -3531,6 +3678,7 @@ void server_context::context_shift() {
 }
 
 void server_context::add_sampled_tokens() {
+    server_mtp_profile_scope scope(server_mtp_prof().add_sampled_total);
     for (auto& slot : slots) {
         slot.released = false;
         if (slot.state == SLOT_STATE_IDLE) {
@@ -3556,11 +3704,14 @@ void server_context::add_sampled_tokens() {
             const llama_pos draft_base_pos = slot.has_mtp ? slot.cache_tokens.pos_next() : -1;
 
             if (slot.has_mtp) {
+                const int64_t t0 = server_mtp_prof_now();
                 if (!common_speculative_ensure_sequence_hidden(slot.spec, ctx, slot.id, draft_base_pos - 1)) {
                     LOG_ERROR("MTP hidden state is empty during speculation", {});
                 }
+                server_mtp_prof_add(server_mtp_prof().ensure_hidden, t0);
             }
 
+            int64_t t0 = server_mtp_prof_now();
             llama_tokens draft = common_speculative_draft(
                 slot.spec,
                 params_spec,
@@ -3568,6 +3719,7 @@ void server_context::add_sampled_tokens() {
                 slot.sampled,
                 draft_base_pos,
                 slot.id);
+            server_mtp_prof_add(server_mtp_prof().speculative_draft, t0);
             slot.drafted_spec_type = common_speculative_current_type(slot.spec);
 
             const int n_draft_max = slot.get_n_draft_max();
@@ -4144,19 +4296,27 @@ static void restore_speculative_checkpoint(
     llama_token sampled_before,
     const std::vector<llama_token> & ids, int n_draft,
         const std::vector<float> & mtp_hidden_state_pre, int32_t mtp_n_past_base) {
+    server_mtp_profile_scope scope(server_mtp_prof().restore_total, ids.size());
     if (slot.spec_ckpt.per_step_enabled) {
         const int step = (int)ids.size() - 1;
+        int64_t t0 = server_mtp_prof_now();
         llama_spec_ckpt_restore(ctx, slot.id, slot.spec_ckpt.n_past, step);
+        server_mtp_prof_add(server_mtp_prof().restore_per_step_call, t0);
 
         if (slot.spec_ckpt.sampler) {
+            t0 = server_mtp_prof_now();
             common_sampler_clone(slot.spec_ckpt.sampler, slot.ctx_sampling);
+            server_mtp_prof_add(server_mtp_prof().restore_sampler_clone, t0);
         }
+        t0 = server_mtp_prof_now();
         for (llama_token id : ids) {
             common_sampler_accept(slot.ctx_sampling, ctx, id, true);
         }
+        server_mtp_prof_add(server_mtp_prof().restore_sampler_accept, t0, ids.size());
 
         // Update MTP KV cache and hidden state using embeddings collected before checkpoint restore.
         if (slot.has_mtp && !mtp_hidden_state_pre.empty()) {
+            t0 = server_mtp_prof_now();
             if (!common_speculative_commit_accepted_hidden_rows(
                     slot.spec,
                     spec_type_used,
@@ -4169,22 +4329,29 @@ static void restore_speculative_checkpoint(
             } else if (spec_type_used != COMMON_SPECULATIVE_TYPE_MTP) {
                 SLT_DBG(slot, "%s", "synced MTP target hidden state from accepted-prefix rows after per-step restore");
             }
+            server_mtp_prof_add(server_mtp_prof().restore_commit_hidden, t0, ids.size());
         }
 
         SLT_DBG(slot, "per-step restore: step=%d (rejected %d drafts)\n",
             step, (int)(n_draft - (ids.size() - 1)));
     } else {
         // Restore pre-speculation recurrent state then re-decode accepted tokens.
+        int64_t t0 = server_mtp_prof_now();
         llama_spec_ckpt_restore(ctx, slot.id, slot.spec_ckpt.n_past, 0);
+        server_mtp_prof_add(server_mtp_prof().restore_fallback_call, t0);
 
         if (slot.spec_ckpt.sampler) {
+            t0 = server_mtp_prof_now();
             common_sampler_clone(slot.spec_ckpt.sampler, slot.ctx_sampling);
+            server_mtp_prof_add(server_mtp_prof().restore_sampler_clone, t0);
         }
 
         if (!ids.empty()) {
             // Re-decode to advance recurrent state to the accepted position.
             const int n_re = (int)ids.size();
+            t0 = server_mtp_prof_now();
             llama_batch re_batch = llama_batch_init(n_re, 0, 1);
+            server_mtp_prof_add(server_mtp_prof().restore_redecode_batch_init, t0, n_re);
             common_batch_add(re_batch, slot.spec_ckpt.sampled, slot.spec_ckpt.n_past, { slot.id }, n_re == 1);
             for (int j = 0; j < n_re - 1; j++) {
                 common_batch_add(re_batch, ids[j], slot.spec_ckpt.n_past + 1 + j, { slot.id }, j == n_re - 2);
@@ -4197,7 +4364,9 @@ static void restore_speculative_checkpoint(
                 llama_set_embeddings(ctx, true);
             }
 
+            t0 = server_mtp_prof_now();
             const int ret = llama_decode(ctx, re_batch);
+            server_mtp_prof_add(server_mtp_prof().restore_redecode_decode, t0, n_re);
             if (ret != 0) {
                 SLT_ERR(slot, "failed to re-decode accepted tokens after checkpoint restore: %d\n", ret);
             }
@@ -4208,6 +4377,7 @@ static void restore_speculative_checkpoint(
                     redecoded_indices[j] = j;
                 }
 
+                t0 = server_mtp_prof_now();
                 if (!common_speculative_commit_accepted_output(
                         slot.spec,
                         ctx,
@@ -4219,13 +4389,18 @@ static void restore_speculative_checkpoint(
                         redecoded_indices)) {
                     common_speculative_clear_sequence_hidden(slot.spec, slot.id);
                 }
+                server_mtp_prof_add(server_mtp_prof().restore_commit_output, t0, ids.size());
             }
 
+            t0 = server_mtp_prof_now();
             for (llama_token id : ids) {
                 common_sampler_accept(slot.ctx_sampling, ctx, id, true);
             }
+            server_mtp_prof_add(server_mtp_prof().restore_sampler_accept, t0, ids.size());
 
+            t0 = server_mtp_prof_now();
             llama_batch_free(re_batch);
+            server_mtp_prof_add(server_mtp_prof().restore_redecode_batch_free, t0);
             SLT_DBG(slot, "spec checkpoint restored: re-decoded %d tokens (rejected %d drafts)\n",
                 n_re, (int)(n_draft - (ids.size() - 1)));
         }
@@ -4240,6 +4415,7 @@ void server_context::speculative_decoding_accept() {
             continue;
         }
 
+        server_mtp_profile_scope scope(server_mtp_prof().spec_accept_total, slot.drafted.size());
         const llama_token sampled_before = slot.sampled;
         const common_speculative_type spec_type_used = slot.drafted_spec_type;
         size_t n_draft = slot.drafted.size();
@@ -4256,7 +4432,9 @@ void server_context::speculative_decoding_accept() {
         // the accepted tokens from the speculation
         std::vector<llama_token> ids;
         try {
+            const int64_t t0 = server_mtp_prof_now();
             ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
+            server_mtp_prof_add(server_mtp_prof().spec_accept_sample, t0, slot.drafted.size());
         } catch (const std::exception & e) {
             LOG_ERROR("speculative sampling failed, releasing slot", {
                 {"id_slot", slot.id},
@@ -4284,9 +4462,11 @@ void server_context::speculative_decoding_accept() {
             }
 
             if (any_rejected && slot.spec_ckpt.valid && !accepted_output_indices.empty()) {
+                const int64_t t0 = server_mtp_prof_now();
                 if (!common_speculative_copy_output_hidden_rows(slot.spec, ctx, accepted_output_indices, mtp_hidden_state_pre)) {
                     mtp_hidden_state_pre.clear();
                 }
+                server_mtp_prof_add(server_mtp_prof().spec_accept_pre_copy_hidden, t0, accepted_output_indices.size());
             }
         }
 
@@ -4303,7 +4483,9 @@ void server_context::speculative_decoding_accept() {
         slot.n_draft_accepted += ids.size() - 1;
 
         // inform the speculative decoding about the number of accepted tokens
+        int64_t t0 = server_mtp_prof_now();
         common_speculative_accept(slot.spec, ids.size() - 1);
+        server_mtp_prof_add(server_mtp_prof().spec_accept_feedback, t0, ids.size());
 
         // rollback to the state before sampling the draft tokens
         slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - n_draft);
@@ -4317,9 +4499,12 @@ void server_context::speculative_decoding_accept() {
 
         // for recurrent/hybrid models: if any drafts were rejected, restore recurrent state
         if (any_rejected && slot.spec_ckpt.valid) {
+            t0 = server_mtp_prof_now();
             restore_speculative_checkpoint(slot, ctx, model, spec_type_used, sampled_before, ids, n_draft, mtp_hidden_state_pre, mtp_n_past_base);
+            server_mtp_prof_add(server_mtp_prof().spec_accept_restore, t0, ids.size());
         } else {
             if (slot.has_mtp && !accepted_output_indices.empty()) {
+                t0 = server_mtp_prof_now();
                 if (!common_speculative_commit_accepted_output(
                         slot.spec,
                         ctx,
@@ -4333,11 +4518,17 @@ void server_context::speculative_decoding_accept() {
                 } else if (spec_type_used != COMMON_SPECULATIVE_TYPE_MTP) {
                     SLT_DBG(slot, "%s", "synced MTP target hidden state from accepted-prefix rows");
                 }
+                server_mtp_prof_add(server_mtp_prof().spec_accept_commit_output, t0, accepted_output_indices.size());
             }
+            t0 = server_mtp_prof_now();
             llama_kv_cache_seq_rm(ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
+            server_mtp_prof_add(server_mtp_prof().spec_accept_kv_rm, t0);
+            t0 = server_mtp_prof_now();
             discard_speculative_checkpoint(slot, ctx);
+            server_mtp_prof_add(server_mtp_prof().spec_accept_discard, t0);
         }
 
+        t0 = server_mtp_prof_now();
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;
 
@@ -4367,6 +4558,7 @@ void server_context::speculative_decoding_accept() {
 
             update_allowlist_state(slot);
         }
+        server_mtp_prof_add(server_mtp_prof().spec_accept_process_outputs, t0, ids.size());
         SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int)ids.size() - 1, (int)slot.drafted.size(), slot.n_past);
         LOG_VERBOSE("speculative decoding result", {
             {"id_slot", slot.id},
@@ -4664,7 +4856,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
+        int64_t t0 = server_mtp_prof_now();
         const int ret = llama_decode(ctx, batch_view);
+        server_mtp_prof_add(server_mtp_prof().process_batch_decode, t0, n_tokens);
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;
@@ -4721,9 +4915,11 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 continue;
             }
 
+            t0 = server_mtp_prof_now();
             if (common_speculative_on_target_seq_batch(slot.spec, ctx, batch_view, slot.id, true) != 0) {
                 LOG_ERROR("failed to warm up MTP state from prompt batch for slot %d\n", slot.id);
             }
+            server_mtp_prof_add(server_mtp_prof().prompt_mtp_warmup, t0, n_tokens);
         }
     }
 
