@@ -196,6 +196,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     llama_context * ctx_tgt;
     llama_context * ctx_mtp = nullptr;
     common_sampler * smpl;
+    bool owns_ctx_mtp = true;
     // For Gemma 4 external MTP assistant: draft positions are held constant
     bool constant_draft_positions = false;
     int n_embd = 0;
@@ -206,10 +207,12 @@ struct common_speculative_state_mtp : public common_speculative_state {
             enum common_speculative_type type,
             llama_context * ctx_tgt,
             llama_context * ctx_mtp,
+            bool owns_ctx_mtp = true,
             bool constant_draft_positions = false)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
         , ctx_mtp(ctx_mtp)
+        , owns_ctx_mtp(owns_ctx_mtp)
         , constant_draft_positions(constant_draft_positions)
     {
         struct common_params_sampling sparams;
@@ -226,7 +229,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
     ~common_speculative_state_mtp() override {
         common_sampler_free(smpl);
-        if (ctx_mtp) {
+        if (owns_ctx_mtp && ctx_mtp) {
             llama_free(ctx_mtp);
         }
     }
@@ -1146,7 +1149,8 @@ done:
 //
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt) {
+        llama_context             * ctx_tgt,
+        llama_context             * ctx_mtp_shared) {
     std::string chain_error;
     if (!common_speculative_validate_chain(params, &chain_error)) {
         LOG_ERR("%s: invalid speculative stage chain: %s\n", __func__, chain_error.c_str());
@@ -1241,7 +1245,8 @@ common_speculative * common_speculative_init(
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_MTP: {
-                llama_context * ctx_mtp = ctx_dft;
+                llama_context * ctx_mtp = ctx_dft ? ctx_dft : ctx_mtp_shared;
+                bool owns_ctx_mtp = ctx_dft != nullptr;
                 if (!ctx_mtp) {
                     const llama_model * model = llama_get_model(ctx_tgt);
                     ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), config.params.cparams_dft);
@@ -1249,12 +1254,15 @@ common_speculative * common_speculative_init(
                         LOG_ERR("%s: failed to create MTP context\n", __func__);
                         return nullptr;
                     }
+                    owns_ctx_mtp = true;
                 }
-                ctx_dft = nullptr;
+                if (ctx_dft == ctx_mtp) {
+                    ctx_dft = nullptr;
+                }
 
                 const bool use_constant_draft_positions = llama_model_is_gemma4_mtp_assistant(llama_get_model(ctx_mtp));
                 impls.push_back(std::make_unique<common_speculative_state_mtp>(
-                    config.type, ctx_tgt, ctx_mtp, use_constant_draft_positions));
+                    config.type, ctx_tgt, ctx_mtp, owns_ctx_mtp, use_constant_draft_positions));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
