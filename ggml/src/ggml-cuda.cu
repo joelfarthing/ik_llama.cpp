@@ -4788,6 +4788,30 @@ GGML_CALL static bool ggml_backend_cuda_supports_buft(ggml_backend_t backend, gg
     return false;
 }
 
+static bool ggml_cuda_moe_offload_ledger_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_MOE_OFFLOAD_LEDGER");
+        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_moe_offload_ledger_layer(const char * name) {
+    const char * p = strstr(name, "ffn_moe_");
+    if (p == nullptr) {
+        return -1;
+    }
+
+    p += strlen("ffn_moe_");
+    while (*p != '\0' && (*p < '0' || *p > '9')) {
+        p++;
+    }
+
+    char * end = nullptr;
+    const long layer = strtol(p, &end, 10);
+    return end != p ? (int) layer : -1;
+}
+
 GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const ggml_tensor * op) {
     auto ctx = (ggml_backend_cuda_context *)backend->context;
     int min_batch_size = ctx->offload_batch_size; // originally: GGML_CUDA_MIN_BATCH_OFFLOAD;
@@ -4803,6 +4827,8 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
     // as the condition for offloading model weights resinding in RAM to the GPU.
     // In this case, the number of tokens is not as usual in op->ne[1] but rather in op->ne[2].
     if (op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_MOE_FUSED_UP_GATE) {
+        const int configured_min_batch_size = min_batch_size;
+        const bool per_byte_enabled = ctx->offload_batch_size_per_byte >= 0;
         if (ctx->offload_batch_size_per_byte >= 0) {
             auto src0 = op->src[0];
             auto row_size = ggml_row_size(src0->type, src0->ne[0]);
@@ -4810,10 +4836,41 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
         }
         auto ids = op->op == GGML_OP_MUL_MAT_ID ? op->src[2] : op->src[3];
         int64_t batch_size = op->ne[2];
-        if (batch_size < min_batch_size) return false;
         int64_t n_experts_tot    = op->src[0]->ne[2];
         int64_t n_experts_active = ids->ne[0];
-        bool should_offload = batch_size*n_experts_active >= min_batch_size*n_experts_tot;
+        int64_t lhs = batch_size*n_experts_active;
+        int64_t rhs = (int64_t) min_batch_size*n_experts_tot;
+        bool rejected_by_batch = batch_size < min_batch_size;
+        bool should_offload = !rejected_by_batch && lhs >= rhs;
+        if (ggml_cuda_moe_offload_ledger_enabled()) {
+            fprintf(stderr,
+                    "ggml_cuda_moe_offload_ledger op=%s node=%s layer=%d src0=%s ids=%s "
+                    "decision=%s reject_batch=%d per_byte=%d configured_min_batch=%d effective_min_batch=%d "
+                    "batch_size=%lld ids_ne0=%lld ids_ne1=%lld total_experts=%lld lhs=%lld rhs=%lld "
+                    "src0_type=%s src0_ne0=%lld src0_ne1=%lld src0_ne2=%lld src0_row_size=%zu\n",
+                    ggml_op_name(op->op),
+                    op->name,
+                    ggml_cuda_moe_offload_ledger_layer(op->name),
+                    op->src[0] ? op->src[0]->name : "null",
+                    ids ? ids->name : "null",
+                    should_offload ? "offload" : "stay",
+                    rejected_by_batch ? 1 : 0,
+                    per_byte_enabled ? 1 : 0,
+                    configured_min_batch_size,
+                    min_batch_size,
+                    (long long) batch_size,
+                    (long long) n_experts_active,
+                    ids ? (long long) ids->ne[1] : -1,
+                    (long long) n_experts_tot,
+                    (long long) lhs,
+                    (long long) rhs,
+                    ggml_type_name(op->src[0]->type),
+                    (long long) op->src[0]->ne[0],
+                    (long long) op->src[0]->ne[1],
+                    (long long) op->src[0]->ne[2],
+                    ggml_row_size(op->src[0]->type, op->src[0]->ne[0]));
+        }
+        if (rejected_by_batch) return false;
         return should_offload;
     }
 
