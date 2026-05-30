@@ -251,6 +251,31 @@ static common_speculative_stage_params server_parse_speculative_stage_json(const
 }
 
 server_context::~server_context() {
+    for (server_slot& slot : slots) {
+        if (slot.ctx_sampling != nullptr) {
+            common_sampler_free(slot.ctx_sampling);
+            slot.ctx_sampling = nullptr;
+        }
+        slot.spec_ckpt.clear();
+        common_speculative_free(slot.spec);
+        slot.spec = nullptr;
+        llama_batch_free(slot.batch_spec);
+    }
+
+    if (ctx_mtp_shared) {
+        llama_free(ctx_mtp_shared);
+        ctx_mtp_shared = nullptr;
+    }
+
+    if (model_draft) {
+        llama_free_model(model_draft);
+        model_draft = nullptr;
+    }
+
+    // Free multimodal before releasing the target model it was built from.
+    mtmd_free(mctx);
+    mctx = nullptr;
+
     if (ctx) {
         llama_free(ctx);
         ctx = nullptr;
@@ -259,34 +284,6 @@ server_context::~server_context() {
     if (model) {
         llama_free_model(model);
         model = nullptr;
-    }
-    // Free multimodal
-    mtmd_free(mctx);
-    // Free draft model and context if they exist
-    if (ctx_draft) {
-        llama_free(ctx_draft);
-        ctx_draft = nullptr;
-    }
-    if (model_draft) {
-        llama_free_model(model_draft);
-        model_draft = nullptr;
-    }
-
-    // Clear any sampling context
-    for (server_slot& slot : slots) {
-        if (slot.ctx_sampling != nullptr) {
-            common_sampler_free(slot.ctx_sampling);
-        }
-        slot.spec_ckpt.clear();
-        if (slot.ctx_dft) {
-            llama_free(slot.ctx_dft);
-        }
-        common_speculative_free(slot.spec);
-        llama_batch_free(slot.batch_spec);
-    }
-    if (ctx_mtp_shared) {
-        llama_free(ctx_mtp_shared);
-        ctx_mtp_shared = nullptr;
     }
 
     llama_batch_free(batch);
@@ -435,6 +432,7 @@ bool server_context::load_model(const gpt_params& params_) {
 
         cparams_dft = common_context_params_to_llama(params_dft);
 
+        model_draft = model_dft;
         params_base.speculative.model_dft = model_dft;
         params_base.speculative.cparams_dft = cparams_dft;
 
@@ -726,6 +724,10 @@ bool server_context::trim_slot_companion_state(server_slot& slot, llama_pos p0, 
     const bool ok = llama_kv_cache_seq_rm(ctx_companion, slot.id, p0, -1);
     if (ok) {
         common_speculative_clear_sequence_hidden(slot.spec, slot.id);
+        slot.drafted.clear();
+        slot.drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+        slot.i_batch_dft.clear();
+        slot.spec_ckpt.clear();
     }
 
     LOG_VERBOSE("slot companion speculative state trimmed", {
@@ -737,6 +739,33 @@ bool server_context::trim_slot_companion_state(server_slot& slot, llama_pos p0, 
     });
 
     return ok;
+}
+
+void server_context::shift_slot_companion_state(
+        server_slot& slot,
+        llama_pos kv_keep,
+        llama_pos kv_discard,
+        llama_pos kv_past,
+        const char * reason) {
+    if (slot.spec == nullptr) {
+        return;
+    }
+
+    common_speculative_context_shift(slot.spec, slot.id, kv_keep, kv_discard, kv_past);
+    common_speculative_clear_sequence_hidden(slot.spec, slot.id);
+    slot.drafted.clear();
+    slot.drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+    slot.i_batch_dft.clear();
+    slot.spec_ckpt.clear();
+
+    LOG_VERBOSE("slot companion speculative state shifted", {
+        {"id_slot", slot.id},
+        {"reason", reason ? reason : ""},
+        {"kv_keep", kv_keep},
+        {"kv_discard", kv_discard},
+        {"kv_past", kv_past},
+        {"has_companion_ctx", companion_ctx_for_slot(slot) != nullptr},
+    });
 }
 
 void server_slot::reset() {
@@ -882,6 +911,11 @@ void server_slot::release() {
         task.reset();
     }
     llama_decode_reset();
+}
+
+void server_context::release_slot(server_slot& slot, const char * reason) {
+    slot.release();
+    clear_slot_companion_state(slot, true, reason);
 }
 
 
@@ -2283,8 +2317,7 @@ bool server_context::system_prompt_set(const std::string& sys_prompt) {
 
     // release all slots
     for (server_slot& slot : slots) {
-        slot.release();
-        clear_slot_companion_state(slot, true, "system prompt reset");
+        release_slot(slot, "system prompt reset");
         slot.cache_tokens.clear();
         slot.n_past = 0;
         slot.n_past_prompt = 0;
@@ -3026,8 +3059,7 @@ void server_context::process_single_task(server_task&& task) {
         // release slot linked with the task id
         for (auto& slot : slots) {
             if (slot.id_task == task.id_target) {
-                slot.release();
-                clear_slot_companion_state(slot, true, "task cancellation");
+                release_slot(slot, "task cancellation");
                 break;
             }
         }
@@ -3180,11 +3212,13 @@ void server_context::process_single_task(server_task&& task) {
         size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
         if (nread == 0) {
             slot->cache_tokens.resize(0);
+            clear_slot_companion_state(*slot, true, "slot state restore failed");
             send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
             break;
         }
         load_server_tokens_from_file(filepath+".tokens.json", slot->cache_tokens);
         size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
+        clear_slot_companion_state(*slot, true, "target-only slot state restore");
 
         const int64_t t_end = ggml_time_us();
         const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3221,6 +3255,7 @@ void server_context::process_single_task(server_task&& task) {
         // Erase token cache
         const size_t n_erased = slot->cache_tokens.size();
         llama_kv_cache_seq_rm(ctx, slot->id, -1, -1);
+        clear_slot_companion_state(*slot, true, "slot erase");
         slot->cache_tokens.keep_first(0);
         //slot->cache_tokens.clear();
         slot->server_cached_prompt.checkpoints.clear();
@@ -3483,7 +3518,7 @@ void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_sl
     llama_kv_cache_seq_rm(ctx, slot.id, slot.cache_tokens.pos_next(kv_keep), slot.cache_tokens.pos_next(kv_keep + kv_discard));
     llama_kv_cache_seq_add(ctx, slot.id, kv_keep + kv_discard, kv_past, -kv_discard);
     if (slot.has_mtp && slot.spec) {
-        common_speculative_context_shift(slot.spec, slot.id, kv_keep, kv_discard, kv_past);
+        shift_slot_companion_state(slot, kv_keep, kv_discard, kv_past, "target context shift");
     }
     if (slot.params.cache_prompt) {
         slot.cache_tokens.discard_n_tokens(n_keep, n_discard);
@@ -3594,6 +3629,7 @@ void server_context::release_slots()
             slot.state = SLOT_STATE_IDLE;
             slot.command = SLOT_COMMAND_NONE;
             slot.t_last_used = ggml_time_us();
+            clear_slot_companion_state(slot, true, "slot release finalization");
 
             LOG_INFO("slot released", {
                 {"id_slot",         slot.id},
@@ -3637,7 +3673,7 @@ void server_context::context_shift() {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
                     slot.print_timings();
-                    slot.release();
+                    release_slot(slot, "context shift disabled");
                     send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
                     continue;
                 }
@@ -3822,6 +3858,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                     pos_next = slot.prompt_tokens.pos_next(slot.n_past_prompt);
                     pos_next = std::min(pos_next, std::max(it->pos_min_prompt + 1, it->pos_max_prompt));
                     slot.n_past_prompt = slot.prompt_tokens.size_up_to_pos(pos_next);
+                    clear_slot_companion_state(slot, true, "target context checkpoint restore");
                     SLT_WRN(slot, "restored context checkpoint took  %.2f ms (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", (ggml_time_us() - t_start) / 1000.0, it->pos_min, it->pos_max, it->n_tokens, slot.n_past, (float)checkpoint_size / 1024 / 1024);
                 }
             }
@@ -3836,6 +3873,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 slot.cache_tokens.keep_first(0);
                 pos_next = 0;
                 common_sampler_reset(slot.ctx_sampling);
+                clear_slot_companion_state(slot, true, "target context checkpoint reset");
             }
         }
     }
@@ -3963,7 +4001,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         slot.state = SLOT_STATE_PROCESSING;
                         slot.command = SLOT_COMMAND_NONE;
                         send_final_response(slot);
-                        slot.release();
+                        release_slot(slot, "empty prompt");
                         slot.print_timings();
                         continue;
                     }
@@ -3973,7 +4011,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         if (slot.n_prompt_tokens > n_ubatch) {
                             slot.state = SLOT_STATE_PROCESSING;
                             slot.command = SLOT_COMMAND_NONE;
-                            slot.release();
+                            release_slot(slot, "embedding prompt too large");
                             send_error(slot, "input is too large to process. increase the physical batch size", ERROR_TYPE_SERVER);
                             continue;
                         }
@@ -3984,7 +4022,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                         if (slot.ga_n == 1 && slot.n_prompt_tokens >= slot.n_ctx) {
                             if (!params_base.ctx_shift) {
                                 send_error(slot, "the request exceeds the available context size, try increasing it", ERROR_TYPE_SERVER);
-                                slot.release();
+                                release_slot(slot, "prompt exceeds context");
                                 continue;
                             }
                             context_shift_prompt(ctx, slot);
@@ -4157,7 +4195,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             mtp_media_callback, &mtp_media_warmup);
                     if (res != 0) {
                         LLAMA_LOG_ERROR("failed to process image, res = %d\n", res);
-                        slot.release();
+                        release_slot(slot, "image processing failure");
                         send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                         continue;
                     }
@@ -4423,7 +4461,7 @@ void server_context::speculative_decoding_accept() {
                 {"error", e.what()},
             });
             send_error(slot, std::string("sampling error: ") + e.what(), ERROR_TYPE_SERVER);
-            slot.release();
+            release_slot(slot, "speculative sampling failure");
             slot.i_batch = -1;
             slot.i_batch_dft.clear();
             slot.drafted.clear();
@@ -4546,7 +4584,7 @@ void server_context::release_slot_after_final_response(server_slot & slot) {
     if (params_base.do_checkpoint) {
         create_checkpoint(slot);
     }
-    slot.release();
+    release_slot(slot, "final response");
     slot.released = true;
     metrics.on_prediction(slot);
 }
@@ -4666,7 +4704,7 @@ inline int32_t check_ban_phrase(server_slot& slot) {
     return -1;
 }
 
-inline void rewind_context(server_slot& slot, int32_t ban_pos) {
+void server_context::rewind_context(server_slot& slot, int32_t ban_pos) {
     slot.rewind_count++;
 
     int32_t buffer_start_pos = slot.n_past - (int32_t)slot.token_buffer.size() + 1;
@@ -4713,7 +4751,11 @@ inline void rewind_context(server_slot& slot, int32_t ban_pos) {
     slot.n_past = slot.cache_tokens.n_tokens();
 
     // Remove from KV cache
-    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
+    const llama_pos p0 = slot.cache_tokens.pos_next(slot.n_past);
+    llama_kv_cache_seq_rm(slot.ctx, slot.id, p0, -1);
+    if (!trim_slot_companion_state(slot, p0, "string-ban rewind")) {
+        clear_slot_companion_state(slot, true, "string-ban rewind full clear");
+    }
 
     // Truncate buffer
     slot.token_buffer.resize(n_keep_buffer);
@@ -4846,10 +4888,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                         llama_pos cur_pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
                         slot.n_past = slot.cache_tokens.size_up_to_pos(cur_pos + 1);
                         slot.cache_tokens.keep_first(slot.n_past);
-                        slot.release();
+                        release_slot(slot, "decode cancelled");
                     }
                     else {
-                        slot.release();
+                        release_slot(slot, "decode failure");
                         LLAMA_LOG_INFO("n_past = %d\n", (int)slot.cache_tokens.size());
                         send_error(slot, "Input prompt is too big compared to KV size. Please try increasing KV size.");
                     }
@@ -4904,7 +4946,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             // prompt evaluated for embedding
             if (slot.embedding) {
                 send_embedding(slot, batch_view);
-                slot.release();
+                release_slot(slot, "embedding complete");
                 slot.i_batch = -1;
                 continue; // continue loop of slots
             }
@@ -4952,7 +4994,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     {"error", e.what()},
                 });
                 send_error(slot, std::string("sampling error: ") + e.what(), ERROR_TYPE_SERVER);
-                slot.release();
+                release_slot(slot, "sampling failure");
                 slot.i_batch = -1;
                 continue;
             }
