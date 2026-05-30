@@ -82,6 +82,12 @@ static bool server_mtp_batched_draft_enabled() {
     return enabled;
 }
 
+static bool server_mtp_range_ckpt_enabled() {
+    static const bool enabled = std::getenv("IK_MTP_RANGE_CKPT") != nullptr ||
+                                std::getenv("IK_MTP_RANGE_CHECKPOINT") != nullptr;
+    return enabled;
+}
+
 static server_mtp_profile & server_mtp_prof() {
     static server_mtp_profile profile;
     return profile;
@@ -354,6 +360,91 @@ static bool server_batch_needs_recurrent_seq_split(const llama_batch & batch, in
     return has_repeated_seq && seen.size() > 1;
 }
 
+static bool server_slot_spec_indices_are_contiguous(const server_slot & slot, const llama_batch & batch) {
+    if (slot.i_batch_dft.empty()) {
+        return false;
+    }
+    if (!slot.has_mtp || slot.spec == nullptr) {
+        return false;
+    }
+
+    const int32_t first = slot.i_batch_dft.front();
+    if (first < 0 || first + (int32_t) slot.i_batch_dft.size() > batch.n_tokens) {
+        return false;
+    }
+
+    if (batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        return false;
+    }
+
+    for (size_t i = 0; i < slot.i_batch_dft.size(); ++i) {
+        const int32_t idx = first + (int32_t) i;
+        if (slot.i_batch_dft[i] != idx) {
+            return false;
+        }
+        if (batch.n_seq_id[idx] != 1 || batch.seq_id[idx] == nullptr || batch.seq_id[idx][0] != slot.id) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool server_can_defer_speculative_checkpoints_to_ranges(
+        const std::vector<server_slot> & slots, const llama_batch & batch, int32_t n_batch) {
+    bool found = false;
+    for (const auto & slot : slots) {
+        if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
+            continue;
+        }
+        found = true;
+        if (!server_slot_spec_indices_are_contiguous(slot, batch)) {
+            return false;
+        }
+        if (n_batch <= 0 || (int32_t) slot.i_batch_dft.size() > n_batch) {
+            return false;
+        }
+
+        const int32_t first = slot.i_batch_dft.front();
+        const int32_t last  = slot.i_batch_dft.back();
+        if (first / n_batch != last / n_batch) {
+            return false;
+        }
+    }
+
+    return found;
+}
+
+static server_slot * server_find_single_speculative_slot_in_range(
+        std::vector<server_slot> & slots, int32_t begin, int32_t n_tokens) {
+    server_slot * found = nullptr;
+    const int32_t end = begin + n_tokens;
+
+    for (auto & slot : slots) {
+        if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
+            continue;
+        }
+
+        const bool any_in_range = std::any_of(slot.i_batch_dft.begin(), slot.i_batch_dft.end(), [&](int32_t idx) {
+            return idx >= begin && idx < end;
+        });
+        if (!any_in_range) {
+            continue;
+        }
+
+        const bool all_in_range = std::all_of(slot.i_batch_dft.begin(), slot.i_batch_dft.end(), [&](int32_t idx) {
+            return idx >= begin && idx < end;
+        });
+        if (!all_in_range || found != nullptr) {
+            return nullptr;
+        }
+
+        found = &slot;
+    }
+
+    return found;
+}
+
 static bool server_speculative_same_stage_types(
         const common_params_speculative & lhs,
         const common_params_speculative & rhs) {
@@ -505,14 +596,29 @@ bool server_context::load_model(const gpt_params& params_) {
             LOG_WARNING("experimental shared MTP context enabled for parallel slots\n", {
                 {"n_parallel", params_base.n_parallel},
             });
-            if (llama_model_has_recurrent(model) &&
-                    params_base.speculative.recurrent_ckpt_mode != LLAMA_SPEC_CKPT_CPU) {
-                // The GPU per-step recurrent checkpoint buffers are currently context-global.
-                // Until they are made multi-slot aware, shared parallel MTP must use the CPU path.
-                LOG_WARNING("forcing CPU recurrent checkpoints for experimental shared parallel MTP\n", {
-                    {"n_parallel", params_base.n_parallel},
-                });
-                params_base.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_CPU;
+            if (llama_model_has_recurrent(model)) {
+                if (server_mtp_range_ckpt_enabled()) {
+                    if (params_base.speculative.recurrent_ckpt_mode != LLAMA_SPEC_CKPT_CPU &&
+                            params_base.speculative.recurrent_ckpt_mode != LLAMA_SPEC_CKPT_GPU_FALLBACK) {
+                        // Per-step checkpoints are still context-global and are not safe for
+                        // shared parallel MTP. The range-scheduled probe uses GPU fallback
+                        // to avoid CPU serialization while keeping restore/redecode semantics.
+                        LOG_WARNING("forcing gpu-fallback recurrent checkpoints for experimental shared parallel MTP range checkpoints\n", {
+                            {"n_parallel", params_base.n_parallel},
+                        });
+                        params_base.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_GPU_FALLBACK;
+                    }
+                    LOG_WARNING("experimental shared parallel MTP will checkpoint per validation range\n", {
+                        {"n_parallel", params_base.n_parallel},
+                    });
+                } else if (params_base.speculative.recurrent_ckpt_mode != LLAMA_SPEC_CKPT_CPU) {
+                    // The GPU per-step recurrent checkpoint buffers are currently context-global.
+                    // Until they are made multi-slot aware, shared parallel MTP must use the CPU path.
+                    LOG_WARNING("forcing CPU recurrent checkpoints for experimental shared parallel MTP\n", {
+                        {"n_parallel", params_base.n_parallel},
+                    });
+                    params_base.speculative.recurrent_ckpt_mode = LLAMA_SPEC_CKPT_CPU;
+                }
             }
         } else {
             if (server_mtp_shared_context_enabled() && !has_draft_model && recurrent_flash_attn) {
@@ -5068,6 +5174,20 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
+        if (llama_model_has_recurrent(model) && server_mtp_range_ckpt_enabled() && ctx_mtp_shared != nullptr) {
+            server_slot * slot_ckpt = server_find_single_speculative_slot_in_range(slots, i, n_tokens);
+            if (slot_ckpt != nullptr && !slot_ckpt->spec_ckpt.valid) {
+                const int ckpt_mode = params_base.speculative.recurrent_ckpt_mode;
+                if (save_speculative_checkpoint(*slot_ckpt, model, ctx, ckpt_mode)) {
+                    const char * mode_name = slot_ckpt->spec_ckpt.per_step_enabled ? "per-step" : "shadow/cpu";
+                    SLT_DBG(*slot_ckpt, "range spec checkpoint saved (mode=%s), n_past_pre_spec=%d\n",
+                        mode_name, slot_ckpt->spec_ckpt.n_past);
+                } else {
+                    SLT_WRN(*slot_ckpt, "%s", "failed to save range spec checkpoint\n");
+                }
+            }
+        }
+
         int64_t t0 = server_mtp_prof_now();
         const int ret = llama_decode(ctx, batch_view);
         server_mtp_prof_add(server_mtp_prof().process_batch_decode, t0, n_tokens);
@@ -5342,7 +5462,13 @@ void server_context::update_slots() {
     // make sure we're in the right embedding mode
     llama_set_embeddings(ctx, batch_type == 1);
 
-    if (llama_model_has_recurrent(model)) {
+    const bool defer_spec_ckpt_to_ranges =
+        llama_model_has_recurrent(model) &&
+        server_mtp_range_ckpt_enabled() &&
+        ctx_mtp_shared != nullptr &&
+        server_can_defer_speculative_checkpoints_to_ranges(slots, batch, n_batch);
+
+    if (llama_model_has_recurrent(model) && !defer_spec_ckpt_to_ranges) {
         const int ckpt_mode = params_base.speculative.recurrent_ckpt_mode;
 
         for (auto & slot : slots) {
