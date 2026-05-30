@@ -316,6 +316,12 @@ struct server_context {
 
     void copy_data_to_cached_prompt(const server_tokens& tokens, server_slot& slot);
 
+    llama_context * companion_ctx_for_slot(server_slot& slot) const;
+
+    bool clear_slot_companion_state(server_slot& slot, bool clear_kv, const char * reason);
+
+    bool trim_slot_companion_state(server_slot& slot, llama_pos p0, const char * reason);
+
     server_slot* get_available_slot(const server_task& task);
 
     int32_t populate_vocab_pieces();

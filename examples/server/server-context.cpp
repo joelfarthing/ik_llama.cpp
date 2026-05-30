@@ -676,6 +676,69 @@ void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_to
     }
 }
 
+llama_context * server_context::companion_ctx_for_slot(server_slot& slot) const {
+    if (slot.spec == nullptr) {
+        return nullptr;
+    }
+
+    return common_speculative_get_companion_ctx(slot.spec);
+}
+
+bool server_context::clear_slot_companion_state(server_slot& slot, bool clear_kv, const char * reason) {
+    if (slot.spec == nullptr) {
+        return true;
+    }
+
+    common_speculative_clear_sequence_hidden(slot.spec, slot.id);
+    slot.drafted.clear();
+    slot.drafted_spec_type = COMMON_SPECULATIVE_TYPE_NONE;
+    slot.i_batch_dft.clear();
+    slot.spec_ckpt.clear();
+
+    llama_context * ctx_companion = companion_ctx_for_slot(slot);
+    bool ok = true;
+    if (clear_kv && ctx_companion != nullptr) {
+        ok = llama_kv_cache_seq_rm(ctx_companion, slot.id, -1, -1);
+    }
+
+    LOG_VERBOSE("slot companion speculative state cleared", {
+        {"id_slot", slot.id},
+        {"reason", reason ? reason : ""},
+        {"clear_kv", clear_kv},
+        {"has_companion_ctx", ctx_companion != nullptr},
+        {"shared_mtp", ctx_companion != nullptr && ctx_companion == ctx_mtp_shared},
+        {"ok", ok},
+    });
+
+    return ok;
+}
+
+bool server_context::trim_slot_companion_state(server_slot& slot, llama_pos p0, const char * reason) {
+    if (slot.spec == nullptr) {
+        return true;
+    }
+
+    llama_context * ctx_companion = companion_ctx_for_slot(slot);
+    if (ctx_companion == nullptr) {
+        return true;
+    }
+
+    const bool ok = llama_kv_cache_seq_rm(ctx_companion, slot.id, p0, -1);
+    if (ok) {
+        common_speculative_clear_sequence_hidden(slot.spec, slot.id);
+    }
+
+    LOG_VERBOSE("slot companion speculative state trimmed", {
+        {"id_slot", slot.id},
+        {"reason", reason ? reason : ""},
+        {"p0", p0},
+        {"shared_mtp", ctx_companion == ctx_mtp_shared},
+        {"ok", ok},
+    });
+
+    return ok;
+}
+
 void server_slot::reset() {
     n_prompt_tokens = 0;
     last_gentxt_size = 0;
@@ -1226,6 +1289,7 @@ server_slot* server_context::get_available_slot(const server_task& task) {
             copy_data_to_cached_prompt(tokens, *ret);
 
             ret->prompt_load(*prompt_cache, task.tokens);
+            clear_slot_companion_state(*ret, true, "target-only prompt cache restore");
             prompt_cache->update();
 
             ret->cache_tokens = ret->server_cached_prompt.tokens.clone(); // recover cache tokens
@@ -2155,14 +2219,18 @@ void server_context::kv_cache_clear() {
 
     // clear the entire KV cache
     llama_kv_cache_clear(ctx);
+    std::vector<llama_context *> cleared_companion_contexts;
     for (auto & slot : slots) {
         if (slot.spec == nullptr) {
             continue;
         }
 
-        common_speculative_clear_sequence_hidden(slot.spec, slot.id);
-        if (auto * ctx_companion = common_speculative_get_companion_ctx(slot.spec); ctx_companion != nullptr) {
+        clear_slot_companion_state(slot, false, "target kv cache clear");
+        if (auto * ctx_companion = companion_ctx_for_slot(slot);
+                ctx_companion != nullptr &&
+                std::find(cleared_companion_contexts.begin(), cleared_companion_contexts.end(), ctx_companion) == cleared_companion_contexts.end()) {
             llama_kv_cache_clear(ctx_companion);
+            cleared_companion_contexts.push_back(ctx_companion);
         }
     }
     clean_kv_cache = false;
@@ -2216,6 +2284,7 @@ bool server_context::system_prompt_set(const std::string& sys_prompt) {
     // release all slots
     for (server_slot& slot : slots) {
         slot.release();
+        clear_slot_companion_state(slot, true, "system prompt reset");
         slot.cache_tokens.clear();
         slot.n_past = 0;
         slot.n_past_prompt = 0;
@@ -2958,6 +3027,7 @@ void server_context::process_single_task(server_task&& task) {
         for (auto& slot : slots) {
             if (slot.id_task == task.id_target) {
                 slot.release();
+                clear_slot_companion_state(slot, true, "task cancellation");
                 break;
             }
         }
@@ -4036,15 +4106,12 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 slot.cache_tokens.keep_first(slot.n_past);
                 int p0 = (int)system_tokens.size() + slot.n_past;
                 p0 = system_tokens.size() + slot.cache_tokens.pos_next();
-                auto * ctx_companion = slot.spec ? common_speculative_get_companion_ctx(slot.spec) : nullptr;
                 const bool target_trimmed = llama_kv_cache_seq_rm(ctx, slot.id, p0, -1);
-                const bool companion_trimmed = ctx_companion == nullptr || llama_kv_cache_seq_rm(ctx_companion, slot.id, p0, -1);
+                const bool companion_trimmed = trim_slot_companion_state(slot, p0, "prompt reuse trim");
                 if (!target_trimmed || !companion_trimmed) {
                     // could not partially delete (likely using a non-Transformer model)
                     llama_kv_cache_seq_rm(ctx, slot.id, -1, -1);
-                    if (ctx_companion != nullptr) {
-                        llama_kv_cache_seq_rm(ctx_companion, slot.id, -1, -1);
-                    }
+                    clear_slot_companion_state(slot, true, "prompt reuse full clear");
 
                     p0 = (int)system_tokens.size();
                     if (p0 != 0) {
