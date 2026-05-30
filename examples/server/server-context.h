@@ -42,7 +42,6 @@ struct server_slot {
     struct slot_params params;
 
     llama_batch batch_spec = {};
-    llama_context * ctx_dft = nullptr;
 
     bool released = false;
     slot_state state = SLOT_STATE_IDLE;
@@ -270,7 +269,6 @@ struct server_context {
 
     // For speculative decoding
     llama_model* model_draft = nullptr;
-    llama_context* ctx_draft = nullptr;
     llama_context* ctx_mtp_shared = nullptr;
     llama_context_params cparams_dft;
 
@@ -323,6 +321,10 @@ struct server_context {
     bool clear_slot_companion_state(server_slot& slot, bool clear_kv, const char * reason);
 
     bool trim_slot_companion_state(server_slot& slot, llama_pos p0, const char * reason);
+
+    void shift_slot_companion_state(server_slot& slot, llama_pos kv_keep, llama_pos kv_discard, llama_pos kv_past, const char * reason);
+
+    void release_slot(server_slot& slot, const char * reason);
 
     server_slot* get_available_slot(const server_task& task);
 
@@ -406,6 +408,8 @@ struct server_context {
     void send_token_results(completion_token_outputs& results, server_slot& slot, int32_t n = 0);
 
     void buffer_and_check_string_ban(server_slot& slot, completion_token_output& result);
+
+    void rewind_context(server_slot& slot, int32_t ban_pos);
 
     void update_allowlist_state(server_slot& slot);
 
