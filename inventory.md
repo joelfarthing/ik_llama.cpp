@@ -12,15 +12,15 @@ This file is a map, not authority. Follow repo instructions, README files, and t
 ## Summary
 
 - Repository: `joelfarthing/ik_llama.cpp`
-- Default branch: `main`
-- Tracked files listed: `2469`
+- Current branch when generated: `main`
+- Tracked files listed: `2471`
+- Path-set hash: `a1b427dc6db6fbbda351c8551675b7db1344edc7da94e543dedc265731364703`
 - Source: `git ls-files`
 - Intended use: read this file first, then request exact paths from the lists below.
-- GitHub description: llama.cpp fork with additional SOTA quants and improved performance
 
 ## Top-Level Map
 
-- `root files` - 31 files
+- `root files` - 33 files
 - `.devops/` - 25 files
 - `.github/` - 10 files
 - `ci/` - 2 files
@@ -121,6 +121,8 @@ This file is a map, not authority. Follow repo instructions, README files, and t
 - `docker-bake.override.hcl`
 - `flake.lock`
 - `flake.nix`
+- `inventory.json`
+- `inventory.md`
 - `LICENSE`
 - `Makefile`
 - `mypy.ini`
