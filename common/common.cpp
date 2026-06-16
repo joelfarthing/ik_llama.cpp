@@ -95,6 +95,235 @@ common_time_meas::~common_time_meas() {
         t_acc += ggml_time_us() - t_start_us;
     }
 }
+
+bool common_speculative_type_is_self_spec(enum common_speculative_type type) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+        case COMMON_SPECULATIVE_TYPE_SUFFIX:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int32_t common_speculative_stage_effective_n_max(
+        const common_params_speculative & params,
+        const common_speculative_stage_params & stage) {
+    return stage.has_n_max_override() ? stage.n_max : params.n_max;
+}
+
+static int32_t common_speculative_stage_effective_n_min(
+        const common_params_speculative & params,
+        const common_speculative_stage_params & stage) {
+    return stage.has_n_min_override() ? stage.n_min : params.n_min;
+}
+
+std::vector<common_speculative_stage_params> common_params_speculative::get_resolved_stages() const {
+    if (!stages.empty()) {
+        std::vector<common_speculative_stage_params> resolved;
+        resolved.reserve(stages.size());
+
+        for (const auto & stage : stages) {
+            if (stage.type != COMMON_SPECULATIVE_TYPE_NONE) {
+                resolved.push_back(stage);
+            }
+        }
+
+        return resolved;
+    }
+
+    if (type == COMMON_SPECULATIVE_TYPE_NONE) {
+        return {};
+    }
+
+    return {{ .type = type }};
+}
+
+common_params_speculative common_params_speculative::with_stage_overrides(const common_speculative_stage_params & stage) const {
+    common_params_speculative result = *this;
+
+    result.type = stage.type;
+
+    if (stage.has_n_max_override()) {
+        result.n_max = stage.n_max;
+    }
+    if (stage.has_n_min_override()) {
+        result.n_min = stage.n_min;
+    }
+    if (stage.has_p_min_override()) {
+        result.p_min = stage.p_min;
+    }
+    if (stage.has_ngram_size_n_override()) {
+        result.ngram_size_n = stage.ngram_size_n;
+        result.ngram_mod.reset();
+    }
+    if (stage.has_ngram_size_m_override()) {
+        result.ngram_size_m = stage.ngram_size_m;
+    }
+    if (stage.has_ngram_min_hits_override()) {
+        result.ngram_min_hits = stage.ngram_min_hits;
+    }
+    if (stage.has_suffix_min_match_len_override()) {
+        result.suffix_min_match_len = stage.suffix_min_match_len;
+    }
+    if (stage.has_suffix_max_depth_override()) {
+        result.suffix_max_depth = stage.suffix_max_depth;
+    }
+    if (stage.has_suffix_corpus_override()) {
+        result.suffix_corpus = stage.suffix_corpus;
+    }
+
+    result.n_max = std::max(result.n_max, 0);
+    result.n_min = std::max(0, std::min(result.n_min, result.n_max));
+    result.stages.clear();
+
+    return result;
+}
+
+bool common_params_speculative::has_stage_chain() const {
+    return !get_resolved_stages().empty();
+}
+
+bool common_params_speculative::has_stage_type(common_speculative_type stage_type) const {
+    const auto resolved = get_resolved_stages();
+    return std::any_of(resolved.begin(), resolved.end(), [stage_type](const common_speculative_stage_params & stage) {
+        return stage.type == stage_type;
+    });
+}
+
+void common_params_speculative::remove_stage_type(common_speculative_type stage_type) {
+    stages.erase(std::remove_if(stages.begin(), stages.end(), [stage_type](const common_speculative_stage_params & stage) {
+        return stage.type == stage_type;
+    }), stages.end());
+
+    if (type == stage_type) {
+        const auto resolved = get_resolved_stages();
+        type = resolved.empty() ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+    }
+}
+
+bool common_params_speculative::has_composite_stage_chain() const {
+    return get_resolved_stages().size() > 1;
+}
+
+bool common_params_speculative::needs_dft_model() const {
+    return has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT) ||
+        (has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) && has_dft());
+}
+
+void common_params_speculative::clear_dft() {
+    if (model_dft != nullptr) {
+        llama_free_model(model_dft);
+        model_dft = nullptr;
+    }
+
+    model.clear();
+    params.clear();
+    mparams_dft.path.clear();
+    cparams_dft = llama_context_default_params();
+}
+
+int32_t common_params_speculative::get_max_stage_n_max() const {
+    const auto resolved = get_resolved_stages();
+    if (resolved.empty()) {
+        return std::max(n_max, 0);
+    }
+
+    int32_t max_n_max = 0;
+    for (const auto & stage : resolved) {
+        max_n_max = std::max(max_n_max, common_speculative_stage_effective_n_max(*this, stage));
+    }
+
+    return std::max(max_n_max, 0);
+}
+
+int32_t common_params_speculative::get_min_usable_stage_n_min() const {
+    const auto resolved = get_resolved_stages();
+    if (resolved.empty()) {
+        return std::max(0, std::min(n_min, n_max));
+    }
+
+    int32_t min_n_min = INT_MAX;
+    for (const auto & stage : resolved) {
+        min_n_min = std::min(min_n_min, std::max(0, std::min(common_speculative_stage_effective_n_min(*this, stage), common_speculative_stage_effective_n_max(*this, stage))));
+    }
+
+    return min_n_min == INT_MAX ? 0 : min_n_min;
+}
+
+bool common_speculative_validate_chain(const common_params_speculative & params, std::string * error) {
+    const auto fail = [error](const std::string & msg) {
+        if (error != nullptr) {
+            *error = msg;
+        }
+        return false;
+    };
+
+    const auto resolved = params.get_resolved_stages();
+    if (resolved.empty()) {
+        return true;
+    }
+
+    if (resolved.size() > 2) {
+        return fail("at most two speculative stages are supported in this PR");
+    }
+
+    std::unordered_set<int> seen_types;
+    for (const auto & stage : resolved) {
+        if (stage.type == COMMON_SPECULATIVE_TYPE_NONE && resolved.size() > 1) {
+            return fail("the 'none' speculative stage cannot be combined with other stages");
+        }
+
+        if (!seen_types.insert((int) stage.type).second) {
+            return fail("duplicate speculative stage type in chain: " + common_speculative_type_to_str(stage.type));
+        }
+
+        const auto stage_params = params.with_stage_overrides(stage);
+        if (stage_params.n_min > stage_params.n_max) {
+            return fail("speculative stage has n_min greater than n_max");
+        }
+
+        if (stage.type == COMMON_SPECULATIVE_TYPE_DRAFT && !params.has_dft()) {
+            return fail("draft speculative stage requires a draft model or draft params");
+        }
+    }
+
+    if (resolved.size() == 2) {
+        const auto first = resolved[0].type;
+        const auto second = resolved[1].type;
+
+        if (!common_speculative_type_is_self_spec(first)) {
+            return fail("two-stage speculative mode currently requires a self-spec stage first");
+        }
+
+        if (second != COMMON_SPECULATIVE_TYPE_MTP && second != COMMON_SPECULATIVE_TYPE_DRAFT) {
+            return fail("two-stage speculative mode currently supports only MTP or draft-model fallback after self-spec");
+        }
+    }
+
+    return true;
+}
+
+std::string common_speculative_stage_chain_to_str(const common_params_speculative & params) {
+    const auto resolved = params.get_resolved_stages();
+    if (resolved.empty()) {
+        return "none";
+    }
+
+    std::ostringstream oss;
+    for (size_t i = 0; i < resolved.size(); ++i) {
+        if (i > 0) {
+            oss << " -> ";
+        }
+        oss << common_speculative_type_to_str(resolved[i].type);
+    }
+
+    return oss.str();
+}
 //
 // Environment variable utils
 //
@@ -419,6 +648,30 @@ static bool is_autoy(const std::string & value) {
     return value == "auto" || value == "-1";
 }
 
+static void common_speculative_finalize_stages(gpt_params & params) {
+    auto & spec = params.speculative;
+
+    if (!spec.stages.empty()) {
+        const auto resolved = spec.get_resolved_stages();
+        if (resolved.size() != spec.stages.size()) {
+            spec.stages = resolved;
+        }
+
+        spec.type = resolved.empty() ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+        params.has_mtp = spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+        return;
+    }
+
+    if (spec.type != COMMON_SPECULATIVE_TYPE_NONE) {
+        spec.stages.push_back({ .type = spec.type });
+    } else if (params.has_mtp) {
+        spec.stages.push_back({ .type = COMMON_SPECULATIVE_TYPE_MTP });
+    }
+
+    spec.type = spec.stages.empty() ? COMMON_SPECULATIVE_TYPE_NONE : spec.stages.front().type;
+    params.has_mtp = spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+}
+
 bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     bool invalid_param = false;
     std::string arg;
@@ -472,6 +725,10 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     if (!params.tensor_buft_overrides.empty()) {
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
+    if (!params.fit_margin_array.empty()) {
+        params.fit_margin_array.push_back(-1);
+        params.fit_margin_array.push_back(0);
+    }
 
     if (!params.chat_template.empty() && !common_chat_verify_template(params.chat_template, params.use_jinja)) {
         throw std::runtime_error(string_format(
@@ -480,6 +737,14 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
             params.use_jinja ? "" : "\nnote: llama.cpp was started without --jinja, we only support commonly used templates"
         ));
     }
+
+    common_speculative_finalize_stages(params);
+
+    std::string spec_error;
+    if (!common_speculative_validate_chain(params.speculative, &spec_error)) {
+        throw std::invalid_argument("error: invalid speculative stage configuration: " + spec_error);
+    }
+
     return true;
 }
 
@@ -586,6 +851,215 @@ std::vector<std::pair<T1,T2>> string_split_pairs(const std::string & str, char d
     }
     return values;
 }
+
+static std::string common_normalize_spec_stage_key(std::string key) {
+    while (!key.empty() && key.front() == '-') {
+        key.erase(key.begin());
+    }
+
+    std::replace(key.begin(), key.end(), '-', '_');
+
+    return key;
+}
+
+static std::invalid_argument common_speculative_legacy_option_error(
+        const std::string & arg,
+        const std::string & replacement) {
+    return std::invalid_argument(
+        "legacy speculative option '" + arg + "' is disabled; use " + replacement);
+}
+
+static void common_speculative_remove_explicit_stage(common_params_speculative & params, common_speculative_type type) {
+    params.stages.erase(std::remove_if(params.stages.begin(), params.stages.end(), [type](const common_speculative_stage_params & stage) {
+        return stage.type == type;
+    }), params.stages.end());
+
+    if (params.stages.empty() && params.type == type) {
+        params.type = COMMON_SPECULATIVE_TYPE_NONE;
+    }
+}
+
+static void common_speculative_stage_apply_kv(
+        common_speculative_stage_params & stage,
+        const std::string & key_raw,
+        const std::string & value_raw) {
+    const std::string key = common_normalize_spec_stage_key(key_raw);
+
+    if (key == "n_max") {
+        stage.n_max = std::stoi(value_raw);
+        if (stage.n_max < 0) {
+            throw std::invalid_argument("speculative stage n_max must be >= 0");
+        }
+        return;
+    }
+    if (key == "n_min") {
+        stage.n_min = std::stoi(value_raw);
+        if (stage.n_min < 0) {
+            throw std::invalid_argument("speculative stage n_min must be >= 0");
+        }
+        return;
+    }
+    if (key == "p_min") {
+        stage.p_min = std::stof(value_raw);
+        if (stage.p_min < 0.0f) {
+            throw std::invalid_argument("speculative stage p_min must be >= 0");
+        }
+        return;
+    }
+    if (key == "ngram_size_n") {
+        stage.ngram_size_n = std::stoi(value_raw);
+        if (stage.ngram_size_n < 1 || stage.ngram_size_n > 1024) {
+            throw std::invalid_argument("speculative stage ngram_size_n must be between 1 and 1024 inclusive");
+        }
+        return;
+    }
+    if (key == "ngram_size_m") {
+        stage.ngram_size_m = std::stoi(value_raw);
+        if (stage.ngram_size_m < 1 || stage.ngram_size_m > 1024) {
+            throw std::invalid_argument("speculative stage ngram_size_m must be between 1 and 1024 inclusive");
+        }
+        return;
+    }
+    if (key == "ngram_min_hits") {
+        stage.ngram_min_hits = std::stoi(value_raw);
+        if (stage.ngram_min_hits < 1) {
+            throw std::invalid_argument("speculative stage ngram_min_hits must be at least 1");
+        }
+        return;
+    }
+    if (key == "suffix_min_match_len") {
+        stage.suffix_min_match_len = std::stoi(value_raw);
+        if (stage.suffix_min_match_len < 1) {
+            throw std::invalid_argument("speculative stage suffix_min_match_len must be at least 1");
+        }
+        return;
+    }
+    if (key == "suffix_max_depth") {
+        stage.suffix_max_depth = std::stoi(value_raw);
+        if (stage.suffix_max_depth < 1) {
+            throw std::invalid_argument("speculative stage suffix_max_depth must be at least 1");
+        }
+        return;
+    }
+    if (key == "suffix_corpus") {
+        stage.suffix_corpus = value_raw;
+        if (stage.suffix_corpus.empty()) {
+            throw std::invalid_argument("speculative stage suffix_corpus must not be empty");
+        }
+        return;
+    }
+
+    throw std::invalid_argument("unknown speculative stage parameter: " + key_raw);
+}
+
+static std::vector<std::string> common_speculative_stage_split_kvs(const std::string & values) {
+    std::vector<std::string> result;
+    std::string current;
+    char quote = '\0';
+    bool escaped = false;
+
+    for (char ch : values) {
+        if (escaped) {
+            current += ch;
+            escaped = false;
+            continue;
+        }
+
+        if (ch == '\\') {
+            current += ch;
+            escaped = true;
+            continue;
+        }
+
+        if (quote != '\0') {
+            if (ch == quote) {
+                quote = '\0';
+            }
+            current += ch;
+            continue;
+        }
+
+        if ((ch == '\'' || ch == '"') && !current.empty() && current.back() == '=') {
+            quote = ch;
+            current += ch;
+            continue;
+        }
+
+        if (ch == ',') {
+            result.push_back(current);
+            current.clear();
+            continue;
+        }
+
+        current += ch;
+    }
+
+    if (quote != '\0') {
+        throw std::invalid_argument("invalid speculative stage option list: unterminated quote");
+    }
+
+    result.push_back(current);
+    return result;
+}
+
+static std::string common_speculative_stage_unescape_value(const std::string & value_raw) {
+    std::string value = value_raw;
+    if (value.size() >= 2) {
+        const char first = value.front();
+        const char last = value.back();
+        if ((first == '\'' && last == '\'') || (first == '"' && last == '"')) {
+            value = value.substr(1, value.size() - 2);
+        }
+    }
+
+    std::string result;
+    result.reserve(value.size());
+
+    for (size_t i = 0; i < value.size(); ++i) {
+        const char ch = value[i];
+        if (ch != '\\' || i + 1 >= value.size()) {
+            result += ch;
+            continue;
+        }
+
+        const char next = value[i + 1];
+        if (next == '\\' || next == ',' || next == '\'' || next == '"') {
+            result += next;
+            ++i;
+            continue;
+        }
+
+        result += ch;
+    }
+
+    return result;
+}
+
+static common_speculative_stage_params common_speculative_stage_from_arg(const std::string & value) {
+    const auto spec_pos = value.find(':');
+    const std::string type_name = value.substr(0, spec_pos);
+
+    common_speculative_stage_params stage;
+    stage.type = common_speculative_type_from_name(type_name);
+    if (stage.type == COMMON_SPECULATIVE_TYPE_COUNT) {
+        throw std::invalid_argument("unknown speculative stage type: " + type_name);
+    }
+
+    if (spec_pos == std::string::npos) {
+        return stage;
+    }
+
+    for (const std::string & kv : common_speculative_stage_split_kvs(value.substr(spec_pos + 1))) {
+        const auto eq_pos = kv.find('=');
+        if (eq_pos == std::string::npos) {
+            throw std::invalid_argument("invalid speculative stage option: " + kv);
+        }
+
+        common_speculative_stage_apply_kv(stage, kv.substr(0, eq_pos), common_speculative_stage_unescape_value(kv.substr(eq_pos + 1)));
+    }
+
+    return stage;
+}
 }
 
 #define CHECK_ARG if (++i >= argc) { invalid_param = true; return true; }
@@ -615,6 +1089,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.n_threads_batch = std::stoi(argv[i]);
         if (params.n_threads_batch <= 0) {
             params.n_threads_batch = std::thread::hardware_concurrency();
+        }
+        return true;
+    }
+    if (arg == "-tm" || arg == "--threads-mtmd") {
+        CHECK_ARG
+        params.n_threads_mtmd = std::stoi(argv[i]);
+        if (params.n_threads_mtmd <= 0) {
+            params.n_threads_mtmd = std::thread::hardware_concurrency();
         }
         return true;
     }
@@ -1020,18 +1502,18 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--draft" || arg == "--draft-max" || arg == "--draft-n") {
         CHECK_ARG
-        params.speculative.n_max = std::stoi(argv[i]);
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the value inside the relevant repeated --spec-type entry, e.g. --spec-type mtp:n_max=" + std::string(argv[i]) + ",p_min=0.0 or --spec-type draft:n_max=" + std::string(argv[i]) + ",p_min=0.0");
     }
     if (arg == "--draft-min" || arg == "--draft-n-min") {
         CHECK_ARG
-        params.speculative.n_min = std::stoi(argv[i]);
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the value inside the relevant repeated --spec-type entry using the canonical key n_min, e.g. --spec-type ngram-mod:n_min=" + std::string(argv[i]));
     }
     if (arg == "--draft-p-min") {
         CHECK_ARG
-        params.speculative.p_min = std::stof(argv[i]);
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the value inside the relevant repeated --spec-type entry using the canonical key p_min, e.g. --spec-type mtp:p_min=" + std::string(argv[i]));
     }
     if (arg == "--recurrent-ckpt-mode") {
         CHECK_ARG
@@ -1084,77 +1566,48 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.speculative.model = argv[i];
         return true;
     }
+    if (arg == "--spec-stage") {
+        CHECK_ARG
+        throw common_speculative_legacy_option_error(arg,
+            "repeated --spec-type SPEC[:k=v,...] entries, e.g. --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0");
+    }
     if (arg == "--spec-type") {
         CHECK_ARG
-        std::string value = argv[i];
-        if (value == "none") {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
-        } else if (value == "ngram-cache") {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
-        } else if (value == "ngram-simple") {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
-        } else if (value == "ngram-map-k") {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K;
-        } else if (value == "ngram-map-k4v") {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
-        } else if (value == "ngram-mod") {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
-        } else if (value == "suffix") {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_SUFFIX;
-        } else {
-            throw std::invalid_argument("unknown speculative decoding type without draft model");
-        }
+        params.speculative.stages.push_back(common_speculative_stage_from_arg(argv[i]));
+        const auto resolved = params.speculative.get_resolved_stages();
+        params.speculative.type = resolved.empty() ? COMMON_SPECULATIVE_TYPE_NONE : resolved.front().type;
+        params.has_mtp = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
         return true;
     }
     if (arg == "--spec-ngram-size-n") {
         CHECK_ARG
-        int value = std::stoi(argv[i]);
-        if (value < 1 || value > 1024) {
-            throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
-        }
-        params.speculative.ngram_size_n = value;
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type ngram-mod:ngram_size_n=" + std::string(argv[i]));
     }
     if (arg == "--spec-ngram-size-m") {
         CHECK_ARG
-        int value = std::stoi(argv[i]);
-        if (value < 1 || value > 1024) {
-            throw std::invalid_argument("ngram size M must be between 1 and 1024 inclusive");
-        }
-        params.speculative.ngram_size_m = value;
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type ngram-map-k4v:ngram_size_m=" + std::string(argv[i]));
     }
     if (arg == "--spec-ngram-min-hits") {
         CHECK_ARG
-        int value = std::stoi(argv[i]);
-        if (value < 1) {
-            throw std::invalid_argument("ngram min hits must be at least 1");
-        }
-        params.speculative.ngram_min_hits = value;
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type ngram-map-k4v:ngram_min_hits=" + std::string(argv[i]));
     }
     if (arg == "--suffix-pattern-len") {
         CHECK_ARG
-        int value = std::stoi(argv[i]);
-        if (value < 1) {
-            throw std::invalid_argument("suffix pattern length must be at least 1");
-        }
-        params.speculative.suffix_min_match_len = value;
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type suffix:suffix_min_match_len=" + std::string(argv[i]));
     }
     if (arg == "--suffix-max-depth") {
         CHECK_ARG
-        int value = std::stoi(argv[i]);
-        if (value < 1) {
-            throw std::invalid_argument("suffix max depth must be at least 1");
-        }
-        params.speculative.suffix_max_depth = value;
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type suffix:suffix_max_depth=" + std::string(argv[i]));
     }
     if (arg == "--suffix-corpus") {
         CHECK_ARG
-        params.speculative.suffix_corpus = argv[i];
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "the canonical stage key inside --spec-type, e.g. --spec-type suffix:suffix_corpus=" + std::string(argv[i]));
     }
     if (arg == "-a" || arg == "--alias") {
         CHECK_ARG
@@ -1358,6 +1811,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--mtp-requantize-output-tensor" || arg == "-mtprot") {
+        CHECK_ARG
+        params.extra_output_type = argv[i];
+        return true;
+    }
     if (arg == "-ctkd" || arg == "--cache-type-k-draft") {
         params.speculative.cache_type_k = argv[++i];
         return true;
@@ -1410,6 +1868,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-amb" || arg == "--attention-max-batch") {
         CHECK_ARG
         params.attn_max_batch = std::stoi(argv[i]);
+        if (params.attn_max_batch > 0 && params.attn_max_batch < 128) {
+            LLAMA_LOG_WARN("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX amb = %d is too low. Changing to 128\n", params.attn_max_batch);
+            params.attn_max_batch = 128;
+        }
         return true;
     }
     if (arg == "-no-fmoe" || arg == "--no-fused-moe") {
@@ -1571,18 +2033,35 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--gpu-fit-margin" || arg == "-gfm") {
+        CHECK_ARG
+        auto p = string_split_pairs<int,int>(argv[i], ',');
+        if (p.empty()) {
+            fprintf(stderr, "error: invalid GPU split margin argument: %s\n", argv[i]);
+            invalid_param = true;
+        } else {
+            auto cur_size = params.fit_margin_array.size();
+            params.fit_margin_array.resize(cur_size + 2*p.size());
+            for (auto & pair : p) {
+                params.fit_margin_array[cur_size+0] = pair.first;
+                params.fit_margin_array[cur_size+1] = pair.second;
+                cur_size += 2;
+            }
+        }
+        return true;
+    }
     if (arg == "-cuda" || arg == "--cuda-params") {
         CHECK_ARG
         params.cuda_params = argv[i];
         return true;
     }
     if (arg == "-mtp" || arg == "--multi-token-prediction") {
-        params.has_mtp = true;
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "--spec-type mtp:n_max=1,p_min=0.0");
     }
     if (arg == "-no-mtp" || arg == "--no-multi-token-prediction") {
-        params.has_mtp = false;
-        return true;
+        throw common_speculative_legacy_option_error(arg,
+            "remove the mtp entry from repeated --spec-type arguments");
     }
     if (arg == "-draft" || arg == "--draft-params") {
         CHECK_ARG
@@ -1695,6 +2174,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.reduce_type = argv[i];
         return true;
     }
+    if (arg == "-gap" || arg == "--graph-attn-precision") {
+        CHECK_ARG
+        params.graph_attn_precision = argv[i];
+        return true;
+    }
     if (arg == "--numa") {
         CHECK_ARG
         std::string value(argv[i]);
@@ -1779,6 +2263,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--allowlist-keyword-delay") {
         CHECK_ARG
         params.allow_kw_delay = std::stoul(argv[i]);
+        return true;
+    }
+    if (arg == "--expiring-logit-bias-file") {
+        CHECK_ARG
+        std::string content = read_file(argv[i]);
+        argparse_expiring_logit_bias(content, sparams);
         return true;
     }
     if (arg == "-ld" || arg == "--logdir") {
@@ -1980,6 +2470,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--webui") {
         CHECK_ARG
         params.webui = common_webui_from_name(std::string(argv[i]));
+        return true;
+    }
+    if (arg == "--webui-mcp-proxy" || arg == "--ui-mcp-proxy") {
+        params.webui_mcp_proxy = true;
         return true;
     }
     if (arg == "--api-key") {
@@ -2290,6 +2784,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.lora_outfile = argv[i];
         return true;
     }
+    if (arg == "--output-draft" || arg == "--draft-output" || arg == "--draft-output-file") {
+        CHECK_ARG
+        params.out_file_draft = argv[i];
+        return true;
+    }
     if (arg == "-ofreq" || arg == "--output-frequency") {
         CHECK_ARG
         params.n_out_freq = std::stoi(argv[i]);
@@ -2452,6 +2951,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-s,    --seed SEED",            "RNG seed (default: %d, use random seed for < 0)", params.seed });
     options.push_back({ "*",           "-t,    --threads N",            "number of threads to use during generation (default: %d)", params.n_threads });
     options.push_back({ "*",           "-tb,   --threads-batch N",      "number of threads to use during batch and prompt processing (default: same as --threads)" });
+    options.push_back({ "multi-modality", "-tm,   --threads-mtmd N",    "number of threads to use during multimodal image processing (default: same as --threads-batch)" });
     options.push_back({ "speculative", "-td,   --threads-draft N",      "number of threads to use during generation (default: same as --threads)" });
     options.push_back({ "speculative", "-tbd,  --threads-batch-draft N",
                                                                         "number of threads to use during batch and prompt processing (default: same as --threads-draft)" });
@@ -2494,6 +2994,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",         "-smf16, --split-mode-f16,",       "Use f16 for data exchange between GPUs (default: %d)", true});
     options.push_back({ "*",         "-smf32, --split-mode-f32,",       "Use f32 for data exchange between GPUs (default: %d)", false});
     options.push_back({ "*",         "-grt, --graph-reduce-type",       "Type for data exchange between GPUs (default: %s)", "f32"});
+    options.push_back({ "*",         "-gap, --graph-attn-precision",    "Flash-attn precision under -sm graph (default: %s)", "f16"});
     options.push_back({ "*",         "-smgs, --split-mode-graph-scheduling,", "Force Split Mode Graph Scheduling (default: %d)", params.split_mode_graph_scheduling});
     options.push_back({ "*",         "-sas,  --scheduler_async,",       "Async evaluation of compute graphs: %d)", params.scheduler_async});
     options.push_back({ "*",         "-vq, --validate-quants",          "validate quantized data while loading the model (default: %d)", params.validate_quants});
@@ -2569,6 +3070,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       -l TOKEN_ID(+/-)BIAS",   "modifies the likelihood of token appearing in the completion,\n"
                                                                         "i.e. `--logit-bias 15043+1` to increase likelihood of token ' Hello',\n"
                                                                         "or `--logit-bias 15043-1` to decrease likelihood of token ' Hello'" });
+    options.push_back({ "*",           "       --expiring-logit-bias-file",
+                                                                        "original PR: https://github.com/ikawrakow/ik_llama.cpp/pull/1731\n"});
     options.push_back({ "main",        "       --cfg-negative-prompt PROMPT",
                                                                         "negative prompt to use for guidance (default: '%s')", sparams.cfg_negative_prompt.c_str() });
     options.push_back({ "main",        "       --cfg-negative-prompt-file FNAME",
@@ -2642,6 +3145,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ctv-last,  --cache-type-k-last  TYPE,N", "KV cache data type for the last N layers of K  (default: %s,-1)", params.type_k_last.c_str() });
     options.push_back({ "*",           "-ctv-first, --cache-type-v-first TYPE,N", "KV cache data type for the first N layers of V (default: %s,-1)", params.type_v_first.c_str() });
     options.push_back({ "*",           "-ctk-last,  --cache-type-v-last  TYPE,N", "KV cache data type for the last N layers of V  (default: %s,-1)", params.type_v_last.c_str() });
+    options.push_back({ "*",           "-mtprot, --mtp-requantize-output-tensor type", "Use output requantized to type for MTP (default: %s)", params.extra_output_type.c_str() });
     options.push_back({ "*",           "-ctkd, --cache-type-k-draft TYPE", "KV cache data type for K for the draft model" });
     options.push_back({ "*",           "-ctvd, --cache-type-v-draft TYPE", "KV cache data type for V for the draft model" });
 
@@ -2743,26 +3247,20 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-hfr,  --hf-repo REPO",         "Hugging Face model repository (default: unused)" });
     options.push_back({ "*",           "-hff,  --hf-file FILE",         "Hugging Face model file (default: unused)" });
     options.push_back({ "*",           "-hft,  --hf-token TOKEN",       "Hugging Face access token (default: value from HF_TOKEN environment variable)" });
-    options.push_back({ "*", "-mtp, --multi-token-prediction",          "whether to use multi-token-prediction (if supported) (default: %s)", params.has_mtp ? "true" : "false" });
-    options.push_back({ "*", "-no-mtp, --no-multi-token-prediction",    "whether to use multi-token-prediction (if supported) (default: %s)", !params.has_mtp ? "true" : "false" });
-    options.push_back({ "*", "--draft-max, --draft, --draft-n N",
-                                                                        "number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max });
-    options.push_back({ "*", "--draft-min, --draft-n-min N",   "minimum number of draft tokens to use for speculative decoding" });
-    options.push_back({ "*", "--draft-p-min P",                "minimum speculative decoding probability (greedy) (default: %.1f)", (double)params.speculative.p_min });
     options.push_back({ "*", "--recurrent-ckpt-mode MODE",    "checkpoint strategy for recurrent/hybrid speculative decoding\n"
                                                               "  auto         auto-select: per-step if CUDA full-GPU, gpu-fallback otherwise (default)\n"
                                                               "  per-step     save SSM state per draft step in VRAM; no re-decode on rejection\n"
                                                               "  gpu-fallback copy state to GPU buffer; re-decode on rejection\n"
                                                               "  cpu          serialise state via llama_state_seq; re-decode on rejection" });
-    options.push_back({ "*", "--spec-type Name [none | ngram - cache | ngram - simple | ngram - map - k | ngram - map - k4v | ngram - mod | suffix]", "type of speculative decoding to use when no draft model is provided (default: %d)\n", (int)params.speculative.type});
-    options.push_back({ "*", "--spec-ngram-size-n N", "ngram size N for ngram-simple/ngram-map speculative decoding, length of lookup n-gram (default: %d)\n",params.speculative.ngram_size_n });
-
-    options.push_back({ "*", "--spec-ngram-size-m N", "ngram size M for ngram-simple/ngram-map speculative decoding, length of draft m-gram (default: %d)\n", params.speculative.ngram_size_m });
-
-    options.push_back({ "*", "--spec-ngram-min-hits N", "minimum hits for ngram-map speculative decoding (default: %d)\n", params.speculative.ngram_min_hits });
-    options.push_back({ "*", "--suffix-pattern-len N",   "minimum context match length for suffix decoding (default: %d)", params.speculative.suffix_min_match_len });
-    options.push_back({ "*", "--suffix-max-depth N",     "suffix tree maximum depth for suffix decoding (default: %d)",    params.speculative.suffix_max_depth });
-    options.push_back({ "*", "--suffix-corpus PATH",     "corpus file to pre-warm the suffix tree: .json (array of strings or conversation messages) or .bin (raw int32 token IDs)" });
+    options.push_back({ "*", "--spec-type SPEC[:k=v,...]",      "canonical speculative stage entry; repeat for a supported two-stage chain.\n"
+                                                              "types: none, draft, mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n"
+                                                              "canonical keys: n_max,n_min,p_min,ngram_size_n,ngram_size_m,ngram_min_hits,suffix_min_match_len,suffix_max_depth,suffix_corpus\n"
+                                                              "for comma-bearing string values, quote the value inside the stage payload for normal shell use\n"
+                                                              "if argv is passed directly without shell unescaping, the parser also accepts escaped commas as \\,\n"
+                                                              "examples: --spec-type mtp:n_max=1,p_min=0.0\n"
+                                                              "          --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0\n"
+                                                              "          --spec-type \"suffix:n_max=16,n_min=2,suffix_min_match_len=5,suffix_max_depth=64,suffix_corpus='/tmp/spec,type-corpus.json'\"\n"
+                                                              "legacy --spec-stage, --draft-*, --spec-ngram-*, --suffix-* and -mtp flags are rejected" });
     options.push_back({ "*", "--spec-autotune",          "automatically tune speculative params to maximize tokens/sec" });
 
     options.push_back({ "retrieval" });
@@ -2777,6 +3275,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
 
     options.push_back({ "imatrix" });
     options.push_back({ "imatrix",     "-o,    --output FNAME",         "output file (default: '%s')", params.out_file.c_str() });
+    options.push_back({ "imatrix",     "       --output-draft FNAME",   "paired draft output file (default: derived from --output)" });
     options.push_back({ "imatrix",     "       --output-frequency N",   "output the imatrix every N iterations (default: %d)", params.n_out_freq });
     options.push_back({ "imatrix",     "       --save-frequency N",     "save an imatrix copy every N iterations (default: %d)", params.n_save_freq });
     options.push_back({ "imatrix",     "       --process-output",       "collect data for the output tensor (default: %s)", params.process_output ? "true" : "false" });
@@ -2805,6 +3304,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                             "- auto: default webui \n"
                                                             "- llamacpp: llamacpp webui \n"
                                                             "(default: auto)", });
+    options.push_back({ "server",      "       --ui-mcp-proxy, --webui-mcp-proxy",          "experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments (default: disabled)" });
     options.push_back({ "server",      "       --api-key KEY",          "API key to use for authentication (default: none)" });
     options.push_back({ "server",      "       --api-key-file FNAME",   "path to file containing API keys (default: none)" });
     options.push_back({ "server",      "       --ssl-key-file FNAME",   "path to file a PEM-encoded SSL private key" });
@@ -2886,6 +3386,9 @@ std::string gpt_params_get_system_info(const gpt_params & params) {
     os << "system_info: n_threads = " << params.n_threads;
     if (params.n_threads_batch != -1) {
         os << " (n_threads_batch = " << params.n_threads_batch << ")";
+    }
+    if (params.n_threads_mtmd != -1) {
+        os << " (n_threads_mtmd = " << params.n_threads_mtmd << ")";
     }
     os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
 
@@ -3012,7 +3515,7 @@ std::string string_lower(const std::string& str) {
     std::string result = str;
     for (char& c : result) {
         if (c >= 'A' && c <= 'Z') {
-            c = static_cast<char>(c + ('a' - 'A')); 
+            c = static_cast<char>(c + ('a' - 'A'));
         }
     }
     return result;
@@ -3086,6 +3589,28 @@ void string_process_escapes(std::string & input) {
     input.resize(output_idx);
 }
 
+std::string string_unescape(const std::string& str) {
+    std::string result;
+    result.reserve(2 * str.length());
+    for (const auto c: str) {
+        switch (c) {
+        case '\n':
+            result.append("\\n");
+            break;
+        case '\t':
+            result.append("\\t");
+            break;
+        case '\r':
+            result.append("\\r");
+            break;
+        default:
+            result.append(1, c);
+            break;
+        }
+    }
+    return result;
+}
+
 bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_override> & overrides) {
     const char * sep = strchr(data, '=');
     if (sep == nullptr || sep - data >= 128) {
@@ -3130,6 +3655,42 @@ bool string_parse_kv_override(const char * data, std::vector<llama_model_kv_over
     }
     overrides.emplace_back(std::move(kvo));
     return true;
+}
+
+std::vector<std::string> string_extract(const std::string& str, const char c, std::vector<size_t>& posi) {
+    std::vector<std::string> extracts;
+    auto pos = str.find(c);
+    size_t count = 0;
+    while (pos != std::string::npos) {
+        if (count % 2 == 0) {
+            // opening c
+            posi.push_back(pos);
+            ++count;
+        } else {
+            // closing c must be unescaped
+            auto esc_pos = pos;
+            size_t n_esc = 0;
+            while ((esc_pos > 0) && (str[--esc_pos] == '\\')) {
+                ++n_esc;
+            }
+            if (n_esc % 2 == 0) {
+                extracts.push_back(str.substr(posi.back() + 1, pos - posi.back() - 1));
+                string_process_escapes(extracts.back());
+                posi.push_back(pos);
+                ++count;
+            }
+        }
+        pos = str.find(c, pos + 1);
+    }
+    return extracts;
+}
+
+bool string_is_found(const std::string& window, const std::string& str, size_t& pos) {
+    if (str.empty()) {
+        return false;
+    }
+    pos = window.find(str);
+    return pos != std::string::npos;
 }
 
 //
@@ -3349,11 +3910,9 @@ std::string fs_get_cache_file(const std::string & filename) {
 }
 
 
-//
-// Model utils
-//
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
+
     auto mparams = common_model_params_to_llama(params);
 
     llama_model * model = nullptr;
@@ -3524,15 +4083,19 @@ static std::pair<int, int> get_batch_ubatch(const gpt_params & params) {
     if (params.n_ctx > 0) {
         n_batch = std::min(n_batch, params.n_ctx);
     }
-    if (!params.mmproj.path.empty()) {
-        // temporary fix for qwen mtmd
-        n_batch = std::max(n_batch, n_ubatch);
-        n_ubatch = n_batch;
-        fprintf(stdout, "Adjust batch size for mtmd: u_batch = %d, batch = %d\n", n_ubatch, n_batch);
-    } else {
-        n_ubatch = std::min(n_batch, n_ubatch);
-    }
+    n_ubatch = std::min(n_batch, n_ubatch);
     return {n_batch, n_ubatch};
+}
+
+static ggml_type parse_ggml_type(const char * arg) {
+    for (int j = 0; j < GGML_TYPE_COUNT; ++j) {
+        auto type = ggml_type(j);
+        const auto * name = ggml_type_name(type);
+        if (name && strcmp(arg, name) == 0) {
+            return type;
+        }
+    }
+    return GGML_TYPE_COUNT;
 }
 
 struct llama_model_params common_model_params_to_llama(const gpt_params & params) {
@@ -3557,6 +4120,9 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
     mparams.type_v_first    = kv_cache_type_from_str(params.type_v_first);
     mparams.type_v_last     = kv_cache_type_from_str(params.type_v_last );
+    if (!params.extra_output_type.empty()) {
+        mparams.extra_output_type = parse_ggml_type(params.extra_output_type.c_str());
+    }
     mparams.n_k_first       = params.n_k_first;
     mparams.n_k_last        = params.n_k_last;
     mparams.n_v_first       = params.n_v_first;
@@ -3575,7 +4141,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.validate_quants = params.validate_quants;
     mparams.merge_qkv       = params.merge_qkv;
     mparams.merge_up_gate_exps = params.merge_up_gate_exps;
-    mparams.mtp             = params.has_mtp;
+    mparams.mtp             = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     mparams.flash_attn      = params.flash_attn;
     mparams.defer_experts   = params.defer_experts;
     if (params.kv_overrides.empty()) {
@@ -3592,6 +4158,11 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     }
     if (!mparams.flash_attn && ggml_is_quantized(mparams.type_v)) {
         throw std::runtime_error("Quantized V cache cannot be used without flash attention");
+    }
+    if (!params.fit_margin_array.empty()) {
+        GGML_ASSERT(params.fit_margin_array.size() % 2 == 0 && "Fit margin array does not have even number of elements");
+        GGML_ASSERT(params.fit_margin_array[params.fit_margin_array.size()-2] == -1 && "Fit margin array is not correctly termionated");
+        mparams.fit_margin_array = params.fit_margin_array.data();
     }
 
     return mparams;
@@ -3660,12 +4231,13 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.thresh_experts    = params.thresh_experts;
     cparams.only_active_experts = params.only_active_exps;
     cparams.max_extra_alloc   = params.max_extra_alloc_MiB;
-    cparams.mtp               = params.has_mtp;
+    cparams.mtp               = params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
 
     cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
     cparams.type_reduce = ggml_type_from_str(params.reduce_type);
+    cparams.type_graph_attn = ggml_type_from_str(params.graph_attn_precision);
     if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v)) {
         throw std::runtime_error("Quantized V cache cannot be used without flash attention");
     }
@@ -4601,7 +5173,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
 
     yaml_dump_string_multiline(stream, "in_prefix", params.input_prefix.c_str());
     fprintf(stream, "in_prefix_bos: %s # default: false\n", params.input_prefix_bos ? "true" : "false");
-    yaml_dump_string_multiline(stream, "in_suffix", params.input_prefix.c_str());
+    yaml_dump_string_multiline(stream, "in_suffix", params.input_suffix.c_str());
     fprintf(stream, "interactive: %s # default: false\n", params.interactive ? "true" : "false");
     fprintf(stream, "interactive_first: %s # default: false\n", params.interactive_first ? "true" : "false");
     fprintf(stream, "keep: %d # default: 0\n", params.n_keep);
@@ -4749,4 +5321,173 @@ std::tuple<uint32_t, uint32_t, std::string, float> argparse_allowlist_unicode_ru
     }
 
     return { std::min(first, last), std::max(first, last), script, bias };
+}
+
+void argparse_expiring_logit_bias(const std::string& content, common_params_sampling& sparams) {
+    auto elb_params = sparams.elb_params;
+    elb_params.push_back({ { }, "", "" });
+    auto entries = elb_params[0].entries;
+
+    const auto lines = string_split(content, "\n");
+    for (size_t i = 0; i < lines.size(); ++i) {
+        auto line = string_strip(lines[i]);
+        const char c0 = line.empty() ? '#' : line[0];
+        if (c0 == '#') {
+            LLAMA_LOG_DEBUG("%s: line %zu: comment or empty\n", __func__, i);
+            continue;   // next line
+        }
+
+        // (... "EXTRACT" ... "EXTRACT" ...)
+        std::vector<size_t> qq_posi = { 0 };
+        auto extracts = string_extract(line, '"', qq_posi);
+        qq_posi.push_back(std::string::npos);
+        for (int32_t j = 0; j < int32_t(qq_posi.size()) - 1; j += 2) {
+            const auto pnd_pos = line.find('#', qq_posi[j]);
+            if (pnd_pos < qq_posi[j + 1]) {
+                LLAMA_LOG_DEBUG("%s: line %zu: inline comment @ %zu\n", __func__, i, pnd_pos);
+                line = string_strip(line.substr(0, pnd_pos));
+                qq_posi.resize(j + 2);
+                qq_posi.back() = std::string::npos;
+                extracts.resize(j / 2);
+                break;
+            }
+        }
+        const auto last_qq_pos = qq_posi[qq_posi.size() - 2];
+
+        auto n_char = line.length();
+        const char cE = line[n_char - 1];
+
+        LLAMA_LOG_DEBUG("%s: line %zu: %s\n", __func__, i, line.c_str());
+        if ('(' == c0 && cE == ')') {
+            const bool is_nested = '(' == line[1] && line[n_char - 2] == ')';
+            if (is_nested) {
+                if (n_char == 4) {
+                    // (())
+                    entries.clear();
+                    LLAMA_LOG_DEBUG("%s: line %zu: persistent entry clear\n", __func__, i);
+                    continue;   // next line
+                }
+                n_char -= 2;
+                line = line.substr(1, n_char);
+                LLAMA_LOG_DEBUG("%s: line %zu: persistent entry\n", __func__, i);
+            }
+
+            // (DURATION : ...)
+            int32_t duration = is_nested ? -1 : 1;
+            const auto cln_pos = line.find(':');
+            if ((cln_pos != std::string::npos) && (1 < cln_pos) && (cln_pos < qq_posi[1])) {
+                duration = std::stoi(line.substr(1, cln_pos - 1));
+            }
+            if (duration == 0) {
+                LLAMA_LOG_DEBUG("%s: line %zu: invalid duration\n", __func__, i);
+                continue;   // next line
+            }
+
+            #undef X
+            #define X(T, MEMBER, DV, PRECAST) #MEMBER,
+            static const std::vector<std::string> names = { X_COMMON_PARAMS_SAMPLING };
+
+            std::vector<float> addsubs(names.size(), 0.0f);
+            bool is_sb = false;
+
+            // (... : SPARAM ...)
+            const auto window = line.substr(last_qq_pos + 1);
+            for (int j = 0; j < names.size(); ++j) {
+                const auto& name = names[j];
+                auto pos = window.find(name);
+                if (pos != std::string::npos) {
+                    pos += name.length();
+                    auto next_pos = window.find(",", pos + 1);
+                    if (next_pos == std::string::npos) {
+                        next_pos = n_char - 1;
+                    }
+                    auto sub = string_strip(window.substr(pos, next_pos - pos));
+                    if (sub[0] == '~') {
+                        addsubs[j] += std::stof(sub.substr(1));
+                        is_sb = true;
+                        LLAMA_LOG_DEBUG("%s: line %zu: bias = %f\n", __func__, i, addsubs[j]);
+                    }
+                }
+            }
+
+            auto& phrases = extracts;
+            if (phrases.empty()) {
+                if (is_sb) {
+                    phrases.push_back("");
+                } else {
+                    continue;   // next line
+                }
+            }
+
+            const auto n_phrase = phrases.size();
+            std::vector<float> biases;
+            bool is_range = false;
+
+            if (!is_sb) {
+                // (... : BIAS ...)
+                const auto cln_rpos = line.rfind(':');
+                auto sub = line.substr(cln_rpos + 1, n_char - cln_rpos - 2);
+                if (sub.find("~") != std::string::npos) {
+                    // (... : BIAS ~ BIAS)
+                    const auto splits = string_split(sub, '~');
+                    biases.push_back(std::stof(splits.front()));
+                    LLAMA_LOG_DEBUG("%s: line %zu: logit bias = %f\n", __func__, i, biases.back());
+                    biases.push_back(std::stof(splits.back()));
+                    LLAMA_LOG_DEBUG("%s: line %zu: logit bias = %f\n", __func__, i, biases.back());
+                    is_range = true;
+                } else {
+                    // (... : BIAS, BIAS, ..., BIAS)
+                    for (const auto& split: string_split(sub, ',')) {
+                        if (!split.empty()) {
+                            biases.push_back(std::stof(split));
+                            LLAMA_LOG_DEBUG("%s: line %zu: logit bias = %f\n", __func__, i, biases.back());
+                        }
+                    }
+                }
+                if (biases.empty()) {
+                    continue;   // next line
+                }
+            }
+
+            size_t max_phrase_len = 0;
+            for (const auto& phrase: phrases) {
+                LLAMA_LOG_DEBUG("%s: line %zu: phrase = \"%s\"\n", __func__, i, phrase.c_str());
+                max_phrase_len = std::max(phrase.length(), max_phrase_len);
+            }
+            LLAMA_LOG_DEBUG("%s: line %zu: max_phrase_len = %zu\n", __func__, i, max_phrase_len);
+
+            common_params_sampling::elb_param::elb_entry entry = {
+                std::vector<size_t>(n_phrase, 0),
+                std::move(addsubs),
+                std::vector<bool>(n_phrase, false),
+                max_phrase_len,
+                std::move(phrases),
+                std::move(biases),
+                duration,
+                is_range
+            };
+            if (is_nested) {
+                entries.push_back(entry);
+            }
+            elb_params.back().entries.push_back(std::move(entry));
+            continue;   // next line
+        }
+
+        if (last_qq_pos > 0) {
+            elb_params.back().op = string_strip(line.substr(last_qq_pos + 1));
+        }
+
+        auto& exitwords = extracts;
+        if (exitwords.empty()) {
+            string_process_escapes(line);
+            exitwords.push_back(std::move(line));
+        }
+
+        // maybe support multiple exitwords in future
+        elb_params.back().exitword = std::move(exitwords[0]);
+
+        elb_params.push_back({ entries, "", "" });
+    }
+
+    sparams.elb_params = std::move(elb_params);
 }

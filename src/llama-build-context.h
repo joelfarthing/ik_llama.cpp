@@ -24,7 +24,7 @@ enum llm_ffn_op_type {
     LLM_FFN_RELU,
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
-    LLM_FFN_SWIGLU_OAI_MOE,
+    LLM_FFN_SWIGLU_OAI,
 };
 
 enum llm_ffn_gate_type {
@@ -208,6 +208,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_qwen3moe();
 
+    ggml_cgraph * build_mellum();
+
     ggml_cgraph * build_qwen3vlmoe();
 
     ggml_cgraph * build_qwen3next();
@@ -240,6 +242,8 @@ struct llm_build_context {
 
     ggml_cgraph * build_gemma4();
 
+    ggml_cgraph * build_gemma4_mtp();
+
     ggml_cgraph * build_starcoder2();
 
     ggml_cgraph * build_mamba();
@@ -256,6 +260,26 @@ struct llm_build_context {
 
     ggml_cgraph * build_deepseek2();
 
+    ggml_tensor * build_deepseek2_tp_attention(
+            ggml_cgraph * gf, int il,
+            ggml_tensor * inpL,
+            ggml_tensor * KQ_mask, ggml_tensor * inp_pos,
+            ggml_tensor * rope_cache,
+            float kq_scale, float attn_factor_scaled,
+            bool use_f32_attn_precision,
+            bool is_lite,
+            bool pp_opt);
+
+    ggml_tensor * build_deepseek2_layer_attention(
+            ggml_cgraph * gf, int il,
+            ggml_tensor * inpL,
+            ggml_tensor * KQ_mask, ggml_tensor * inp_pos,
+            ggml_tensor * rope_cache,
+            float kq_scale, float attn_factor_scaled,
+            bool use_f32_attn_precision,
+            bool is_lite,
+            bool pp_opt);
+
     ggml_cgraph * build_glm4_moe();
 
     ggml_cgraph * build_bitnet();
@@ -263,6 +287,7 @@ struct llm_build_context {
     ggml_cgraph * build_bitnet_158();
 
     ggml_cgraph * build_cohere2();
+    ggml_cgraph * build_cohere2_moe();
 
     ggml_cgraph * build_t5_encoder();
 
@@ -287,12 +312,15 @@ struct llm_build_context {
     ggml_cgraph * build_bailingmoe2();
 
     ggml_cgraph * build_minimaxm2();
+    ggml_cgraph * build_minimaxm3();
 
     ggml_cgraph * build_smollm3();
 
     ggml_cgraph * build_mimo2();
 
     ggml_cgraph * build_seedoss();
+
+    ggml_cgraph * build_laguna();
 
     ggml_cgraph * build_step35();
 
@@ -339,7 +367,8 @@ struct llm_build_context {
                     int32_t   kv_head,
                     int32_t   n_kv,
                     float     kq_scale,
-         const llm_build_cb & cb, int il, ggml_tensor * sinks = nullptr, int n_swa = 0);
+         const llm_build_cb & cb, int il, ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
+         ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr);
 
     static ggml_tensor * llm_build_ffn(ggml_context * ctx, llama_context & lctx, ggml_tensor * ffn_norm,
          ggml_tensor * cur,
@@ -426,7 +455,7 @@ llm_expert_gating_func_type   gating_op,
             llm_ffn_op_type   type_op_shexp,
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * shexp_gate = nullptr);
+         ggml_tensor * shexp_gate = nullptr, ggml_tensor * add_extra = nullptr);
 
     static ggml_cgraph * llama_build_graph_defrag(llama_context & lctx, const std::vector<uint32_t> & ids);
 
@@ -445,7 +474,7 @@ llm_expert_gating_func_type   gating_op,
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
-            ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb);
+            ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name = true);
 
     static ggml_tensor * do_split_norm(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * the_norm, const llama_hparams & hparams,
         const llm_build_cb & cb, int id, int il_cb, bool is_norm);
@@ -463,6 +492,14 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * rope_cache
     );
 
+    struct ggml_tensor * build_deepseek2_mtp(
+        const struct llama_layer & mtp_layer,
+        struct ggml_tensor * prev_embeddings,
+        struct ggml_cgraph * gf,
+        struct ggml_tensor * inp_pos,
+        struct ggml_tensor * rope_cache
+    );
+
     struct ggml_tensor * build_qwen35_mtp(
         const struct llama_layer & mtp_layer,
         struct ggml_tensor * prev_embeddings,
@@ -470,4 +507,14 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_cgraph * gf,
         struct ggml_tensor * inp_pos
     );
+
+    struct ggml_tensor * build_qwen35moe_mtp(
+        const struct llama_layer & mtp_layer,
+        struct ggml_tensor * prev_embeddings,
+        int64_t n_embd_head,
+        struct ggml_cgraph * gf,
+        struct ggml_tensor * inp_pos
+    );
+
+    ggml_cgraph * new_graph_custom();
 };
