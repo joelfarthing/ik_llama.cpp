@@ -18,6 +18,7 @@
 #include <limits>
 #include <map>
 #include <sstream>
+#include <string>
 #include <unordered_map>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -2366,15 +2367,6 @@ void common_speculative_commit(
         ? spec->curr_impl->type
         : COMMON_SPECULATIVE_TYPE_NONE;
 
-    if (auto * mtp_state = common_speculative_get_mtp_state(spec);
-            spec_type_used == COMMON_SPECULATIVE_TYPE_MTP &&
-            mtp_state != nullptr &&
-            mtp_model_uses_recurrent_conditioning(*mtp_state)) {
-        // Recurrent MTP commit tokens are aligned to [sampled_before, accepted_prefix], so
-        // their hidden-state rows must be replayed one target position earlier.
-        pos_base -= 1;
-    }
-
     common_speculative_checkpoint & ckpt = spec->checkpoint;
     const bool any_rejected = (int) ids.size() - 1 < n_draft;
     std::vector<float> mtp_hidden_state_pre;
@@ -2565,7 +2557,23 @@ static void mtp_store_target_hidden(
 }
 
 static bool mtp_model_uses_recurrent_conditioning(const common_speculative_state_mtp & state) {
-    return state.ctx_mtp != nullptr && llama_model_has_recurrent(llama_get_model(state.ctx_mtp));
+    if (state.ctx_mtp == nullptr) {
+        return false;
+    }
+
+    const llama_model * model = llama_get_model(state.ctx_mtp);
+    if (!llama_model_has_recurrent(model)) {
+        return false;
+    }
+
+    char arch[64] = {};
+    const int32_t arch_len = llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    if (arch_len <= 0) {
+        return false;
+    }
+
+    const std::string arch_str(arch, std::min<size_t>((size_t) arch_len, sizeof(arch) - 1));
+    return arch_str == "qwen35" || arch_str == "qwen35moe";
 }
 
 static void mtp_clear_target_hidden(common_speculative_state_mtp & state, llama_seq_id seq_id) {
