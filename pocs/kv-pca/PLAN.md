@@ -117,6 +117,26 @@ Takeaway: for hybrid-attention models, K-cache transform coding pays off only at
 aggressive 2-bit; 4-bit is already cheap. The 4-bit "no win" should be reconfirmed in bf16
 (CPU-offload) to rule out the nf4 confound.
 
+### V-quantization follow-up (2026-06-29): the K-PCA win survives a fully-quantized cache
+
+ik_llama quantizes both K and V. Phase 0 showed PCA *hurts* V, so the realistic scheme is
+K-PCA+alloc + V-Hadamard vs today's K-Hadamard + V-Hadamard — V quantized identically in
+both arms (`--quant-v`), isolating K's transform against a common V noise floor. Perplexity
+delta vs the fp cache, wikitext-2:
+
+| Model | 4-bit Had | 4-bit PCA | 2-bit Had | 2-bit PCA |
+| --- | --- | --- | --- | --- |
+| Qwen3-1.7B | +5.48 | **+1.06** | collapse | **+312** |
+| Llama-3.2-3B | +0.14 | +0.19 | +485 | **+42** |
+| Qwen3.5-9B (nf4) | +0.027 | +0.023 | +1.67 | **+1.12** |
+
+The K-PCA+alloc advantage is **robust to V quantization**: wherever it won K-only (Qwen3
+4-bit; every model at 2-bit) it still wins with V also quantized; where there was no
+headroom (4-bit on the robust / few-cached-layer models) there is still none. V-Hadamard
+adds a noise floor common to both arms but does not erode K-PCA's edge. Net: the proposed
+**K-PCA+alloc + V-Hadamard** cache beats today's all-Hadamard cache wherever quantization
+actually bites.
+
 ## Cost reality (revised)
 
 The original doc claimed this was "cheap to ship" because a PCA rotation is just a
