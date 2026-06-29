@@ -5,3 +5,5 @@ transformers>=4.44
 numpy>=1.24
 # Optional: plots. The harness degrades gracefully (CSV/JSON + stdout verdict) if absent.
 matplotlib>=3.7
+# Optional: only for prepare_calib.py pulling wikitext. Not needed with --from-files.
+datasets>=2.14
