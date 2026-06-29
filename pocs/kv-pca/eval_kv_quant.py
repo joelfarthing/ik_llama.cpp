@@ -120,13 +120,17 @@ def kquant_attention(module, query, key, value, attention_mask, scaling, dropout
     layers = STATE["layers"]
     li = getattr(module, "layer_idx", None)
     if mode != "fp" and layers is not None and li is not None and li in layers:
-        R, bits = layers[li][mode]
+        ent = layers[li]
+        R, bits = ent[mode]
         if R.device != key.device:
             R = R.to(key.device)
-        kf = key.float()
-        kt = kf @ R
-        kt = block_qdq(kt, bits, STATE["block"])
-        key = (kt @ R.transpose(0, 1)).to(key.dtype)
+        key = (block_qdq(key.float() @ R, bits, STATE["block"]) @ R.transpose(0, 1)).to(key.dtype)
+        if STATE.get("quant_v") and "v" in ent:
+            Rv, vbits = ent["v"]
+            if Rv.device != value.device:
+                Rv = Rv.to(value.device)
+            value = (block_qdq(value.float() @ Rv, vbits, STATE["block"])
+                     @ Rv.transpose(0, 1)).to(value.dtype)
     ks = repeat_kv(key, module.num_key_value_groups)
     vs = repeat_kv(value, module.num_key_value_groups)
     aw = torch.matmul(query, ks.transpose(2, 3)) * scaling
@@ -167,6 +171,7 @@ def layers_for_bits(R_pca, block_var, H, avg_bits):
         ent = {"pca": (R_pca[li], list(allocate_bits(block_var[li], avg_bits)))}
         if H is not None:
             ent["hadamard"] = (H, [avg_bits] * nb)
+            ent["v"] = (H, [avg_bits] * nb)  # V: Hadamard+uniform at matched bits (--quant-v)
         out[li] = ent
     return out
 
@@ -213,6 +218,9 @@ def main():
                     help="int8 weights via bitsandbytes (fit big models on 12GB VRAM)")
     ap.add_argument("--load-4bit", action="store_true",
                     help="nf4 4-bit weights via bitsandbytes (fit very big models on 12GB)")
+    ap.add_argument("--quant-v", action="store_true",
+                    help="also quantize V (Hadamard+uniform, matched bits) in both arms — "
+                         "fully-quantized cache, isolates K's transform against a V noise floor")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -236,6 +244,7 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(
             args.model, dtype=torch.bfloat16, device_map=dev, attn_implementation="eager").eval()
     model.config._attn_implementation = "kquant"
+    STATE["quant_v"] = args.quant_v
 
     R_pca, block_var, H, d, nlayers = build_layer_params(args.dumps, dev)
     print(f"[eval] {nlayers} layers, head_dim={d}, hadamard={'yes' if H is not None else 'no'}",
@@ -293,7 +302,7 @@ def main():
 
     print("\n==================== Phase 0.5: logit-quality verdict ====================")
     print(f"model: {args.model}   eval: wikitext-2 test, {len(wins)}x{args.seqlen} tok   "
-          f"(K-cache quantized inline, V fp)")
+          f"(K quantized inline, V {'Hadamard-quant (matched bits)' if args.quant_v else 'fp'})")
     print(f"  fp cache ppl: {ppl_fp:.4f}")
     for b in args.bits:
         print(f"  -- {b}-bit avg --")
