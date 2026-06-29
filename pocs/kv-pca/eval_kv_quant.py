@@ -117,8 +117,12 @@ STATE = {"mode": "fp", "block": 32, "layers": None}  # layers[li][mode] = (R_fp3
 @torch.no_grad()
 def kquant_attention(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
     mode = STATE["mode"]
-    if mode != "fp":
-        R, bits = STATE["layers"][module.layer_idx][mode]
+    layers = STATE["layers"]
+    li = getattr(module, "layer_idx", None)
+    if mode != "fp" and layers is not None and li is not None and li in layers:
+        R, bits = layers[li][mode]
+        if R.device != key.device:
+            R = R.to(key.device)
         kf = key.float()
         kt = kf @ R
         kt = block_qdq(kt, bits, STATE["block"])
@@ -141,26 +145,29 @@ def build_layer_params(dumps_dir, device):
     files = sorted(glob.glob(os.path.join(dumps_dir, "layer_*.npz")))
     if not files:
         raise SystemExit(f"no layer_*.npz in {dumps_dir}")
-    R_pca, block_var, d = [], [], None
+    # keyed by model-layer index parsed from layer_<idx>.npz (hybrid models cache
+    # only some layers, so indices are sparse).
+    R_pca, block_var, d = {}, {}, None
     for f in files:
+        idx = int(os.path.basename(f).split("_")[1].split(".")[0])
         k = np.load(f)["k"].astype(np.float32)
         d = k.shape[1]
         Rp = pca_basis(k)
         kt = k @ Rp
-        block_var.append([float(np.mean(kt[:, s:s + 32] ** 2)) for s in range(0, d, 32)])
-        R_pca.append(torch.tensor(Rp, device=device, dtype=torch.float32))
+        block_var[idx] = [float(np.mean(kt[:, s:s + 32] ** 2)) for s in range(0, d, 32)]
+        R_pca[idx] = torch.tensor(Rp, device=device, dtype=torch.float32)
     H = torch.tensor(hadamard_matrix(d), device=device, dtype=torch.float32) if is_pow2(d) else None
     return R_pca, block_var, H, d, len(files)
 
 
 def layers_for_bits(R_pca, block_var, H, avg_bits):
-    nb = len(block_var[0])
-    out = []
-    for li in range(len(R_pca)):
+    out = {}
+    for li in R_pca:
+        nb = len(block_var[li])
         ent = {"pca": (R_pca[li], list(allocate_bits(block_var[li], avg_bits)))}
         if H is not None:
             ent["hadamard"] = (H, [avg_bits] * nb)
-        out.append(ent)
+        out[li] = ent
     return out
 
 
@@ -202,6 +209,10 @@ def main():
     ap.add_argument("--windows", type=int, default=16)
     ap.add_argument("--seqlen", type=int, default=1024)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--load-8bit", action="store_true",
+                    help="int8 weights via bitsandbytes (fit big models on 12GB VRAM)")
+    ap.add_argument("--load-4bit", action="store_true",
+                    help="nf4 4-bit weights via bitsandbytes (fit very big models on 12GB)")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -211,8 +222,19 @@ def main():
     dev = "cuda"
     print(f"[eval] loading {args.model}", file=sys.stderr)
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, device_map=dev, attn_implementation="eager").eval()
+    if args.load_8bit or args.load_4bit:
+        from transformers import BitsAndBytesConfig
+        if args.load_4bit:
+            qc = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                    bnb_4bit_compute_dtype=torch.bfloat16)
+        else:
+            qc = BitsAndBytesConfig(load_in_8bit=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, device_map="auto", attn_implementation="eager",
+            quantization_config=qc).eval()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=torch.bfloat16, device_map=dev, attn_implementation="eager").eval()
     model.config._attn_implementation = "kquant"
 
     R_pca, block_var, H, d, nlayers = build_layer_params(args.dumps, dev)

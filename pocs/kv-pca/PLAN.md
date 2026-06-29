@@ -97,6 +97,26 @@ test (16×1024 tok), V left fp. Perplexity (lower = better) and logit-KL(fp||q):
   architectures (Hadamard 2-bit collapses to ppl 10²–10⁵). Value = **QK-norm models at
   moderate (4-bit), any model at extreme (2-bit)**. Build justified.
 
+### Qwen3.5-9B — hybrid attention moves the operating point (2026-06-29)
+
+Qwen3.5-9B-Base is a **hybrid linear-attention** model: 32 layers = 24 linear-attention +
+8 full-attention (`full_attention_interval=4`; only layers 3,7,…,31 cache K/V, head_dim
+256). The KV cache is already 4× smaller by design. The harness is now hybrid-aware
+(extract/eval skip cacheless layers, dumps keyed by model-layer index) with nf4 4-bit
+loading (`--load-4bit`; the 9B runs in nf4 to fit the 12 GB 4070 — a caveat). On the 8
+full-attention layers:
+
+- **MSE: strong GO** — K@4-bit `pca+alloc` +22.7%, **8/8 layers** ≥15% (same `hadamard+alloc`
+  = +0% signature).
+- **Logit (nf4, wikitext-2): no 4-bit win, clear 2-bit win.** fp ppl 10.20. At 4-bit,
+  Hadamard K-quant is *already near-lossless* (+0.005 ppl, KL 0.0017) — nothing to win,
+  because only 8 layers cache K/V (and partly an nf4-weight confound). At 2-bit, PCA halves
+  the penalty: ppl +0.52 → +0.21, KL 0.057 → 0.021.
+
+Takeaway: for hybrid-attention models, K-cache transform coding pays off only at very
+aggressive 2-bit; 4-bit is already cheap. The 4-bit "no win" should be reconfirmed in bf16
+(CPU-offload) to rule out the nf4 confound.
+
 ## Cost reality (revised)
 
 The original doc claimed this was "cheap to ship" because a PCA rotation is just a
