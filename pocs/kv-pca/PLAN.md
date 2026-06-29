@@ -45,6 +45,42 @@ punishes static per-coefficient scales (the reason KVTC keeps recent + sink toke
 uncompressed and uses entropy coding)?** That is empirical, and `rd_analysis.py`
 answers it per model.
 
+## Phase 0 results — RUN on halfeagle (2026-06-29)
+
+Ran `extract_kv.py` + `rd_analysis.py` on four models (wikitext-103 calib, K-cache, 4-bit
+decision gate). **The result inverts this doc's QK-norm hypothesis** — which predicted
+QK-norm would pre-whiten the cache and *remove* the headroom (Qwen NO-GO, Llama GO):
+
+| Model | QK-norm | K@4-bit pca+alloc vs Hadamard | layers ≥15% | verdict |
+| --- | --- | --- | --- | --- |
+| Qwen3-1.7B | yes | +39.1% | 26/28 (93%) | **GO** (strong) |
+| Qwen3-4B | yes | +20.9% | 20/36 (56%) | **GO** |
+| Qwen2.5-3B | no | +10.9% | 11/36 (31%) | NO-GO |
+| Llama-3.2-3B | no | −1.9% | 2/28 (7%) | NO-GO |
+
+- **QK-norm is the causal variable, not model family.** Qwen2.5-3B shares Qwen3's
+  tokenizer/lineage/head_dim=128 and differs mainly in QK-norm; it is NO-GO while both
+  Qwen3 sizes are GO. So QK-norm *adds* exploitable K-cache headroom — the opposite of the
+  prior. (Llama-3.2-3B run via the ungated, arch-identical `unsloth/Llama-3.2-3B`;
+  meta-llama is license-gated.)
+- **The win needs the PCA basis AND allocation together.** A `hadamard+alloc` ablation
+  (added to `rd_analysis.py`) is **+0.0%** on every model — Hadamard flattens variance, so
+  allocation has nothing to exploit — and `pca`-rotation-only is catastrophic (−120 to
+  −285%). The whole gain is the calibrated basis paired with allocation, *not* a cheap
+  allocation-only tweak on the existing format.
+- **Scope: K-cache only, low bit-depth.** PCA hurts V (−18 to −30% @4-bit) → transform K,
+  leave V. The win lives at 2–4 bit (Qwen3-4B K: +74% @2-bit, +21% @4-bit); at 8-bit the
+  allocation saturates and it reverts to the PCA-uniform loss.
+- **Robustness:** Qwen3-4B re-run on a code corpus (ik_llama source) → GO +22.4% (vs
+  +20.9% wikitext) — not distribution-specific.
+
+**Caveat / next gate:** all of the above is reconstruction MSE — a proxy. Whether the
+K-MSE win becomes real memory-at-iso-quality must be confirmed with **logit-KL / perplexity
+vs the F16 cache** before any C++ build. That is Phase 0.5 (`eval_kv_quant.py`, not yet
+written): quantize the K-cache inline in an HF forward (PCA+alloc vs Hadamard+uniform at
+matched bits, V fp) and measure ppl + logit-KL on held-out text — no kernel work, decisive
+either way.
+
 ## Cost reality (revised)
 
 The original doc claimed this was "cheap to ship" because a PCA rotation is just a

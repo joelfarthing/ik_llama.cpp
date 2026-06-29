@@ -3,6 +3,6 @@ dumps/
 results/
 *.npz
 *.png
-calib.txt
+calib*.txt
 .venv/
 __pycache__/

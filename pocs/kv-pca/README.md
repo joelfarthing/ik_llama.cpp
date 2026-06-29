@@ -10,6 +10,15 @@ by this harness's controls. The real lever is **adaptive bit allocation**, which
 different cache format, not a drop-in. This harness measures whether that lever pays off
 on a given model. Intended to run on `halfeagle`.
 
+## Results so far (2026-06-29, halfeagle)
+
+Ran on four models. **The QK-norm hypothesis inverted:** QK-norm models GO, non-QK-norm
+NO-GO (K@4-bit `pca+alloc` vs Hadamard: Qwen3-1.7B +39%, Qwen3-4B +21% | Qwen2.5-3B +11%
+sub-gate, Llama-3.2-3B −2%). Qwen2.5-3B vs Qwen3 (same lineage, QK-norm the difference)
+isolates QK-norm as the cause. The win is **K-only, low-bit**, and needs the PCA basis +
+allocation together (`hadamard+alloc` = +0%). All MSE — logit-KL confirmation
+(`eval_kv_quant.py`, Phase 0.5) is the next gate. Full table + detail in `PLAN.md`.
+
 ## Setup
 
 ```bash
