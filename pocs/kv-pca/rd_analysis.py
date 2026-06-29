@@ -204,6 +204,14 @@ def analyze_tensor(x, bits_list, block, center):
         b: block_quant_mse_alloc(xt_pca, b, block) for b in bits_list}
     results["pca+alloc-perdim"] = {
         b: col_quant_mse_alloc(xt_pca, b) for b in bits_list}
+    # Ablation: the SAME adaptive allocation on the Hadamard basis ik_llama already
+    # uses. Isolates "is the win the allocation lever (basis-free, small build) or the
+    # PCA basis (needs a calibrated sidecar)?" — the gap pca+alloc - hadamard+alloc is
+    # the marginal value of the learned basis.
+    if "hadamard" in transforms:
+        xt_had = x @ transforms["hadamard"]
+        results["hadamard+alloc"] = {
+            b: block_quant_mse_alloc(xt_had, b, block) for b in bits_list}
     return results
 
 
@@ -274,6 +282,7 @@ def main():
             "mean_mse_reduction_pca_alloc_vs_hadamard_k": float(np.mean(reduction)),
             "median_mse_reduction": float(np.median(reduction)),
             "rotation_only_mean_reduction_vs_hadamard": mean_red("pca"),
+            "hadamard_alloc_mean_reduction_vs_hadamard": mean_red("hadamard+alloc"),
             "perdim_ceiling_mean_reduction_vs_hadamard": mean_red("pca+alloc-perdim"),
             "layers_meeting_margin": wins,
             "fraction_meeting_margin": float(wins / len(cand)),
@@ -305,9 +314,15 @@ def main():
               f"{verdict['layers_meeting_margin']}/{verdict['n_layers']} "
               f"({verdict['fraction_meeting_margin']:.0%})")
         rot = verdict.get("rotation_only_mean_reduction_vs_hadamard")
+        had_alloc = verdict.get("hadamard_alloc_mean_reduction_vs_hadamard")
         ceil = verdict.get("perdim_ceiling_mean_reduction_vs_hadamard")
         if rot is not None:
             print(f"  rotation-only PCA vs Hadamard:   {rot:+.1%}  (expected ~0 or negative)")
+        if had_alloc is not None:
+            print(f"  Hadamard+alloc vs Hadamard:      {had_alloc:+.1%}  (allocation only, no PCA — basis-free)")
+            pa = verdict.get("mean_mse_reduction_pca_alloc_vs_hadamard_k")
+            if pa is not None:
+                print(f"  -> PCA basis marginal value:     {pa - had_alloc:+.1%}  (pca+alloc minus hadamard+alloc)")
         if ceil is not None:
             print(f"  per-dim transform-coding ceiling: {ceil:+.1%}  (upper bound; needs a new cache format)")
         print(f"\n  >>> {'GO' if verdict['go'] else 'NO-GO'} <<<  "

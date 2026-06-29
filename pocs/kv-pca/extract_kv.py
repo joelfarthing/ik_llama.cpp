@@ -92,7 +92,13 @@ def to_layer_kv(past_key_values):
 
     Each k/v is a tensor [batch, n_kv_heads, seq, head_dim].
     """
-    # Newer transformers: DynamicCache with to_legacy_cache(); or .key_cache lists.
+    # transformers 5.x: DynamicCache exposes .layers, each a DynamicLayer with
+    # .keys / .values tensors (to_legacy_cache() and .key_cache were removed, and
+    # raw iteration now yields >2-tuples).
+    layers = getattr(past_key_values, "layers", None)
+    if layers is not None and len(layers) and hasattr(layers[0], "keys"):
+        return [(L.keys, L.values) for L in layers]
+    # transformers 4.x: DynamicCache with to_legacy_cache(); or .key_cache lists.
     if hasattr(past_key_values, "to_legacy_cache"):
         legacy = past_key_values.to_legacy_cache()
         return [(k, v) for (k, v) in legacy]
