@@ -20,8 +20,19 @@ pip install -r requirements.txt   # torch/CUDA likely already present on halfeag
 
 ## Run
 
-**1. Extract KV samples** (uses the 4070). Pass real text via `--calib-file` for a
-meaningful result; the built-in corpus is only a smoke test.
+**0. Build a calibration corpus.** A meaningful result needs representative, ideally
+long-context text (the built-in corpus in `extract_kv.py` is a smoke test only).
+
+```bash
+python prepare_calib.py --out calib.txt                 # wikitext-103 (~1.2M chars)
+python prepare_calib.py --out calib.txt --config wikitext-2-raw-v1   # lighter/faster
+python prepare_calib.py --out calib.txt --from-files mycode.py mydocs.md  # your domain text
+```
+
+`--from-files` needs no `datasets` dependency and is the better choice if your real
+workload is code or a specific domain — calibrate on text that looks like production.
+
+**1. Extract KV samples** (uses the 4070). Pass the corpus via `--calib-file`.
 
 ```bash
 # Primary target: clean go/no-go (no QK-norm)
@@ -34,6 +45,15 @@ python extract_kv.py --model Qwen/Qwen3-4B \
     --calib-file calib.txt --seq-len 2048 --max-seqs 64 \
     --output-dir dumps/qwen3-4b
 ```
+
+**Model access notes:**
+- `meta-llama/Llama-3.2-3B` is **gated** — accept the license on its HF page and
+  `huggingface-cli login` once on this box. `Qwen/Qwen3-4B` is open.
+- Ungated fallback if the Llama gate is a hassle: an architecture-identical mirror such
+  as `unsloth/Llama-3.2-3B` (same no-QK-norm GQA, head_dim 128). Mirror availability can
+  change; any genuine Llama-3 base without QK-norm preserves the contrast vs Qwen3.
+- VRAM: Qwen3-4B at 2048 tokens is tight on 12 GB. If it OOMs, drop `--seq-len 1024`,
+  or load in 8-bit, or (wall time is free) let it spill to CPU. Llama-3.2-3B has room.
 
 **2. Rate-distortion analysis** (CPU/numpy):
 
