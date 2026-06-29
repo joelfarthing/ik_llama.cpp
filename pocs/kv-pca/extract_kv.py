@@ -58,6 +58,10 @@ def parse_args():
                     choices=["float16", "bfloat16", "float32"])
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--load-8bit", action="store_true",
+                    help="int8 weights via bitsandbytes (fit big models on 12GB VRAM)")
+    ap.add_argument("--load-4bit", action="store_true",
+                    help="nf4 4-bit weights via bitsandbytes (fit very big models on 12GB)")
     return ap.parse_args()
 
 
@@ -90,14 +94,21 @@ def load_chunks(calib_file, tokenizer, seq_len, max_seqs):
 def to_layer_kv(past_key_values):
     """Normalize various transformers cache formats to a list of (k, v) per layer.
 
-    Each k/v is a tensor [batch, n_kv_heads, seq, head_dim].
+    Each k/v is a tensor [batch, n_kv_heads, seq, head_dim]. Entries are None for
+    layers that hold no softmax K/V cache (e.g. the linear-attention layers in a
+    hybrid model like Qwen3.5), so callers can map dumps back to model-layer indices.
     """
-    # transformers 5.x: DynamicCache exposes .layers, each a DynamicLayer with
+    # transformers 5.x: DynamicCache exposes .layers, each a layer object with
     # .keys / .values tensors (to_legacy_cache() and .key_cache were removed, and
-    # raw iteration now yields >2-tuples).
+    # raw iteration now yields >2-tuples). Hybrid models mix in cacheless layers.
     layers = getattr(past_key_values, "layers", None)
-    if layers is not None and len(layers) and hasattr(layers[0], "keys"):
-        return [(L.keys, L.values) for L in layers]
+    if layers is not None and len(layers):
+        out = []
+        for L in layers:
+            k = getattr(L, "keys", None)
+            v = getattr(L, "values", None)
+            out.append((k, v) if (k is not None and v is not None) else None)
+        return out
     # transformers 4.x: DynamicCache with to_legacy_cache(); or .key_cache lists.
     if hasattr(past_key_values, "to_legacy_cache"):
         legacy = past_key_values.to_legacy_cache()
@@ -142,10 +153,21 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     dtype = getattr(torch, args.dtype)
-    print(f"[extract] loading {args.model} ({args.dtype}) ...", file=sys.stderr)
+    qtag = "int4" if args.load_4bit else "int8" if args.load_8bit else args.dtype
+    print(f"[extract] loading {args.model} ({qtag}) ...", file=sys.stderr)
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=dtype, device_map=args.device)
+    if args.load_8bit or args.load_4bit:
+        from transformers import BitsAndBytesConfig
+        if args.load_4bit:
+            qc = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                    bnb_4bit_compute_dtype=torch.bfloat16)
+        else:
+            qc = BitsAndBytesConfig(load_in_8bit=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, device_map="auto", quantization_config=qc)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=dtype, device_map=args.device)
     model.eval()
 
     chunks = load_chunks(args.calib_file, tok, args.seq_len, args.max_seqs)
@@ -156,6 +178,7 @@ def main():
     v_res = None
     head_dim = None
     n_layers = None
+    kv_idxs = None  # model-layer indices that actually hold a K/V cache
 
     with torch.no_grad():
         for si, chunk in enumerate(chunks):
@@ -164,41 +187,46 @@ def main():
             layers = to_layer_kv(out.past_key_values)
             if k_res is None:
                 n_layers = len(layers)
-                head_dim = layers[0][0].shape[-1]
-                k_res = [Reservoir(args.n_sample, head_dim, rng) for _ in range(n_layers)]
-                v_res = [Reservoir(args.n_sample, head_dim, rng) for _ in range(n_layers)]
-                print(f"[extract] {n_layers} layers, head_dim={head_dim}",
-                      file=sys.stderr)
-            for li, (k, v) in enumerate(layers):
+                kv_idxs = [i for i, lyr in enumerate(layers) if lyr is not None]
+                if not kv_idxs:
+                    raise SystemExit("[extract] no K/V-cache layers found")
+                head_dim = layers[kv_idxs[0]][0].shape[-1]
+                k_res = {i: Reservoir(args.n_sample, head_dim, rng) for i in kv_idxs}
+                v_res = {i: Reservoir(args.n_sample, head_dim, rng) for i in kv_idxs}
+                print(f"[extract] {n_layers} layers, {len(kv_idxs)} with K/V cache "
+                      f"(idxs {kv_idxs}), head_dim={head_dim}", file=sys.stderr)
+            for i in kv_idxs:
+                k, v = layers[i]
                 # [b, n_kv_heads, seq, head_dim] -> [rows, head_dim]
-                k2 = k.reshape(-1, head_dim).float().cpu().numpy()
-                v2 = v.reshape(-1, head_dim).float().cpu().numpy()
-                k_res[li].add(k2)
-                v_res[li].add(v2)
+                k_res[i].add(k.reshape(-1, head_dim).float().cpu().numpy())
+                v_res[i].add(v.reshape(-1, head_dim).float().cpu().numpy())
             if (si + 1) % 8 == 0:
                 print(f"[extract] {si + 1}/{len(chunks)} sequences", file=sys.stderr)
 
-    for li in range(n_layers):
+    for i in kv_idxs:
         np.savez_compressed(
-            os.path.join(args.output_dir, f"layer_{li:03d}.npz"),
-            k=k_res[li].result().astype(np.float16),
-            v=v_res[li].result().astype(np.float16),
+            os.path.join(args.output_dir, f"layer_{i:03d}.npz"),
+            k=k_res[i].result().astype(np.float16),
+            v=v_res[i].result().astype(np.float16),
         )
 
     meta = {
         "model": args.model,
         "dtype": args.dtype,
         "n_layers": int(n_layers),
+        "kv_layers": len(kv_idxs),
+        "kv_layer_idxs": kv_idxs,
         "head_dim": int(head_dim),
         "n_sample": int(args.n_sample),
         "seq_len": int(args.seq_len),
         "n_seqs": len(chunks),
-        "rows_seen_layer0_k": int(k_res[0].seen),
-        "note": "k = post-RoPE keys, v = value vectors; rows are [n_sample, head_dim]",
+        "rows_seen_first_kv_k": int(k_res[kv_idxs[0]].seen),
+        "note": "k = post-RoPE keys, v = value vectors; rows are [n_sample, head_dim]; "
+                "dumps named layer_<model_idx>.npz (only K/V-cache layers)",
     }
     with open(os.path.join(args.output_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"[extract] wrote {n_layers} layer dumps + meta.json to {args.output_dir}",
+    print(f"[extract] wrote {len(kv_idxs)} layer dumps + meta.json to {args.output_dir}",
           file=sys.stderr)
 
 
