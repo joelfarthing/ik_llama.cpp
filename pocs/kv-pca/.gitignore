@@ -1,0 +1,8 @@
+# Phase 0 artifacts — large/local, not for version control.
+dumps/
+results/
+*.npz
+*.png
+calib.txt
+.venv/
+__pycache__/

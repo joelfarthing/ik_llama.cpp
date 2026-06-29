@@ -1,0 +1,7 @@
+# Phase 0 de-risk harness deps. Install into a venv on halfeagle.
+# torch with CUDA should already be present for the 4070; pin loosely.
+torch>=2.2
+transformers>=4.44
+numpy>=1.24
+# Optional: plots. The harness degrades gracefully (CSV/JSON + stdout verdict) if absent.
+matplotlib>=3.7
