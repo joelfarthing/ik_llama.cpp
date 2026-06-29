@@ -76,10 +76,26 @@ QK-norm would pre-whiten the cache and *remove* the headroom (Qwen NO-GO, Llama 
 
 **Caveat / next gate:** all of the above is reconstruction MSE — a proxy. Whether the
 K-MSE win becomes real memory-at-iso-quality must be confirmed with **logit-KL / perplexity
-vs the F16 cache** before any C++ build. That is Phase 0.5 (`eval_kv_quant.py`, not yet
-written): quantize the K-cache inline in an HF forward (PCA+alloc vs Hadamard+uniform at
-matched bits, V fp) and measure ppl + logit-KL on held-out text — no kernel work, decisive
-either way.
+vs the F16 cache** before any C++ build. That is Phase 0.5 (`eval_kv_quant.py`): quantize the K-cache inline in an HF forward
+(PCA+alloc vs Hadamard+uniform at matched bits, V fp) and measure ppl + logit-KL on
+held-out text.
+
+### Phase 0.5 results (2026-06-29): the MSE win is REAL
+
+`eval_kv_quant.py` registers a custom attention fn that quantizes K inline, on wikitext-2
+test (16×1024 tok), V left fp. Perplexity (lower = better) and logit-KL(fp||q):
+
+| Model | fp ppl | 4-bit Hadamard | 4-bit PCA | 2-bit Hadamard | 2-bit PCA |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-1.7B (GO) | 16.13 | 22.20 (+6.07) | **17.20 (+1.07)** | 232682 | **120.2** |
+| Llama-3.2-3B (NO-GO) | 8.00 | 8.11 (+0.10) | 8.14 (+0.14) | 254.5 | **23.8** |
+
+- Qwen3-1.7B: PCA cuts the 4-bit K-quant penalty ~5× (+6.1 → +1.1 ppl); KL 0.375 → 0.111.
+- Llama-3.2-3B: no 4-bit win — but only because Hadamard is *already near-lossless* at
+  4-bit (+0.10 ppl); nothing to win.
+- **Refinement the MSE gate hid:** at aggressive 2-bit, PCA+alloc rescues *both*
+  architectures (Hadamard 2-bit collapses to ppl 10²–10⁵). Value = **QK-norm models at
+  moderate (4-bit), any model at extreme (2-bit)**. Build justified.
 
 ## Cost reality (revised)
 

@@ -16,8 +16,10 @@ Ran on four models. **The QK-norm hypothesis inverted:** QK-norm models GO, non-
 NO-GO (K@4-bit `pca+alloc` vs Hadamard: Qwen3-1.7B +39%, Qwen3-4B +21% | Qwen2.5-3B +11%
 sub-gate, Llama-3.2-3B −2%). Qwen2.5-3B vs Qwen3 (same lineage, QK-norm the difference)
 isolates QK-norm as the cause. The win is **K-only, low-bit**, and needs the PCA basis +
-allocation together (`hadamard+alloc` = +0%). All MSE — logit-KL confirmation
-(`eval_kv_quant.py`, Phase 0.5) is the next gate. Full table + detail in `PLAN.md`.
+allocation together (`hadamard+alloc` = +0%). **Phase 0.5 (`eval_kv_quant.py`) confirms
+the MSE win in logit space:** on Qwen3-1.7B, PCA cuts the 4-bit K-cache perplexity penalty
+~5× (+6.1 → +1.1 vs Hadamard); at 2-bit it rescues models Hadamard collapses. Full tables
++ detail in `PLAN.md`.
 
 ## Setup
 
