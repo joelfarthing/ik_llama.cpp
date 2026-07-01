@@ -22,6 +22,7 @@ Example:
 """
 import argparse
 import glob
+import itertools
 import json
 import os
 import sys
@@ -175,6 +176,49 @@ def col_quant_mse_alloc(xt, avg_bits):
     return err / xt.size
 
 
+def _nonincreasing_widths(k, bmax):
+    """All non-increasing width tuples of length k drawn from 0..bmax."""
+    for comb in itertools.combinations_with_replacement(range(bmax + 1), k):
+        yield comb[::-1]
+
+
+def _segmentations(nb, max_seg):
+    """All ways to split nb ordered blocks into 1..max_seg contiguous segments."""
+    for k in range(1, min(max_seg, nb) + 1):
+        for cuts in itertools.combinations(range(1, nb), k - 1):
+            bounds = (0,) + cuts + (nb,)
+            yield tuple(b - a for a, b in zip(bounds, bounds[1:]))
+
+
+def segmented_quant_mse(block_errs, size, avg_bits, max_seg, bmax=8):
+    """Gate B (2026-07-01): piecewise-constant (segmented) approximation of pca+alloc.
+
+    pca+alloc gives every block-of-32 its own rate — a fully variable-rate row that no
+    fixed-stride kernel can address. The kernel-feasible shape is a step function: the
+    variance-sorted blocks split into <= max_seg contiguous segments, every block in a
+    segment stored at one fixed width (a K row becomes 2-3 fixed-stride regions, each
+    addressable as an existing quant type). Exhaustive search over cut points and
+    non-increasing per-segment widths (PCA sorts variance descending, so the optimum is
+    non-increasing) under the same total budget pca+alloc gets. `block_errs[i][w]` is
+    the precomputed SSE of block i quantized at width w.
+    """
+    nb = len(block_errs)
+    budget = avg_bits * nb
+    best = None
+    for seg_lens in _segmentations(nb, max_seg):
+        for widths in _nonincreasing_widths(len(seg_lens), bmax):
+            if sum(w * n for w, n in zip(widths, seg_lens)) > budget:
+                continue
+            err, i = 0.0, 0
+            for w, n in zip(widths, seg_lens):
+                for _ in range(n):
+                    err += block_errs[i][w]
+                    i += 1
+            if best is None or err < best:
+                best = err
+    return best / size
+
+
 def analyze_tensor(x, bits_list, block, center):
     """Return {method: {bits: mse}} for one [n, d] sample.
 
@@ -183,6 +227,8 @@ def analyze_tensor(x, bits_list, block, center):
       hadamard   - fixed Hadamard, uniform quant (ik_llama today)
       pca        - learned PCA, uniform quant (rotation-only drop-in; expected ~wash)
       pca+alloc  - learned PCA + adaptive bit allocation at matched avg rate (KVTC lever)
+      pca+seg2/3 - PCA + 2/3-segment piecewise-constant allocation (Gate B: the
+                   kernel-feasible step-function approximation of pca+alloc)
     """
     x = x.astype(np.float32)
     if center:
@@ -204,6 +250,13 @@ def analyze_tensor(x, bits_list, block, center):
         b: block_quant_mse_alloc(xt_pca, b, block) for b in bits_list}
     results["pca+alloc-perdim"] = {
         b: col_quant_mse_alloc(xt_pca, b) for b in bits_list}
+    # Gate B: per-block SSE table computed once, shared by the seg2/seg3 searches
+    # across all bit depths.
+    seg_errs = [[_block_err(xt_pca[:, s:s + block], w) for w in range(9)]
+                for s in range(0, d, block)]
+    for n_seg in (2, 3):
+        results[f"pca+seg{n_seg}"] = {
+            b: segmented_quant_mse(seg_errs, xt_pca.size, b, n_seg) for b in bits_list}
     # Ablation: the SAME adaptive allocation on the Hadamard basis ik_llama already
     # uses. Isolates "is the win the allocation lever (basis-free, small build) or the
     # PCA basis (needs a calibrated sidecar)?" — the gap pca+alloc - hadamard+alloc is
@@ -288,6 +341,16 @@ def main():
             "fraction_meeting_margin": float(wins / len(cand)),
             "go": bool(wins / len(cand) > 0.5),
         })
+        # Gate B: how much of the pca+alloc win survives the kernel-feasible
+        # step-function constraint? PASS = seg3 keeps >= 70% of the mean reduction.
+        pa = verdict["mean_mse_reduction_pca_alloc_vs_hadamard_k"]
+        for tag in ("pca+seg2", "pca+seg3"):
+            red = mean_red(tag)
+            verdict[f"{tag}_mean_reduction_vs_hadamard"] = red
+            if red is not None and pa > 0:
+                verdict[f"{tag}_retention_of_pca_alloc"] = float(red / pa)
+        ret3 = verdict.get("pca+seg3_retention_of_pca_alloc")
+        verdict["gate_b_pass"] = bool(ret3 >= 0.70) if ret3 is not None else None
     else:
         verdict["go"] = None
         verdict["note"] = ("hadamard baseline unavailable (head_dim not a power of two) "
@@ -325,6 +388,16 @@ def main():
                 print(f"  -> PCA basis marginal value:     {pa - had_alloc:+.1%}  (pca+alloc minus hadamard+alloc)")
         if ceil is not None:
             print(f"  per-dim transform-coding ceiling: {ceil:+.1%}  (upper bound; needs a new cache format)")
+        for tag, label in (("pca+seg2", "2-segment step vs Hadamard"),
+                           ("pca+seg3", "3-segment step vs Hadamard")):
+            red = verdict.get(f"{tag}_mean_reduction_vs_hadamard")
+            ret = verdict.get(f"{tag}_retention_of_pca_alloc")
+            if red is not None:
+                extra = f"  ({ret:.0%} of pca+alloc win)" if ret is not None else ""
+                print(f"  {label}:      {red:+.1%}{extra}  (kernel-feasible)")
+        if verdict.get("gate_b_pass") is not None:
+            print(f"  Gate B (seg3 retains >=70% of pca+alloc): "
+                  f"{'PASS' if verdict['gate_b_pass'] else 'FAIL'}")
         print(f"\n  >>> {'GO' if verdict['go'] else 'NO-GO'} <<<  "
               f"({'adaptive allocation clears the bar' if verdict['go'] else 'no win even with allocation — cache near-isotropic for this model'})")
     print(f"\nfull tables: {os.path.join(args.out, 'summary.json')} / rd_results.csv")
