@@ -9382,8 +9382,11 @@ struct llama_data_write {
             // When v is transposed, we also need the element size and get the element ranges from each row
             const uint32_t kv_size = kv_self.size;
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
                 const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
+                // Number of rows in the transposed V cache, taken from the allocated tensor.
+                // It is not always n_embd_v_gqa: MLA with mla_attn == 1 caches the
+                // kv_lora_rank latent instead of per-head values.
+                const uint32_t n_embd_v_gqa = has_v_cache ? ggml_nelements(kv_self.v_l[il])/kv_size : 0;
 
                 // Write value type
                 const int32_t v_type_i = has_v_cache ? (int32_t) kv_self.v_l[il]->type : -1;
@@ -9868,8 +9871,9 @@ struct llama_data_read {
         else if (v_state == 1) {
             // For each layer, read the values for each cell (transposed)
             for (uint32_t il = 0; il < n_layer; ++il) {
-                const uint32_t n_embd_v_gqa = llama_kv_v_row_embd(ctx->model, hparams, il);
                 const bool has_v_cache = kv_self.v_l[il] != nullptr && need_kv;
+                // Row count as in write_kv_cache_data: from the tensor, not n_embd_v_gqa.
+                const uint32_t n_embd_v_gqa = has_v_cache ? ggml_nelements(kv_self.v_l[il])/kv_self.size : 0;
 
                 // Read type of value
                 int32_t v_type_i_ref;
