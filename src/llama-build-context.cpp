@@ -375,8 +375,10 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
             if (kv_self.k_l[il] == nullptr) {
                 continue;
             }
-            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            // the MLA cache holds a kv_lora_rank + n_rot latent, so hparams row widths do not apply here
+            const int64_t n_embd_k_gqa = ggml_nelements(kv_self.k_l[il]) / kv_self.rows(il);
+            const int64_t n_embd_v_gqa = (kv_self.v_l.size() > (size_t) il && kv_self.v_l[il] != nullptr)
+                    ? ggml_nelements(kv_self.v_l[il]) / kv_self.rows(il) : 0;
 
             ggml_tensor * view_k_src = ggml_view_2d(ctx0, kv_self.k_l[il],
                     n_embd_k_gqa, nm,
