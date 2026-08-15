@@ -2036,6 +2036,7 @@ bool common_speculative_prepare_mtp_runtime(
         gpt_params params_mtp = params_base;
         params_mtp.pooling_type = LLAMA_POOLING_TYPE_NONE;
         params.cparams_dft = common_context_params_to_llama(params_mtp);
+        params.cparams_dft.worst_case_tokens = 1;
     }
 
     params.cparams_dft.mtp         = true;
