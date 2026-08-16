@@ -124,7 +124,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     if (new_mma_available(cc) && K->ne[0] == 256 && V->ne[0] == 256 && Q->ne[0] == 256 && Q->ne[1] == 1 && Q->ne[2] / K->ne[2] == 6) {
-        ggml_cuda_flash_attn_ext_mma_new(ctx, dst);
+        if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_new(ctx, dst);
+        }
         return;
     }
 
@@ -215,6 +219,11 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
                 return ggml_cuda_fattn_tile_f32_is_supported(ctx, dst);
             }
         }
+    }
+
+    if (new_mma_available(cc) && K->ne[0] == 256 && V->ne[0] == 256 && Q->ne[0] == 256 && Q->ne[1] == 1 &&
+            Q->ne[2] / K->ne[2] == 6 && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+        return true;
     }
 
     const bool gqa_opt_applies = ((Q->ne[2] / K->ne[2]) % 2 == 0) && mask; // The mma-based kernels have GQA-specific optimizations
