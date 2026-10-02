@@ -3,8 +3,9 @@
 #  - windows-cpu: MSVC CPU builds of the PR head and of its merge base 5bf8f0fe4, then llama-cli arms on
 #    Gemma-4-E2B, RalphQwen and RalphSeek-V4.1, base first on each configuration. Per arm: a cold unbuffered
 #    copy of the GGUF, the standby-cache growth, the peak working set, the wall time, and a hash of the output.
-#  - windows-cuda: MSVC CUDA 12.8 sm_86 builds of the same two refs, packaged with the CUDA runtime DLLs for a
-#    Windows RTX 3090 rental. Hosted runners have no GPU, so nothing CUDA runs here.
+#  - windows-cuda: MSVC CUDA 12.8 sm_86 + sm_89 builds of the same two refs, packaged with the CUDA runtime DLLs for a
+#    Windows GPU rental (A16/A40 = sm_86, L40S = sm_89). Hosted runners have no GPU, so nothing CUDA runs here.
+# windows-cpu is off on this commit: run 37025703228 has its results.
 # Both refs carry the same sed patch for the MSVC break from #2550 (ggml-quants.c:15875, still on main).
 name: pr2563 windows
 # push, not workflow_dispatch: a dispatch workflow must exist on the default branch first
@@ -28,6 +29,7 @@ env:
 
 jobs:
   windows-cpu:
+    if: false
     runs-on: windows-2022
     timeout-minutes: 300
     steps:
@@ -125,14 +127,14 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cl 2>&1 | findstr /C:"Version"
           nvcc --version | findstr release
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_FATAL_WARNINGS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_OPENMP=ON -DLLAMA_CURL=OFF -DGGML_RPC=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_FATAL_WARNINGS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_OPENMP=ON -DLLAMA_CURL=OFF -DGGML_RPC=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89" || exit /b 1
           cmake --build build -j 4 --target llama-server llama-cli > build.log 2>&1 || (type build.log & exit /b 1)
           exit /b 0
 
       - name: Package with the CUDA runtime
         shell: pwsh
         run: |
-          $pkg = "win-cuda12.8-sm86-${{ matrix.side }}"
+          $pkg = "win-cuda12.8-sm86-89-${{ matrix.side }}"
           New-Item -ItemType Directory $pkg | Out-Null
           Copy-Item build\bin\*.exe, build\bin\*.dll $pkg
           foreach ($d in 'cudart64_12.dll','cublas64_12.dll','cublasLt64_12.dll') { Copy-Item "$env:CUDA_PATH\bin\$d" $pkg }
@@ -141,5 +143,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: win-cuda12.8-sm86-${{ matrix.side }}
-          path: win-cuda12.8-sm86-${{ matrix.side }}
+          name: win-cuda12.8-sm86-89-${{ matrix.side }}
+          path: win-cuda12.8-sm86-89-${{ matrix.side }}
