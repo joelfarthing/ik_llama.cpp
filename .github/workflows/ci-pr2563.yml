@@ -1,0 +1,145 @@
+# Lives only on ci/pr2563 (= the PR head 0a1824af5 + one workflow commit), never in the PR diff.
+# Evidence for the #2563 review (Joel, maintainer-requested 2026-10-02):
+#  - windows-cpu: MSVC CPU builds of the PR head and of its merge base 5bf8f0fe4, then llama-cli arms on
+#    Gemma-4-E2B, RalphQwen and RalphSeek-V4.1, base first on each configuration. Per arm: a cold unbuffered
+#    copy of the GGUF, the standby-cache growth, the peak working set, the wall time, and a hash of the output.
+#  - windows-cuda: MSVC CUDA 12.8 sm_86 builds of the same two refs, packaged with the CUDA runtime DLLs for a
+#    Windows RTX 3090 rental. Hosted runners have no GPU, so nothing CUDA runs here.
+# Both refs carry the same sed patch for the MSVC break from #2550 (ggml-quants.c:15875, still on main).
+name: pr2563 windows
+# push, not workflow_dispatch: a dispatch workflow must exist on the default branch first
+on:
+  push:
+    branches: ['ci/pr2563']
+
+env:
+  BASE_REF: 5bf8f0fe4db98e9560de0f495232f8d3a733c678
+  GEMMA_URL: https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf
+  GEMMA_SHA256: fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634
+  RALPHQWEN_URL: https://huggingface.co/ji-farthing/RalphQwen3.8-Flash-Next-GGUF/resolve/main/RalphQwen3.8-Flash-Next-F32.gguf
+  RALPHQWEN_SHA256: c818ee9dc38c4a40f36568d95475395387e7b3eca1ea24715b72d9ba3a3ea957
+  RALPHSEEK_URL: https://huggingface.co/ji-farthing/RalphSeek-V4.1-Flash-GGUF/resolve/main/ralphseek-v41-flash-q8_0.gguf
+  RALPHSEEK_SHA256: 00647c681aaf0d626868938b4ff19dd3259ca2c44b371956459fd5dc347c99da
+  # single quotes keep the backslash escapes literal; llama-cli -e expands them
+  PROMPT_GEMMA: 'The capital of France is Paris. The capital of Japan is'
+  PROMPT_RALPHQWEN: '<|im_start|>user\nTeacher: Tell me about raindrops.\nRalph:<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+  PROMPT_RALPHSEEK: '<｜User｜>Teacher: What is your name?\nRalph:<｜Assistant｜></think>'
+  ARGS: -n 32 --temp 0 --seed 1 -c 512 -t 3 -e
+
+jobs:
+  windows-cpu:
+    runs-on: windows-2022
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out the base into ctl
+        shell: bash
+        run: git worktree add --detach ctl "$BASE_REF" && git -C ctl log -1 --oneline && git log -1 --oneline
+
+      - name: Work around the MSVC build break in ggml-quants.c (both refs)
+        shell: bash
+        run: |
+          for d in . ctl; do
+            sed -i 's/^#if defined(__SSE2__)$/#if defined(__SSE2__) || defined(__SSSE3__)/' $d/ggml/src/ggml-quants.c
+            grep -n 'defined(__SSE2__) || defined(__SSSE3__)' $d/ggml/src/ggml-quants.c
+          done
+
+      - name: Build (MSVC, CPU only, both refs)
+        shell: cmd
+        # GGML_RPC=ON links ws2_32, which ggml-rpc-transport.cpp needs on main
+        run: |
+          choco install ninja -y
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl 2>&1 | findstr /C:"Version"
+          cmake -S ctl -B ctl\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_FATAL_WARNINGS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_OPENMP=ON -DLLAMA_CURL=OFF -DGGML_RPC=ON -DGGML_CUDA=OFF || exit /b 1
+          cmake --build ctl\build -j 4 --target llama-cli > build-base.log 2>&1 || (type build-base.log & exit /b 1)
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_FATAL_WARNINGS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_OPENMP=ON -DLLAMA_CURL=OFF -DGGML_RPC=ON -DGGML_CUDA=OFF || exit /b 1
+          cmake --build build -j 4 --target llama-cli > build-pr.log 2>&1 || (type build-pr.log & exit /b 1)
+          findstr /C:"warning C" build-pr.log | findstr /I "llama.cpp llama-model-loader llama-mmap" > warnings-pr.log
+          findstr /C:"warning C" build-base.log | findstr /I "llama.cpp llama-model-loader llama-mmap" > warnings-base.log
+          type warnings-pr.log
+          exit /b 0
+
+      - name: Fetch models
+        shell: bash
+        run: |
+          curl -L --fail -s -o gemma.gguf "$GEMMA_URL"
+          curl -L --fail -s -o ralphqwen.gguf "$RALPHQWEN_URL"
+          curl -L --fail -s -o ralphseek.gguf "$RALPHSEEK_URL"
+          printf '%s  gemma.gguf\n%s  ralphqwen.gguf\n%s  ralphseek.gguf\n' "$GEMMA_SHA256" "$RALPHQWEN_SHA256" "$RALPHSEEK_SHA256" | sha256sum -c
+          ls -l *.gguf
+
+      - name: Arms (base first, then the PR, per configuration)
+        shell: pwsh
+        run: ./.github/ci-pr2563-arms.ps1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arms-windows-cpu
+          path: |
+            *.out
+            *.err
+            *.log
+            summary.txt
+
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [pr, base]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.8'
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      # after the toolkit step, which reads .github/actions from the pushed commit
+      - name: Check out the base
+        if: ${{ matrix.side == 'base' }}
+        shell: bash
+        run: git checkout --detach "$BASE_REF" && git log -1 --oneline
+
+      - name: Work around the MSVC build break in ggml-quants.c
+        shell: bash
+        run: |
+          sed -i 's/^#if defined(__SSE2__)$/#if defined(__SSE2__) || defined(__SSSE3__)/' ggml/src/ggml-quants.c
+          grep -n 'defined(__SSE2__) || defined(__SSSE3__)' ggml/src/ggml-quants.c
+          git log -1 --format='%H %s' > ref.txt
+
+      - name: Configure and build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl 2>&1 | findstr /C:"Version"
+          nvcc --version | findstr release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_FATAL_WARNINGS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_OPENMP=ON -DLLAMA_CURL=OFF -DGGML_RPC=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 || exit /b 1
+          cmake --build build -j 4 --target llama-server llama-cli > build.log 2>&1 || (type build.log & exit /b 1)
+          exit /b 0
+
+      - name: Package with the CUDA runtime
+        shell: pwsh
+        run: |
+          $pkg = "win-cuda12.8-sm86-${{ matrix.side }}"
+          New-Item -ItemType Directory $pkg | Out-Null
+          Copy-Item build\bin\*.exe, build\bin\*.dll $pkg
+          foreach ($d in 'cudart64_12.dll','cublas64_12.dll','cublasLt64_12.dll') { Copy-Item "$env:CUDA_PATH\bin\$d" $pkg }
+          Copy-Item ref.txt, build.log $pkg
+          Get-ChildItem $pkg | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-cuda12.8-sm86-${{ matrix.side }}
+          path: win-cuda12.8-sm86-${{ matrix.side }}
