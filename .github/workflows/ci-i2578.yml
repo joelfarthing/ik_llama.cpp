@@ -1,0 +1,72 @@
+# Lives only on ci/i2578 (= the fix commit + one workflow commit), never in the PR diff.
+# This commit builds the pr side only; the base package (main 5f89bfc81) comes from run 37082001660.
+# Evidence for the #2578 fix PR: MSVC CUDA 12.8 sm_86 + sm_89 builds of main (5f89bfc81) and of main + the fix,
+# packaged with the CUDA runtime DLLs for a Windows GPU rental. Hosted runners have no GPU, so nothing CUDA runs here.
+# Both refs carry the same sed patch for the MSVC break from #2550 (ggml-quants.c:15875, still on main).
+name: i2578 windows
+# push, not workflow_dispatch: a dispatch workflow must exist on the default branch first
+on:
+  push:
+    branches: ['ci/i2578']
+
+env:
+  BASE_REF: 5f89bfc81268b4d56d2af63ccbed59de17c64c09
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [pr]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.8'
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      # after the toolkit step, which reads .github/actions from the pushed commit
+      - name: Check out the base
+        if: ${{ matrix.side == 'base' }}
+        shell: bash
+        run: git checkout --detach "$BASE_REF" && git log -1 --oneline
+
+      - name: Work around the MSVC build break in ggml-quants.c
+        shell: bash
+        run: |
+          sed -i 's/^#if defined(__SSE2__)$/#if defined(__SSE2__) || defined(__SSSE3__)/' ggml/src/ggml-quants.c
+          grep -n 'defined(__SSE2__) || defined(__SSSE3__)' ggml/src/ggml-quants.c
+          git log -1 --format='%H %s' > ref.txt
+
+      - name: Configure and build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl 2>&1 | findstr /C:"Version"
+          nvcc --version | findstr release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_FATAL_WARNINGS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_OPENMP=ON -DLLAMA_CURL=OFF -DGGML_RPC=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89" || exit /b 1
+          cmake --build build -j 4 --target llama-server llama-cli > build.log 2>&1 || (type build.log & exit /b 1)
+          exit /b 0
+
+      - name: Package with the CUDA runtime
+        shell: pwsh
+        run: |
+          $pkg = "win-cuda12.8-sm86-89-i2578-${{ matrix.side }}"
+          New-Item -ItemType Directory $pkg | Out-Null
+          Copy-Item build\bin\*.exe, build\bin\*.dll $pkg
+          foreach ($d in 'cudart64_12.dll','cublas64_12.dll','cublasLt64_12.dll') { Copy-Item "$env:CUDA_PATH\bin\$d" $pkg }
+          Copy-Item ref.txt, build.log $pkg
+          Get-ChildItem $pkg | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-cuda12.8-sm86-89-i2578-${{ matrix.side }}
+          path: win-cuda12.8-sm86-89-i2578-${{ matrix.side }}
