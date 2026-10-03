@@ -1,0 +1,69 @@
+# Evidence for the MSVC build fix of the Prism ternary vec_dot guard (ggml-quants.c:15875, from #2550).
+# pr = main + the fix; base = main (5f89bfc81), a control that must fail with C2440 in ggml-quants.c.
+# MSVC (cl) with Ninja, CPU only. -DGGML_AVX2=ON makes ggml-impl.h define __SSSE3__ under MSVC, which enables the callers.
+name: msvc sse2 guard
+on:
+  push:
+    branches: ['ci/msvc-sse2-guard']
+
+env:
+  BASE_REF: 5f89bfc81268b4d56d2af63ccbed59de17c64c09
+
+jobs:
+  windows-msvc:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [pr, base]
+    env:
+      SIDE: ${{ matrix.side }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Check out the base
+        if: ${{ matrix.side == 'base' }}
+        shell: bash
+        run: git checkout --detach "$BASE_REF"
+
+      - name: Record the ref and the guard
+        shell: bash
+        run: |
+          git log -1 --format='%H %s' | tee ref.txt
+          sed -n 15875p ggml/src/ggml-quants.c | tee -a ref.txt
+
+      - name: Configure and build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl 2>&1 | findstr /C:"Version"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_FATAL_WARNINGS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_OPENMP=ON -DLLAMA_CURL=OFF || exit /b 1
+          if "%SIDE%"=="base" (cmake --build build -j 4 --target ggml > build.log 2>&1) else (cmake --build build -j 4 --target llama-cli llama-server > build.log 2>&1)
+          >rc.txt echo rc=%ERRORLEVEL%
+          exit /b 0
+
+      - name: Check the result
+        shell: bash
+        run: |
+          cat rc.txt
+          grep -n 'ggml-quants\.c' build.log | head -20 || true
+          if [ "$SIDE" = base ]; then
+            grep -E 'ggml-quants\.c\([0-9]+\): error C2440' build.log
+          else
+            grep -qx 'rc=0' rc.txt && ls -l build/bin/llama-cli.exe build/bin/llama-server.exe
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: msvc-sse2-guard-${{ matrix.side }}
+          path: |
+            ref.txt
+            rc.txt
+            build.log
