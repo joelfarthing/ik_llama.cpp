@@ -5876,7 +5876,7 @@ void quantize_row_iq4_ks_r4(const float * x, void * y, int64_t k) {
     quantize_iq4_ks_r4(x, y, 4, k/4, nullptr, nullptr);
 }
 
-static void repack_iq4_ks(int nrows, int n_per_row, const block_iq4_ks * x, block_iq4_ks_r4 * y, [[maybe_unused]] bool online) {
+void repack_iq4_ks(int nrows, int n_per_row, const block_iq4_ks * x, block_iq4_ks_r4 * y, [[maybe_unused]] bool online) {
     GGML_ASSERT(nrows%4 == 0);
     GGML_ASSERT(n_per_row%QK_K == 0);
     auto row_size = ggml_row_size(GGML_TYPE_IQ4_KS, n_per_row);
@@ -5978,7 +5978,7 @@ void quantize_row_iq4_ks_r16(const float * x, void * y, int64_t k) {
     quantize_iq4_ks_r16(x, y, 16, k/16, nullptr, nullptr);
 }
 
-static void repack_iq4_ks_r16(int nrows, int n_per_row, const block_iq4_ks * x, block_iq4_ks_r16 * y, [[maybe_unused]] bool online, int n_per_row_stored) {
+void repack_iq4_ks_r16(int nrows, int n_per_row, const block_iq4_ks * x, block_iq4_ks_r16 * y, [[maybe_unused]] bool online, int n_per_row_stored) {
     GGML_ASSERT(nrows%16 == 0);
     GGML_ASSERT(n_per_row%QK_K == 0);
     GGML_ASSERT(n_per_row_stored <= n_per_row);
@@ -7079,7 +7079,7 @@ void quantize_row_iq5_ks_r4(const float * x, void * y, int64_t k) {
     quantize_iq5_ks_r4(x, y, 4, k/4, nullptr, nullptr);
 }
 
-static void repack_iq5_ks(int nrows, int n_per_row, const block_iq5_ks * x, block_iq5_ks_r4 * y, [[maybe_unused]] bool online) {
+void repack_iq5_ks(int nrows, int n_per_row, const block_iq5_ks * x, block_iq5_ks_r4 * y, [[maybe_unused]] bool online) {
     GGML_ASSERT(nrows%4 == 0);
     GGML_ASSERT(n_per_row%QK_K == 0);
     auto row_size = ggml_row_size(GGML_TYPE_IQ5_KS, n_per_row);
@@ -10579,6 +10579,13 @@ int iqk_kt_codebook(int type, int bank, const int ** offsets, const int ** point
     };
     if (type == GGML_TYPE_IQ4_KT) return flatten(iq4kt_quantizer(bank == 1), flat[bank]);
     if (type == GGML_TYPE_IQ3_KT) return flatten(iq3kt_quantizer(), flat[2]);
+    return 0;
+}
+
+int iqk_ks_index(int type, const int8_t ** index) {
+    if (type == GGML_TYPE_IQ4_KS) { *index = iq4nl_index; return 241; }
+    if (type == GGML_TYPE_IQ3_KS) { *index = iq3nl_index; return 111; }
+    if (type == GGML_TYPE_IQ5_KS) { *index = iq5nl_index; return 247; }
     return 0;
 }
 
