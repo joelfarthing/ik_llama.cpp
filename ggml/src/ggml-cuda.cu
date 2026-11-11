@@ -1770,6 +1770,9 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     const int64_t i1_diff = i1_high - i1_low;
 
     const char * x = src_ptr + i1_low*nb1 + i2*nb2 + i3*nb3;
+    if (type == GGML_TYPE_F8_E4M3_KS && nb0 == ts) {
+        return cudaMemcpy2DAsync(dst_ptr, rs, x, nb1, rs, i1_diff, cudaMemcpyDeviceToDevice, stream);
+    }
     if (nb0 == ts && nb1 == rs) {
         return cudaMemcpyAsync(dst_ptr, x, i1_diff*nb1, cudaMemcpyDeviceToDevice, stream);
     } else if (nb0 == ts) {
@@ -1815,12 +1818,12 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     const int compute_capability = ggml_cuda_info().devices[id].cc;
 
-    if (src0->type == GGML_TYPE_F8_E4M3 && dst->op_params[0] == GGML_PREC_DEFAULT) {
+    if (src0->type == GGML_TYPE_F8_E4M3_KS && dst->op_params[0] == GGML_PREC_DEFAULT) {
         ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(id), row_diff*ne00);
         ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(id), src1_ncols*ne10);
         ggml_get_to_fp16_cuda(src0->type)(src0_dd_i, src0_f16.get(), row_diff, ne00, stream);
         ggml_get_to_fp16_cuda(src1->type)(src1_ddf_i, src1_f16.get(), src1_ncols, ne10, stream);
-        const float alpha = ggml_get_weight_scale(src0);
+        const float alpha = 1.0f;
         const float beta = 0.0f;
         ctx.cublas_handle(id, stream);
         CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1829,6 +1832,8 @@ static void ggml_cuda_op_mul_mat_cublas(
                         src1_f16.get(), CUDA_R_16F, ne10,
                 &beta,  dst_dd_i,       CUDA_R_32F, ldc,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        scale_f8_rows<ggml_cuda_f8_row><<<(row_diff*src1_ncols + 255)/256, 256, 0, stream>>>(
+                src0_dd_i, dst_dd_i, ne00, row_diff, src1_ncols, ldc);
         return;
     }
 
@@ -1951,7 +1956,12 @@ static void ggml_cuda_op_mul_mat_cublas(
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
             GGML_ASSERT(to_fp32_cuda != nullptr);
             src0_ddq_as_f32.alloc(row_diff*ne00);
-            to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff, ne00, stream);
+            if (src0->type == GGML_TYPE_F8_E4M3_KS) {
+                convert_f8_rows<ggml_cuda_f8_row, float, false><<<(row_diff*ne00 + 255)/256, 256, 0, stream>>>(
+                        src0_dd_i, src0_ddq_as_f32.get(), row_diff*ne00, ne00);
+            } else {
+                to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff, ne00, stream);
+            }
         }
         if (src1->type != GGML_TYPE_F32) {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
@@ -1963,7 +1973,7 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
         const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
 
-        const float alpha = src0->type == GGML_TYPE_F8_E4M3 ? ggml_get_weight_scale(src0) : 1.0f;
+        const float alpha = 1.0f;
         const float beta = 0.0f;
 
         ctx.cublas_handle(id, stream);
@@ -1973,6 +1983,10 @@ static void ggml_cuda_op_mul_mat_cublas(
                     &alpha, src0_ddf_i,  ne00,
                             src1_ddf1_i, ne10,
                     &beta,  dst_dd_i,    ldc));
+        if (src0->type == GGML_TYPE_F8_E4M3_KS) {
+            scale_f8_rows<ggml_cuda_f8_row><<<(row_diff*src1_ncols + 255)/256, 256, 0, stream>>>(
+                    src0_dd_i, dst_dd_i, ne00, row_diff, src1_ncols, ldc);
+        }
     }
 
     GGML_UNUSED(dst);
@@ -2732,17 +2746,13 @@ static void mul_mat_1row(const ggml_tensor * src0, const ggml_tensor * src1, ggm
 }
 
 template <typename src_t>
-static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const float * y, float * z, size_t nb01, size_t nb11, float scale = 1.0f) {
+static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const float * y, float * z, size_t nb01, size_t nb11) {
     int ix = blockIdx.x;
     int iy = blockIdx.y;
     x += nb01 * ix;
     y += nb11 * iy;
     float sum = 0;
-    if constexpr (std::is_same_v<src_t, ggml_fp8_e4m3_t>) {
-        for (int j = threadIdx.x; j < n; j += blockDim.x) {
-            sum = fmaf(ggml_cuda_f8_e4m3_to_float(x[j]), y[j], sum);
-        }
-    } else if constexpr (std::is_same_v<src_t, float>) {
+    if constexpr (std::is_same_v<src_t, float>) {
         for (int j = threadIdx.x; j < n; j += blockDim.x) {
             sum += x[j]*y[j];
         }
@@ -2777,11 +2787,7 @@ static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const flo
     sum = lane_id < blockDim.x/WARP_SIZE ? tmp[lane_id] : 0.0f;
     sum = warp_reduce_sum(sum);
     if (threadIdx.x == 0) {
-        if constexpr (std::is_same_v<src_t, ggml_fp8_e4m3_t>) {
-            z[iy*nx + ix] = sum * scale;
-        } else {
-            z[iy*nx + ix] = sum;
-        }
+        z[iy*nx + ix] = sum;
     }
 }
 
@@ -2794,13 +2800,8 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
         const int nrows = row_high - row_low;
         const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
         const dim3 grid(nrows, src1_ncols);
-        if (dst->op == GGML_OP_MUL_MAT_ID) {
-            k_simple_gemm_T<<<grid, 1024, 0, stream>>>(src0->ne[0], ldc, (const ggml_fp8_e4m3_t *)src0_dd_i,
-                    src1_ddf_i, dst_dd_i, src0->ne[0], src1->ne[0], ggml_get_weight_scale(src0));
-        } else {
-            mul_mat_vec_f8_e4m3<<<grid, 256, 0, stream>>>(src0->ne[0], ldc, (const ggml_fp8_e4m3_t *)src0_dd_i,
-                    src1_ddf_i, dst_dd_i, src1->ne[0], ggml_get_weight_scale(src0));
-        }
+        mul_mat_vec_f8_e4m3<ggml_cuda_f8_row><<<grid, 256, 0, stream>>>(src0->ne[0], ldc, (const ggml_fp8_e4m3_t *)src0_dd_i,
+                src1_ddf_i, dst_dd_i, src1->ne[0]);
     } else {
         ggml_cuda_op_mul_mat_cublas(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
                 row_low, row_high, src1_ncols, src1_padded_row_size, stream);
@@ -2810,7 +2811,7 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
 
-    if (src0->type == GGML_TYPE_F8_E4M3) {
+    if (src0->type == GGML_TYPE_F8_E4M3_KS) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3, nullptr);
         return node_n;
     }
@@ -5111,9 +5112,9 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         }
     }
 
-    bool has_f8 = op->type == GGML_TYPE_F8_E4M3;
+    bool has_f8 = op->type == GGML_TYPE_F8_E4M3_KS;
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        has_f8 = has_f8 || (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3);
+        has_f8 = has_f8 || (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3_KS);
     }
     if (has_f8) {
         switch (op->op) {
@@ -5126,16 +5127,16 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             case GGML_OP_CPY:
             case GGML_OP_DUP:
             case GGML_OP_CONT:
-                return op->src[0]->type == GGML_TYPE_F8_E4M3 &&
+                return op->src[0]->type == GGML_TYPE_F8_E4M3_KS &&
                     (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
-                     op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F8_E4M3);
+                     op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F8_E4M3_KS);
             case GGML_OP_GET_ROWS:
-                return op->src[0]->type == GGML_TYPE_F8_E4M3 && op->src[1]->type == GGML_TYPE_I32 &&
+                return op->src[0]->type == GGML_TYPE_F8_E4M3_KS && op->src[1]->type == GGML_TYPE_I32 &&
                     op->op_params[0] == 0 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                     op->src[0]->nb[0] == 1 && op->src[1]->nb[0] == sizeof(int32_t);
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID:
-                return op->src[0]->type == GGML_TYPE_F8_E4M3 && op->src[1]->type == GGML_TYPE_F32 &&
+                return op->src[0]->type == GGML_TYPE_F8_E4M3_KS && op->src[1]->type == GGML_TYPE_F32 &&
                     op->type == GGML_TYPE_F32 && (op->op == GGML_OP_MUL_MAT_ID || op->src[0]->ne[3] == op->src[1]->ne[3]);
             default:
                 return false;

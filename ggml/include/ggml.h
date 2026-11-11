@@ -475,6 +475,7 @@ extern "C" {
         GGML_TYPE_TQP6       = 166, // pair trellis K=6, group 128 (Agention; on-disk id 148, remapped at load)
         GGML_TYPE_TQP7       = 167, // pair trellis K=7, group 128 (Agention; on-disk id 149, remapped at load)
         GGML_TYPE_NVFP4_KS   = 168,
+        GGML_TYPE_F8_E4M3_KS = 169,
 
         GGML_TYPE_Q4_0_R8    = 202,
         GGML_TYPE_Q5_0_R4    = 206,
@@ -974,8 +975,6 @@ extern "C" {
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);
 
-    GGML_API void ggml_set_weight_scale(struct ggml_tensor * tensor, float scale);
-    GGML_API float ggml_get_weight_scale(const struct ggml_tensor * tensor);
     GGML_API void ggml_set_input_scale(struct ggml_tensor * tensor, float scale);
     GGML_API float ggml_get_input_scale(const struct ggml_tensor * tensor);
     GGML_API bool  ggml_mxfp4_to_nvfp4_ks(const void * src, void * dst, int n_per_row);
