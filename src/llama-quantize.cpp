@@ -152,7 +152,7 @@ static void llama_tensor_dequantize_internal(
     float * f32_output = (float *) output.data();
 
     ggml_type_traits_t qtype;
-    if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS) {
+    if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS || tensor->type == GGML_TYPE_F8_E4M3_B128) {
         qtype = ggml_internal_get_type_traits(tensor->type);
         if (qtype.to_float == NULL) {
             throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(tensor->type)));
@@ -168,12 +168,12 @@ static void llama_tensor_dequantize_internal(
         return;
     }
 
-    if (nthread < 2 || ((ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS) && qtype.row_meta_size > 0)) {
+    if (nthread < 2 || ((ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS || tensor->type == GGML_TYPE_F8_E4M3_B128) && qtype.row_meta_size > 0)) {
         if (tensor->type == GGML_TYPE_F16) {
             ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor->data, f32_output, nelements);
         } else if (tensor->type == GGML_TYPE_BF16) {
             ggml_bf16_to_fp32_row((ggml_bf16_t *)tensor->data, f32_output, nelements);
-        } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS) {
+        } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS || tensor->type == GGML_TYPE_F8_E4M3_B128) {
             auto row_size = ggml_row_size(tensor->type, tensor->ne[0]);
             int nrows = ggml_nrows(tensor);
             auto qsrc = (const char *)tensor->data;
@@ -1670,7 +1670,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     if (!output_meta) {
         output_meta = ml.get_tensor_meta("token_embd.weight");
     }
-    if (params->extra_output_type == GGML_TYPE_F8_E4M3 || params->extra_output_type == GGML_TYPE_F8_E4M3_KS) {
+    if (params->extra_output_type == GGML_TYPE_F8_E4M3 || params->extra_output_type == GGML_TYPE_F8_E4M3_KS || params->extra_output_type == GGML_TYPE_F8_E4M3_B128) {
         throw std::runtime_error("F8 types are not quantization targets; use COPY to repack type 43");
     }
     ggml_tensor * output_tensor = nullptr;
@@ -2068,7 +2068,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 chunk_size_multiplier = num_rows;
             }
 
-            if (new_type == GGML_TYPE_F8_E4M3 || new_type == GGML_TYPE_F8_E4M3_KS) {
+            if (new_type == GGML_TYPE_F8_E4M3 || new_type == GGML_TYPE_F8_E4M3_KS || new_type == GGML_TYPE_F8_E4M3_B128) {
                 throw std::runtime_error("F8 types are not quantization targets; use COPY to repack type 43");
             }
 
@@ -2086,7 +2086,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
                 if (tensor->type == GGML_TYPE_F32) {
                     f32_data = (float *) tensor->data;
-                } else if ((ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS) && !params->allow_requantize) {
+                } else if ((ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS || tensor->type == GGML_TYPE_F8_E4M3_B128) && !params->allow_requantize) {
                     throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
                 } else if (!use_slabs) {
                     llama_tensor_dequantize_internal(tensor, f32_conv_buf, workers, nelements, nthread);
@@ -2344,7 +2344,7 @@ static void estimate_imatrix_internal(const std::string & fname_inp,
 
             if (tensor->type == GGML_TYPE_F32) {
                 f32_data = (float *) tensor->data;
-            } else if ((ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS) && !params->allow_requantize) {
+            } else if ((ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F8_E4M3_KS || tensor->type == GGML_TYPE_F8_E4M3_B128) && !params->allow_requantize) {
                 throw std::runtime_error(format("requantizing from type %s is disabled", ggml_type_name(tensor->type)));
             } else {
                 llama_tensor_dequantize_internal(tensor, f32_conv_buf, workers, nelements, nthread);

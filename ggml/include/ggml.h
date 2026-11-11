@@ -476,6 +476,7 @@ extern "C" {
         GGML_TYPE_TQP7       = 167, // pair trellis K=7, group 128 (Agention; on-disk id 149, remapped at load)
         GGML_TYPE_NVFP4_KS   = 168,
         GGML_TYPE_F8_E4M3_KS = 169,
+        GGML_TYPE_F8_E4M3_B128 = 170,
 
         GGML_TYPE_Q4_0_R8    = 202,
         GGML_TYPE_Q5_0_R4    = 206,

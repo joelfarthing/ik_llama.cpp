@@ -5112,6 +5112,15 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         }
     }
 
+    bool has_f8_b128 = op->type == GGML_TYPE_F8_E4M3_B128;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        has_f8_b128 = has_f8_b128 || (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3_B128);
+    }
+    if (has_f8_b128) {
+        return op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW ||
+               op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE;
+    }
+
     bool has_f8 = op->type == GGML_TYPE_F8_E4M3_KS;
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         has_f8 = has_f8 || (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3_KS);
