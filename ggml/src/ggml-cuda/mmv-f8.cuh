@@ -16,13 +16,8 @@ static __device__ __forceinline__ float2 ggml_cuda_f8_e4m3x2_to_float2(uint16_t 
 }
 
 template <typename layout>
-static __global__ void mul_mat_vec_f8_e4m3(int n, int ldc, const ggml_fp8_e4m3_t * x,
-        const float * y, float * z, size_t nb11) {
-    const int row = blockIdx.x;
-    const int col = blockIdx.y;
-    const void * row_data = (const char *)x + size_t(row)*layout::row_size(n);
-    x = layout::codes(row_data);
-    y += size_t(col) * nb11;
+static __device__ __forceinline__ float dot_f8_e4m3(int n, const void * row_data, const float * y) {
+    const auto * x = layout::codes(row_data);
     float sum = 0.0f;
     if (n % 2 == 0 && uintptr_t(x) % alignof(uint16_t) == 0 && uintptr_t(y) % alignof(float2) == 0) {
         const auto * y2 = (const float2 *)y;
@@ -48,9 +43,15 @@ static __global__ void mul_mat_vec_f8_e4m3(int n, int ldc, const ggml_fp8_e4m3_t
     __syncthreads();
     sum = lane < 256/WARP_SIZE ? tmp[lane] : 0.0f;
     sum = warp_reduce_sum(sum);
-    if (threadIdx.x == 0) {
-        z[size_t(col)*ldc + row] = sum * layout::scale(row_data);
-    }
+    return sum * layout::scale(row_data);
+}
+
+template <typename layout>
+static __global__ void mul_mat_vec_f8_e4m3(int n, int ldc, const ggml_fp8_e4m3_t * x,
+        const float * y, float * z, size_t nb11) {
+    const void * row = (const char *)x + size_t(blockIdx.x)*layout::row_size(n);
+    const float sum = dot_f8_e4m3<layout>(n, row, y + size_t(blockIdx.y)*nb11);
+    if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + blockIdx.x] = sum;
 }
 
 template <int width>
@@ -144,4 +145,36 @@ static __global__ void mul_mat_vec_f8_e4m3_b128_id(int n, int experts, int chann
     const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
     const float sum = dot_f8_e4m3_b128(n, row, a);
     if (threadIdx.x == 0) *(float *)(z + size_t(token)*nb2 + size_t(slot)*nb1 + blockIdx.x*sizeof(float)) = sum;
+}
+
+template <bool blocked>
+static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int experts, int channels,
+        const char * up, const char * gate, const char * y, const char * ids,
+        const char * bias_up, const char * bias_gate, float * u, float * g,
+        size_t nbu1, size_t nbu2, size_t nbg1, size_t nbg2, size_t nb11, size_t nb12,
+        size_t nbi0, size_t nbi1, size_t nbbu1, size_t nbbg1) {
+    const int slot = blockIdx.y;
+    const int token = blockIdx.z;
+    const int row = blockIdx.x;
+    const int expert = *(const int *)(ids + size_t(token)*nbi1 + size_t(slot)*nbi0);
+    const size_t out = (size_t(token)*gridDim.y + slot)*rows + row;
+    if (expert < 0 || expert >= experts) {
+        if (threadIdx.x == 0) u[out] = g[out] = 0;
+        return;
+    }
+    const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
+    const void * ur = up + size_t(expert)*nbu2 + size_t(row)*nbu1;
+    const void * gr = gate + size_t(expert)*nbg2 + size_t(row)*nbg1;
+    float su, sg;
+    if constexpr (blocked) su = dot_f8_e4m3_b128(n, ur, a);
+    else su = dot_f8_e4m3<ggml_cuda_f8_row>(n, ur, a);
+    __syncthreads();
+    if constexpr (blocked) sg = dot_f8_e4m3_b128(n, gr, a);
+    else sg = dot_f8_e4m3<ggml_cuda_f8_row>(n, gr, a);
+    if (threadIdx.x == 0) {
+        if (bias_up) su += ((const float *)(bias_up + size_t(expert)*nbbu1))[row];
+        if (bias_gate) sg += ((const float *)(bias_gate + size_t(expert)*nbbg1))[row];
+        u[out] = su;
+        g[out] = sg;
+    }
 }
