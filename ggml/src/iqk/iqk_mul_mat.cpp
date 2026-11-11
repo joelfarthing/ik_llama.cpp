@@ -250,7 +250,7 @@ struct MulMat {
     }
     static bool prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny);
     static inline ggml_type is_dequant_better(ggml_type type, int nrc_y) {
-        if (type == GGML_TYPE_F8_E4M3_KS) return GGML_TYPE_BF16;
+        if (type == GGML_TYPE_F8_E4M3_KS) return nrc_y >= 32 ? GGML_TYPE_BF16 : type;
 #ifdef __AVX2__
 #ifdef HAVE_FANCY_SIMD
         auto q8_k_type = GGML_TYPE_Q8_K_R16;
@@ -948,19 +948,6 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
 
     }
 
-    if (typeA == GGML_TYPE_F8_E4M3_KS && typeB == GGML_TYPE_BF16) {
-        const auto dot = ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).vec_dot;
-        DataInfo info{C, (const char *)B, size_t(nb1)/sizeof(float), size_t(strideB), 0, ne11, row_mapping, size_t(nb2)/sizeof(float)};
-        for (int ix = ith; ix < Nx; ix += nth) {
-            for (int iy = 0; iy < Ny; ++iy) {
-                float value;
-                dot(ne00, &value, 0, (const char *)A + ix*strideA, 0, info.src1_row(iy), 0, 1);
-                info.store(ix, iy, value);
-            }
-        }
-        return true;
-    }
-
     if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
         return false;
     }
@@ -994,7 +981,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     MulMat mm;
 
     auto etypeA = ggml_type(typeA);
-    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); dequant_type != etypeA) {
+    if (auto dequant_type = typeA == GGML_TYPE_F8_E4M3_KS ? etypeA : MulMat::is_dequant_better(etypeA, Ny); dequant_type != etypeA) {
         if (MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
             constexpr int k_x_step = 64;
@@ -1028,7 +1015,9 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
 
     }
 
-    if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
+    if (typeA == GGML_TYPE_F8_E4M3_KS) {
+        if (!iqk_set_kernels_f8(typeA, typeB, mm.funcs, true)) return false;
+    } else if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
         return false;
     }
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
@@ -1056,6 +1045,9 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny) {
     (void)Ny;
 
     switch (typeA) {
+        case GGML_TYPE_F8_E4M3_KS:
+        case GGML_TYPE_F8_E4M3_B128:
+            return iqk_set_kernels_f8(typeA, typeB, mm.funcs);
         case GGML_TYPE_F16:
         case GGML_TYPE_F32:
         case GGML_TYPE_BF16:
@@ -1171,6 +1163,9 @@ namespace {
 bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int /*Ny*/) {
 
     switch (typeA) {
+        case GGML_TYPE_F8_E4M3_KS:
+        case GGML_TYPE_F8_E4M3_B128:
+            return iqk_set_kernels_f8(typeA, typeB, m.funcs);
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_F32:
