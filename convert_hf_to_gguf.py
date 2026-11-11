@@ -251,7 +251,8 @@ class Model:
             scales = scales.repeat_interleave(block_cols, dim=-1)[..., :weight.shape[-1]]
         return weight.float() * scales
 
-    def _convert_fp8(self, name: str, weight: Tensor, scale: Tensor, block_size: Sequence[int] | None):
+    def _convert_fp8(self, name: str, weight: Tensor, scale: Tensor, block_size: Sequence[int] | None,
+                     transforms_done: bool = False):
         if len(weight.shape) < 2:
             return weight.float() * scale.float()
         scales, block_cols = self._fp8_scale_rows(weight, scale, block_size)
@@ -261,7 +262,7 @@ class Model:
             qtype = gguf.GGMLQuantizationType.F8_E4M3_B128
             if block_cols != 128 or weight.shape[-1] % 128:
                 reason = "block layout is not representable as F8_E4M3_B128"
-        if type(self).modify_tensors not in (Model.modify_tensors, LlamaModel.modify_tensors,
+        if not transforms_done and type(self).modify_tensors not in (Model.modify_tensors, LlamaModel.modify_tensors,
                                            Qwen2MoeModel.modify_tensors, DeepseekV2Model.modify_tensors):
             reason = f"{type(self).__name__} tensor transforms require dequantization"
         if type(self).modify_tensors is DeepseekV2Model.modify_tensors and name.endswith("kv_b_proj.weight"):
@@ -2591,11 +2592,6 @@ class ModelOptModel(Model):
             yield name, gen()
 
     @staticmethod
-    def _numpy_bytes(data):
-        return gguf.LazyNumpyTensor(meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(np.uint8, tuple(data.shape)),
-                                   args=(data,), func=lambda t: t.contiguous().numpy())
-
-    @staticmethod
     def _nvfp4_pack(weight, scale, scale2):
         out_features = weight.shape[0]
         n_blocks = scale.shape[1]
@@ -2622,27 +2618,33 @@ class ModelOptModel(Model):
     def _write_fp8_projection(self, name, weight, scale):
         bid = next((int(p) for p in name.split('.') if p.isdecimal()), None)
         for new_name, data in self.modify_tensors(weight.view(torch.uint8), name, bid):
-            self.gguf_writer.add_tensor(new_name, self._numpy_bytes(data), raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
-            self.gguf_writer.add_tensor(new_name.removesuffix(".weight") + ".scale", scale.float().reshape(-1).numpy())
-            input_name = name.removesuffix(".weight") + ".input_scale"
-            if input_name in self.model_tensors:
-                self.gguf_writer.add_tensor(new_name.removesuffix(".weight") + ".input_scale",
-                                            self.model_tensors[input_name]().float().reshape(-1).numpy())
+            packed = self._convert_fp8(new_name, data.view(torch.float8_e4m3fn), scale, None, transforms_done=True)
+            self.gguf_writer.add_tensor(new_name, packed.numpy(self.is_big_endian), raw_dtype=packed.qtype)
 
     def _write_fp8_ple(self, shards, scale):
         if len(shards) != self.hparams["split_ngram_parts"]:
             raise ValueError(f"Got {len(shards)} PLE shards, expected {self.hparams['split_ngram_parts']}")
         shapes = [self.model_tensors[name]().shape for name in shards]
         self._ple_row_dim = shapes[0][-1]
-        chunks = [lambda gen=self.model_tensors[name]: LazyTorchTensor.to_eager(gen()).view(torch.uint8).contiguous().numpy()
-                  for name in shards]
-        data = gguf.LazyChunkedTensor(chunks, (sum(shape[0] for shape in shapes), self._ple_row_dim), np.uint8)
-        self.gguf_writer.add_tensor("per_layer_token_embd.weight", data, raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
-        self.gguf_writer.add_tensor("per_layer_token_embd.scale", scale.float().reshape(-1).numpy())
+        shape = (sum(shape[0] for shape in shapes), self._ple_row_dim)
+        scale = LazyTorchTensor.to_eager(scale)
+        if self.fp8_dequant:
+            chunks = [lambda gen=self.model_tensors[name]: (LazyTorchTensor.to_eager(gen()).float() * scale.float()).numpy()
+                      for name in shards]
+            qtype = gguf.GGMLQuantizationType[self.ftype.name.removeprefix("MOSTLY_").removeprefix("ALL_")]
+            data = gguf.LazyChunkedTensor(chunks, shape, np.float32).quantize(qtype)
+        else:
+            def pack(gen):
+                tensor = self._convert_fp8("per_layer_token_embd.weight", LazyTorchTensor.to_eager(gen()), scale,
+                                           None, transforms_done=True)
+                return tensor.numpy(self.is_big_endian)
+            chunks = [lambda gen=self.model_tensors[name]: pack(gen) for name in shards]
+            qtype = gguf.GGMLQuantizationType.F8_E4M3_KS
+            data = gguf.LazyChunkedTensor(chunks, gguf.quant_shape_to_byte_shape(shape, qtype), np.uint8)
+        self.gguf_writer.add_tensor("per_layer_token_embd.weight", data, raw_dtype=qtype)
 
-    def _dequant_fp8_mtp(self, weight, scale):
-        scale = scale.float().repeat_interleave(128, 0).repeat_interleave(128, 1)
-        return weight.float() * scale[:weight.shape[0], :weight.shape[1]]
+    def _convert_fp8_mtp(self, name, weight, scale):
+        return self._convert_fp8(name, weight, scale, (128, 128), transforms_done=True)
 
     def _tag_prec_a4(self, name, new_name):
         algo = self._nvfp4_global_algo
@@ -2672,7 +2674,7 @@ class ModelOptModel(Model):
             if inv_name in self.model_tensors:
                 self._fp8_block_weights.add(name)
                 scale = self.model_tensors[inv_name]
-                self.model_tensors[name] = lambda gen=gen, scale=scale: self._dequant_fp8_mtp(gen(), scale())
+                self.model_tensors[name] = lambda name=name, gen=gen, scale=scale: self._convert_fp8_mtp(name, gen(), scale())
                 consumed.add(inv_name)
                 continue
             if scale_name not in self.model_tensors:
@@ -2681,6 +2683,10 @@ class ModelOptModel(Model):
             if weight.dtype == torch.float8_e4m3fn:
                 if math.prod(scale.shape) != 1:
                     raise ValueError(f"Expected per-tensor FP8 scale for {name}: {tuple(scale.shape)}")
+                if self.fp8_dequant:
+                    self.model_tensors[name] = lambda gen=gen, scale=scale: gen().float() * scale.float()
+                    consumed.update((scale_name, base + ".input_scale"))
+                    continue
                 self._write_fp8_projection(name, weight, scale)
             elif self._is_nvfp4:
                 if weight.ndim != 2 or scale.shape != (weight.shape[0], weight.shape[1] // 8):
@@ -2736,7 +2742,7 @@ class ModelOptModel(Model):
             parts[int(m[1])] = data_torch
             n_experts = self.hparams["num_experts"]
             if len(parts) == n_experts:
-                yield self.map_tensor_name(merged_name), torch.stack([parts[i] for i in range(n_experts)])
+                yield self.map_tensor_name(merged_name), FP8Tensor.stack([parts[i] for i in range(n_experts)])
                 del self._modelopt_experts[merged_name]
             return
         yield self.map_tensor_name(name), data_torch
@@ -2783,6 +2789,7 @@ class ModelOptModel(Model):
     def prepare_metadata(self, vocab_only):
         if self._is_nvfp4:
             self.ftype = gguf.LlamaFileType.MOSTLY_NVFP4_KS
+            self._fp8_types.clear()
         super().prepare_metadata(vocab_only)
         generation = self.dir_model / "generation_config.json"
         if generation.is_file():
