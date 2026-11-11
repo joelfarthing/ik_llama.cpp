@@ -3306,6 +3306,61 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     const ggml_tensor * src1 = dst->src[2];
     const ggml_tensor * ids  = dst->src[3];
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const bool f8 = src0_1->type == GGML_TYPE_F8_E4M3_KS || src0_1->type == GGML_TYPE_F8_E4M3_B128;
+    if (f8 && !src0_2) {
+        auto gate = *src0_1;
+        gate.ne[1] /= 2;
+        auto up = gate;
+        up.data = (char *)up.data + up.ne[1]*up.nb[1];
+        auto local_dst = *dst;
+        local_dst.src[0] = &up;
+        local_dst.src[1] = &gate;
+        ggml_tensor bias_up, bias_gate;
+        if (dst->src[4]) {
+            bias_gate = *dst->src[4];
+            bias_gate.ne[0] /= 2;
+            bias_up = bias_gate;
+            bias_up.data = (char *)bias_up.data + bias_up.ne[0]*bias_up.nb[0];
+            local_dst.src[4] = &bias_up;
+            local_dst.src[5] = &bias_gate;
+        }
+        return ggml_cuda_moe_up_gate_unary(ctx, &local_dst, graph, i);
+    }
+    if (f8 && src1->ne[2] <= 8) {
+        bool same_device = true;
+        for (auto tensor : {src0_1, src0_2, src1, ids, (const ggml_tensor *)dst,
+                           (const ggml_tensor *)dst->src[4], (const ggml_tensor *)dst->src[5]}) {
+            if (!tensor) continue;
+            same_device = same_device && ggml_backend_buffer_is_cuda(tensor->buffer) &&
+                ((ggml_backend_cuda_buffer_context *)tensor->buffer->context)->device == ctx.device;
+        }
+        if (same_device) {
+            ggml_cuda_pool_alloc<float> up(ctx.pool(), ggml_nelements(dst));
+            const auto * bu = dst->src[4];
+            const auto * bg = dst->src[5];
+            const dim3 grid(dst->ne[0], ids->ne[0], ids->ne[1]);
+            auto launch = [&](auto kernel) {
+                kernel<<<grid, 256, 0, ctx.stream()>>>(src1->ne[0], dst->ne[0], src0_1->ne[2], src1->ne[1],
+                        (const char *)src0_1->data, (const char *)src0_2->data, (const char *)src1->data,
+                        (const char *)ids->data, bu ? (const char *)bu->data : nullptr, bg ? (const char *)bg->data : nullptr,
+                        up.get(), (float *)dst->data, src0_1->nb[1], src0_1->nb[2], src0_2->nb[1], src0_2->nb[2],
+                        src1->nb[1], src1->nb[2], ids->nb[0], ids->nb[1], bu ? bu->nb[1] : 0, bg ? bg->nb[1] : 0);
+            };
+            if (src0_1->type == GGML_TYPE_F8_E4M3_B128) launch(mul_mat_vec_f8_e4m3_up_gate_id<true>);
+            else launch(mul_mat_vec_f8_e4m3_up_gate_id<false>);
+            CUDA_CHECK(cudaGetLastError());
+            const auto unary = (ggml_unary_op)dst->op_params[0];
+            if (unary == GGML_UNARY_OP_SWIGLU_OAI) {
+                ggml_swiglu_oai_cuda_f32((const float *)dst->data, up.get(), (float *)dst->data,
+                        ggml_nelements(dst), dst->ne[0], dst->ne[0], dst->ne[0], 1.702f, 7.0f, ctx.stream());
+            } else {
+                ggml_fused_mul_unary(ctx, unary, ggml_nelements(dst), (const float *)dst->data, up.get(),
+                        (float *)dst->data, *(const float *)(dst->op_params + 1));
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return i;
+        }
+    }
 
     if (src1->ne[1] == 1 && src1->ne[2] <= 8 && src1->ne[3] == 1 &&
         ggml_is_quantized(src0_1->type) &&
@@ -3471,6 +3526,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t n_ids = ids->ne[0];
 
     ggml_tensor dst_row = *dst;
+    if (f8) dst_row.op_params[0] = GGML_PREC_DEFAULT;
 
     // The heuristics src1->ne[2] <= 32*src0->ne[2] to use the mul_mat_id implementation instead of the original version
     // is derived from
@@ -5160,6 +5216,20 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
     bool has_f8_b128 = op->type == GGML_TYPE_F8_E4M3_B128;
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         has_f8_b128 = has_f8_b128 || (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3_B128);
+    }
+    if ((op->op == GGML_OP_MOE_FUSED_UP_GATE) &&
+        (op->src[0]->type == GGML_TYPE_F8_E4M3_KS || op->src[0]->type == GGML_TYPE_F8_E4M3_B128)) {
+        switch ((ggml_unary_op)op->op_params[0]) {
+            case GGML_UNARY_OP_SILU:
+            case GGML_UNARY_OP_RELU:
+            case GGML_UNARY_OP_GELU:
+            case GGML_UNARY_OP_SIGMOID:
+            case GGML_UNARY_OP_SWIGLU_OAI:
+                return (!op->src[1] || op->src[0]->type == op->src[1]->type) &&
+                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+            default:
+                return false;
+        }
     }
     if (has_f8_b128) {
         if (op->op == GGML_OP_CPY || op->op == GGML_OP_DUP || op->op == GGML_OP_CONT) {
