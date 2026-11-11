@@ -20,6 +20,7 @@
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/f8.cuh"
+#include "ggml-cuda/mmv-f8.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
@@ -2793,8 +2794,13 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
         const int nrows = row_high - row_low;
         const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
         const dim3 grid(nrows, src1_ncols);
-        k_simple_gemm_T<<<grid, 1024, 0, stream>>>(src0->ne[0], ldc, (const ggml_fp8_e4m3_t *)src0_dd_i,
-                src1_ddf_i, dst_dd_i, src0->ne[0], src1->ne[0], ggml_get_weight_scale(src0));
+        if (dst->op == GGML_OP_MUL_MAT_ID) {
+            k_simple_gemm_T<<<grid, 1024, 0, stream>>>(src0->ne[0], ldc, (const ggml_fp8_e4m3_t *)src0_dd_i,
+                    src1_ddf_i, dst_dd_i, src0->ne[0], src1->ne[0], ggml_get_weight_scale(src0));
+        } else {
+            mul_mat_vec_f8_e4m3<<<grid, 256, 0, stream>>>(src0->ne[0], ldc, (const ggml_fp8_e4m3_t *)src0_dd_i,
+                    src1_ddf_i, dst_dd_i, src1->ne[0], ggml_get_weight_scale(src0));
+        }
     } else {
         ggml_cuda_op_mul_mat_cublas(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
                 row_low, row_high, src1_ncols, src1_padded_row_size, stream);
