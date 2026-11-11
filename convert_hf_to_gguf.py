@@ -2526,6 +2526,700 @@ class Qwen3MoeModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3MOE
 
 
+class ModelOptModel(Model):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+    supports_mtp_export = True
+
+    load_hparams = staticmethod(Model.load_text_hparams)
+
+    def __init__(self, *args, **kwargs):
+        self.model_tensors = {}
+        self._source_tensor_names = {}
+        self._prec_a4 = {}
+        self._fp8_block_weights = set()
+        super().__init__(*args, **kwargs)
+        if not self.model_tensors:
+            self._index_modelopt_tensors()
+        self.rope_parameters = self.hparams.get("rope_parameters", self.hparams.get("rope_scaling")) or {}
+        self.block_count += self.hparams.get("mtp_num_hidden_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self._modelopt_experts = {}
+        quant = self.hparams.get("quantization_config") or {}
+        path = self.dir_model / "hf_quant_config.json"
+        if path.is_file():
+            with path.open(encoding="utf-8") as f:
+                quant = {**quant, **json.load(f).get("quantization", {})}
+        self._nvfp4_global_algo = quant.get("quant_algo")
+        self._nvfp4_layer_algo = {k: v.get("quant_algo") for k, v in quant.get("quantized_layers", {}).items()}
+        self._is_nvfp4 = str(self._nvfp4_global_algo).endswith("NVFP4") or any(
+            str(v).endswith("NVFP4") for v in self._nvfp4_layer_algo.values())
+
+    def _filter_modelopt_name(self, name):
+        if name.startswith(("model.visual.", "visual.")):
+            return None
+        name = name.replace("model.language_model.", "model.").removeprefix("language_model.")
+        if name.startswith("model.mtp."):
+            name = name.removeprefix("model.")
+        if name.startswith("mtp."):
+            remapper = {"fc": "eh_proj", "pre_fc_norm_embedding": "enorm", "pre_fc_norm_hidden": "hnorm",
+                        "norm": "shared_head.norm", "fc_embedding": "nextn_fc_embedding",
+                        "fc_hidden": "nextn_fc_hidden", "hyper_connection_mixer": "nextn_hc_head"}
+            parts = name.split(".", 3)
+            n = self.hparams["num_hidden_layers"]
+            if parts[1] == "layers":
+                return f"model.layers.{n + int(parts[2])}.{parts[3]}"
+            return f"model.layers.{n}.{remapper[parts[1]]}.{name.split('.', 2)[2]}"
+        if self.mtp_only and name not in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
+            return None
+        return name
+
+    def _index_modelopt_tensors(self):
+        from safetensors import safe_open
+        for part in self.part_names:
+            with safe_open(self.dir_model / part, framework="pt", device="cpu") as f:
+                for source in f.keys():
+                    name = self._filter_modelopt_name(source)
+                    if name is not None:
+                        data = f.get_slice(source)
+                        self.model_tensors[name] = lambda data=data: LazyTorchTensor.from_safetensors_slice(data)
+                        self._source_tensor_names[name] = source
+
+    def get_tensors(self):
+        if not self.model_tensors:
+            self._index_modelopt_tensors()
+        for name, gen in self.model_tensors.items():
+            yield name, gen()
+
+    @staticmethod
+    def _numpy_bytes(data):
+        return gguf.LazyNumpyTensor(meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(np.uint8, tuple(data.shape)),
+                                   args=(data,), func=lambda t: t.contiguous().numpy())
+
+    @staticmethod
+    def _nvfp4_pack(weight, scale, scale2):
+        out_features = weight.shape[0]
+        n_blocks = scale.shape[1]
+        w = weight.reshape(out_features, n_blocks, 8)
+        vals = torch.stack([w & 0x0F, w >> 4], dim=-1).reshape(out_features, n_blocks, 16)
+        d_ue = scale.view(torch.uint8).numpy().reshape(out_features, n_blocks) & 0x7F
+        qs = (vals[:, :, :8] | (vals[:, :, 8:] << 4)).to(torch.uint8).numpy()
+        n_super = n_blocks // 4
+        raw = np.concatenate([d_ue.reshape(out_features, n_super, 4),
+                              qs.reshape(out_features, n_super, 32)], axis=-1).reshape(out_features, n_super * 36)
+        rows = np.empty((out_features, raw.shape[1] + 4), dtype=np.uint8)
+        rows[:, :4] = scale2.float().reshape(1).numpy().view(np.uint8)
+        rows[:, 4:] = raw
+        return rows
+
+    def _pack_nvfp4(self, name, weight, scale, scale2):
+        shape = (weight.shape[0], weight.shape[1] // 32 * 36 + 4)
+        def pack(w, s, s2):
+            w, s = self._transform_nvfp4_weight(name, w, s)
+            return self._nvfp4_pack(w, s, s2)
+        return gguf.LazyNumpyTensor(meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(np.uint8, shape),
+                                   args=(weight, scale, scale2), func=pack)
+
+    def _write_fp8_projection(self, name, weight, scale):
+        bid = next((int(p) for p in name.split('.') if p.isdecimal()), None)
+        for new_name, data in self.modify_tensors(weight.view(torch.uint8), name, bid):
+            self.gguf_writer.add_tensor(new_name, self._numpy_bytes(data), raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+            self.gguf_writer.add_tensor(new_name.removesuffix(".weight") + ".scale", scale.float().reshape(-1).numpy())
+            input_name = name.removesuffix(".weight") + ".input_scale"
+            if input_name in self.model_tensors:
+                self.gguf_writer.add_tensor(new_name.removesuffix(".weight") + ".input_scale",
+                                            self.model_tensors[input_name]().float().reshape(-1).numpy())
+
+    def _write_fp8_ple(self, shards, scale):
+        if len(shards) != self.hparams["split_ngram_parts"]:
+            raise ValueError(f"Got {len(shards)} PLE shards, expected {self.hparams['split_ngram_parts']}")
+        shapes = [self.model_tensors[name]().shape for name in shards]
+        self._ple_row_dim = shapes[0][-1]
+        chunks = [lambda gen=self.model_tensors[name]: LazyTorchTensor.to_eager(gen()).view(torch.uint8).contiguous().numpy()
+                  for name in shards]
+        data = gguf.LazyChunkedTensor(chunks, (sum(shape[0] for shape in shapes), self._ple_row_dim), np.uint8)
+        self.gguf_writer.add_tensor("per_layer_token_embd.weight", data, raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+        self.gguf_writer.add_tensor("per_layer_token_embd.scale", scale.float().reshape(-1).numpy())
+
+    def _dequant_fp8_mtp(self, weight, scale):
+        scale = scale.float().repeat_interleave(128, 0).repeat_interleave(128, 1)
+        return weight.float() * scale[:weight.shape[0], :weight.shape[1]]
+
+    def _tag_prec_a4(self, name, new_name):
+        algo = self._nvfp4_global_algo
+        source = self._source_tensor_names[name]
+        while source:
+            source = source.rpartition('.')[0]
+            if source in self._nvfp4_layer_algo:
+                algo = self._nvfp4_layer_algo[source]
+                break
+        if algo == "W4A16_NVFP4":
+            self._prec_a4[new_name] = False
+
+    def prepare_tensors(self):
+        consumed = set()
+        expert_parts = {}
+        ple_shards = []
+        for name, gen in list(self.model_tensors.items()):
+            if ".ngram_embedding.shard_" in name:
+                ple_shards.append(name)
+                continue
+            if not name.endswith(".weight"):
+                continue
+            base = name.removesuffix(".weight")
+            scale_name = base + ".weight_scale"
+            inv_name = base + ".weight_scale_inv"
+            weight = gen()
+            if inv_name in self.model_tensors:
+                self._fp8_block_weights.add(name)
+                scale = self.model_tensors[inv_name]
+                self.model_tensors[name] = lambda gen=gen, scale=scale: self._dequant_fp8_mtp(gen(), scale())
+                consumed.add(inv_name)
+                continue
+            if scale_name not in self.model_tensors:
+                continue
+            scale = self.model_tensors[scale_name]()
+            if weight.dtype == torch.float8_e4m3fn:
+                if math.prod(scale.shape) != 1:
+                    raise ValueError(f"Expected per-tensor FP8 scale for {name}: {tuple(scale.shape)}")
+                self._write_fp8_projection(name, weight, scale)
+            elif self._is_nvfp4:
+                if weight.ndim != 2 or scale.shape != (weight.shape[0], weight.shape[1] // 8):
+                    raise ValueError(f"NVFP4 weight {name!r} has incompatible shapes: {list(weight.shape)}, {list(scale.shape)}")
+                scale2 = self.model_tensors.get(base + ".weight_scale_2", lambda: torch.tensor(1.0))()
+                input_scale = self.model_tensors.get(base + ".input_scale", lambda: torch.tensor(1.0))()
+                raw = self._pack_nvfp4(name, weight, scale, scale2)
+                m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
+                if m:
+                    expert = int(m[1])
+                    merged_name = name[:m.start()] + f".experts.{m[2]}.weight"
+                    parts = expert_parts.setdefault(merged_name, {})
+                    parts[expert] = (raw, input_scale)
+                    self._tag_prec_a4(name, self.map_tensor_name(merged_name))
+                    if len(parts) != self.hparams["num_experts"]:
+                        consumed.update((name, scale_name, base + ".weight_scale_2", base + ".input_scale"))
+                        continue
+                    blocks = tuple(parts[i][0] for i in range(self.hparams["num_experts"]))
+                    raw = gguf.LazyNumpyTensor(
+                        meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(np.uint8, (len(blocks), *blocks[0].shape)),
+                        args=(blocks,), func=lambda blocks: np.stack(blocks))
+                    input_scale = torch.cat([parts[i][1].float().reshape(-1) for i in range(self.hparams["num_experts"])])
+                    del expert_parts[merged_name]
+                    new_name = self.map_tensor_name(merged_name)
+                else:
+                    new_name = self.map_tensor_name(name)
+                self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.NVFP4_KS)
+                self.gguf_writer.add_tensor(new_name.removesuffix(".weight") + ".input_scale", input_scale.float().reshape(-1).numpy())
+                self._tag_prec_a4(name, new_name)
+            else:
+                raise ValueError(f"Unsupported ModelOpt weight {name}: {weight.dtype}")
+            consumed.update((name, scale_name, base + ".weight_scale_2", base + ".input_scale"))
+        if expert_parts:
+            raise ValueError(f"Incomplete NVFP4 expert groups: {list(expert_parts)}")
+        if ple_shards:
+            ple_shards.sort(key=lambda n: int(n.rpartition('.shard_')[2].split('.')[0]))
+            scale_name = ple_shards[0].split('.shard_')[0] + '.weight_scale'
+            self._write_fp8_ple(ple_shards, self.model_tensors[scale_name]())
+            consumed.update(ple_shards)
+            consumed.add(scale_name)
+        for name in list(self.model_tensors):
+            if name in consumed or name.endswith((".input_scale", ".k_scale", ".v_scale")):
+                del self.model_tensors[name]
+        super().prepare_tensors()
+        if self._modelopt_experts:
+            raise ValueError(f"Incomplete expert groups: {list(self._modelopt_experts)}")
+
+    def modify_tensors(self, data_torch, name, bid):
+        m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
+        if m:
+            merged_name = name[:m.start()] + f".experts.{m[2]}.weight"
+            parts = self._modelopt_experts.setdefault(merged_name, {})
+            parts[int(m[1])] = data_torch
+            n_experts = self.hparams["num_experts"]
+            if len(parts) == n_experts:
+                yield self.map_tensor_name(merged_name), torch.stack([parts[i] for i in range(n_experts)])
+                del self._modelopt_experts[merged_name]
+            return
+        yield self.map_tensor_name(name), data_torch
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        if name in self._fp8_block_weights:
+            return gguf.GGMLQuantizationType.BF16
+        if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.SSM_CONV1D, bid):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def set_vocab(self):
+        super().set_vocab()
+        with (self.dir_model / "tokenizer.json").open(encoding="utf-8") as f:
+            tokenizer = json.load(f)
+        normalizer = tokenizer.get("normalizer") or {}
+        if normalizer.get("type") == "NFC":
+            self.gguf_writer.add_bool("tokenizer.ggml.normalizer.nfc", True)
+        processor = tokenizer.get("post_processor") or {}
+        for part in processor.get("processors", [processor]):
+            if part.get("type") == "ByteLevel":
+                self.gguf_writer.add_add_bos_token(False)
+                self.gguf_writer.add_add_eos_token(False)
+        with (self.dir_model / "tokenizer_config.json").open(encoding="utf-8") as f:
+            config = json.load(f)
+        if isinstance(config.get("clean_up_tokenization_spaces"), bool):
+            self.gguf_writer.add_bool("tokenizer.ggml.clean_spaces", config["clean_up_tokenization_spaces"])
+        if self.hparams.get("bos_token_id") is not None:
+            self.gguf_writer.add_bos_token_id(self.hparams["bos_token_id"])
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hp = self.hparams
+        if "num_experts" in hp:
+            self.gguf_writer.add_expert_count(hp["num_experts"])
+            self.gguf_writer.add_expert_feed_forward_length(hp["moe_intermediate_size"])
+            self.gguf_writer.add_expert_shared_feed_forward_length(hp["shared_expert_intermediate_size"])
+        if self.block_count > hp["num_hidden_layers"]:
+            self.gguf_writer.add_nextn_predict_layers(self.block_count - hp["num_hidden_layers"])
+        rope = self.rope_parameters
+        self.gguf_writer.add_rope_freq_base(rope.get("rope_theta", hp.get("rope_theta", 10000.0)))
+        self.gguf_writer.add_rope_dimension_sections((rope.get("mrope_section", [11, 11, 10]) + [0] * 4)[:4])
+
+    def prepare_metadata(self, vocab_only):
+        if self._is_nvfp4:
+            self.ftype = gguf.LlamaFileType.MOSTLY_NVFP4_KS
+        super().prepare_metadata(vocab_only)
+        generation = self.dir_model / "generation_config.json"
+        if generation.is_file():
+            with generation.open(encoding="utf-8") as f:
+                config = json.load(f)
+            for source, target in (("top_k", "top_k"), ("top_p", "top_p"), ("temperature", "temp")):
+                if source in config:
+                    if source == "top_k":
+                        self.gguf_writer.add_uint32("general.sampling." + target, config[source])
+                    else:
+                        self.gguf_writer.add_float32("general.sampling." + target, config[source])
+        if self._prec_a4:
+            names = sorted(self._prec_a4)
+            self.gguf_writer.add_tensor_extra_prec_a4(names, [self._prec_a4[n] for n in names])
+
+
+class Qwen3NextModel(ModelOptModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
+        self.gguf_writer.add_ssm_state_size(self.hparams["linear_key_head_dim"])
+        self.gguf_writer.add_ssm_group_count(self.hparams["linear_num_key_heads"])
+        self.gguf_writer.add_ssm_time_step_rank(self.hparams["linear_num_value_heads"])
+        self.gguf_writer.add_ssm_inner_size(self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"])
+        if (layer_types := self.hparams.get("layer_types")) is not None:
+            n_layer = self.hparams["num_hidden_layers"]
+            if len(layer_types) != n_layer:
+                raise ValueError(f"layer_types has {len(layer_types)} entries, expected num_hidden_layers ({n_layer})")
+            recurrent = [t == "linear_attention" for t in layer_types]
+            recurrent += [False] * (self.block_count - n_layer)
+            self.gguf_writer.add_recurrent_layers(recurrent)
+        self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
+        if (rope_dim := self.hparams.get("head_dim")) is None:
+            rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+        self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.rope_parameters.get("partial_rotary_factor", 0.25)))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.endswith(".A_log"):
+            data_torch = -torch.exp(data_torch)
+        elif name.endswith(".dt_bias"):
+            name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
+        elif "conv1d" in name:
+            data_torch = data_torch.squeeze()
+        elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+            data_torch = data_torch + 1
+
+        if "in_proj_qkvz.weight" in name:
+
+            head_k_dim = self.hparams["linear_key_head_dim"]
+            head_v_dim = self.hparams["linear_value_head_dim"]
+            num_v_heads = self.hparams["linear_num_value_heads"]
+            num_k_heads = self.hparams["linear_num_key_heads"]
+            hidden_size = self.hparams["hidden_size"]
+            split_arg_list_qkvz = [
+                head_k_dim,
+                head_k_dim,
+                (num_v_heads // num_k_heads * head_v_dim),
+                (num_v_heads // num_k_heads * head_v_dim),
+            ]
+
+            data_torch = data_torch.permute(1, 0).contiguous()
+            data_torch = data_torch.view(-1, num_k_heads, sum(split_arg_list_qkvz))
+
+            q, k, v, z = torch.split(data_torch, split_arg_list_qkvz, dim=-1)
+
+            q = q.contiguous().view(hidden_size, -1)
+            k = k.contiguous().view(hidden_size, -1)
+            v = v.contiguous().view(hidden_size, -1)
+            z = z.contiguous().view(hidden_size, -1)
+
+            qkv = torch.cat([q, k, v], dim=-1).permute(1, 0).contiguous()
+            z = z.permute(1, 0).contiguous()
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_QKV,  bid, ".weight"), qkv)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_GATE, bid, ".weight"), z)
+        else:
+            yield from super().modify_tensors(data_torch, name, bid)
+
+class _LinearAttentionVReorderBase(Qwen3NextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+    @staticmethod
+    def _reorder_v_heads(tensor: Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> Tensor:
+        """Reorder V heads from grouped (by K head) to tiled order along the given dimension."""
+        shape = list(tensor.shape)
+        if dim < 0:
+            dim += len(shape)
+
+        if hasattr(tensor, 'get_lora_A_B'):
+            n = shape[dim]
+            idx = torch.arange(n).reshape(num_k_heads, num_v_per_k, head_dim)
+            idx = idx.permute(1, 0, 2).contiguous().reshape(n)
+            lora_A, lora_B = tensor.get_lora_A_B()
+            if dim == len(shape) - 1:
+                return type(tensor)(lora_A[:, idx], lora_B)
+            elif dim == 0:
+                return type(tensor)(lora_A, lora_B[idx])
+            else:
+                raise NotImplementedError(f"_reorder_v_heads on dim={dim} not supported for LoRA tensors")
+
+        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
+        tensor = tensor.reshape(*new_shape)
+        perm = list(range(len(new_shape)))
+        perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+        return tensor.permute(*perm).contiguous().reshape(*shape)
+
+    def _transform_nvfp4_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        if not name.endswith((
+            ".linear_attn.in_proj_qkv.weight",
+            ".linear_attn.in_proj_z.weight",
+            ".linear_attn.in_proj_a.weight",
+            ".linear_attn.in_proj_b.weight",
+            ".linear_attn.out_proj.weight",
+        )):
+            return weight, scale
+
+        num_k_heads = self.hparams["linear_num_key_heads"]
+        num_v_heads = self.hparams["linear_num_value_heads"]
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        num_v_per_k = num_v_heads // num_k_heads
+
+        def unpack_nibbles(qs: Tensor) -> Tensor:
+            lo = torch.bitwise_and(qs, 0x0F)
+            hi = torch.bitwise_right_shift(qs, 4)
+            return torch.stack((lo, hi), dim=-1).reshape(*qs.shape[:-1], qs.shape[-1] * 2)
+
+        def pack_nibbles(codes: Tensor) -> Tensor:
+            codes = codes.reshape(*codes.shape[:-1], codes.shape[-1] // 2, 2)
+            lo = torch.bitwise_and(codes[..., 0], 0x0F)
+            hi = torch.bitwise_left_shift(torch.bitwise_and(codes[..., 1], 0x0F), 4)
+            return torch.bitwise_or(lo, hi).contiguous()
+
+        def apply_col_perm(qs: Tensor, scales: Tensor, col_perm: Tensor) -> tuple[Tensor, Tensor]:
+            assert qs.ndim >= 2
+            assert scales.ndim >= 2
+
+            k = qs.shape[-1] * 2
+            assert col_perm.numel() == k
+            assert k % 16 == 0
+
+            group_cols = col_perm.reshape(-1, 16)
+            group_starts = group_cols[:, 0]
+            expected = group_starts.unsqueeze(1) + torch.arange(16, dtype=col_perm.dtype)
+            assert torch.equal(group_cols, expected)
+            assert torch.all(group_starts % 16 == 0)
+
+            group_perm = (group_starts // 16).to(dtype=torch.long)
+            expected_groups = torch.arange(scales.shape[-1], dtype=torch.long)
+            assert group_perm.numel() == scales.shape[-1]
+            assert torch.equal(torch.sort(group_perm).values, expected_groups)
+
+            codes = unpack_nibbles(qs)
+            codes = codes.index_select(-1, col_perm.to(device=qs.device, dtype=torch.long))
+            qs = pack_nibbles(codes)
+            scales = scales.index_select(-1, group_perm.to(device=scales.device))
+            return qs, scales
+
+        def reorder_rows(qs: Tensor, scales: Tensor, head_dim: int) -> tuple[Tensor, Tensor]:
+            row_perm = self._reorder_v_heads(
+                torch.arange(num_v_heads * head_dim, dtype=torch.long).unsqueeze(-1),
+                0, num_k_heads, num_v_per_k, head_dim,
+            ).squeeze(-1)
+            return (
+                qs.index_select(0, row_perm.to(device=qs.device)),
+                scales.index_select(0, row_perm.to(device=scales.device)),
+            )
+
+        if name.endswith(".linear_attn.in_proj_qkv.weight"):
+            q_dim = head_k_dim * num_k_heads
+            k_dim = head_k_dim * num_k_heads
+            q = weight[:q_dim]
+            k = weight[q_dim:q_dim + k_dim]
+            v = weight[q_dim + k_dim:]
+            q_scale = scale[:q_dim]
+            k_scale = scale[q_dim:q_dim + k_dim]
+            v_scale = scale[q_dim + k_dim:]
+            v, v_scale = reorder_rows(v, v_scale, head_v_dim)
+            return torch.cat([q, k, v], dim=0), torch.cat([q_scale, k_scale, v_scale], dim=0)
+
+        if name.endswith(".linear_attn.in_proj_z.weight"):
+            weight, scale = reorder_rows(weight, scale, head_v_dim)
+        elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
+            weight, scale = reorder_rows(weight, scale, 1)
+        elif name.endswith(".linear_attn.out_proj.weight"):
+            if self._hadamard_folds_tensor(name):
+
+                self._hadamard_gdn_v_grouped = True
+            else:
+                col_perm = self._reorder_v_heads(
+                    torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                    1, num_k_heads, num_v_per_k, head_v_dim,
+                ).squeeze(0)
+                weight, scale = apply_col_perm(weight, scale, col_perm)
+
+        return weight, scale
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+        num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+
+        if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads and "linear_attn." in name:
+            head_k_dim = self.hparams["linear_key_head_dim"]
+            head_v_dim = self.hparams["linear_value_head_dim"]
+            num_v_per_k = num_v_heads // num_k_heads
+
+            if ".in_proj_qkv." in name:
+
+                q_dim = head_k_dim * num_k_heads
+                k_dim = head_k_dim * num_k_heads
+                q = data_torch[:q_dim]
+                k = data_torch[q_dim:q_dim + k_dim]
+                v = data_torch[q_dim + k_dim:]
+                v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
+                data_torch = torch.cat([q, k, v], dim=0)
+
+            elif ".in_proj_z." in name:
+
+                data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
+
+            elif ".in_proj_b." in name or ".in_proj_a." in name:
+
+                data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
+
+            elif ".A_log" in name or ".dt_bias" in name or ".dt_proj" in name:
+
+                if data_torch.ndim == 1:
+                    data_torch = self._reorder_v_heads(
+                        data_torch.unsqueeze(-1), 0, num_k_heads, num_v_per_k, 1
+                    ).squeeze(-1)
+                else:
+                    data_torch = self._reorder_v_heads(data_torch, -1, num_k_heads, num_v_per_k, 1)
+
+            elif ".conv1d" in name:
+
+                data = data_torch.squeeze()
+                qk_channels = head_k_dim * num_k_heads * 2
+                qk_part = data[:qk_channels]
+                v_part = data[qk_channels:]
+                v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
+                data_torch = torch.cat([qk_part, v_part], dim=0)
+
+            elif ".out_proj." in name:
+                if self._hadamard_folds_tensor(name):
+
+                    self._hadamard_gdn_v_grouped = True
+                else:
+
+                    data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def _hadamard_folds_tensor(self, name):
+        return False
+
+
+@Model.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM", "Qwen3_5TextModel")
+class Qwen3_5TextModel(_LinearAttentionVReorderBase):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+
+@Model.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
+    model_arch = gguf.MODEL_ARCH.QWEN4EXP
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._ple_shards: dict[int, str] = {}
+        self._ple_row_dim: int | None = None
+        self._mtp_fc: dict[str, Tensor] = {}
+
+        self._merge_parts: dict[tuple[int, gguf.MODEL_TENSOR], dict[int, Tensor]] = {}
+
+    def _read_hash_constants(self, suffix: str) -> list[int]:
+        """Read an int64 PLE constant straight from the checkpoint.
+
+        prepare_tensors() casts every non-float dtype to float32 before
+        modify_tensors() sees it (base.py), which would silently round these
+        45-bit multipliers. Reading the lazy tensor here bypasses that.
+        """
+        for name, gen in self.model_tensors.items():
+            if name.endswith(suffix):
+                t = LazyTorchTensor.to_eager(gen())
+                if t.dtype != torch.int64:
+                    t = t.to(torch.int64)
+                return [int(x) for x in t.tolist()]
+        raise ValueError(f"PLE constant {suffix!r} missing from the checkpoint")
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hp = self.hparams
+
+        self.gguf_writer.add_hyper_connection_count(hp["hc_count"])
+        self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
+
+        n_layer = hp["num_hidden_layers"]
+        self.gguf_writer.add_attention_indexer_head_count(hp["indexer_n_heads"])
+        self.gguf_writer.add_attention_indexer_key_length(hp["indexer_head_dim"])
+        self.gguf_writer.add_attention_indexer_top_k(hp["indexer_budget"])
+        ratio = hp["indexer_compress_ratio"]
+        layer_types = hp["layer_types"]
+
+        self.gguf_writer.add_attention_compress_ratios(
+            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            + [ratio] * (self.block_count - n_layer)
+        )
+
+        ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
+        if not ple_layers or self.mtp_only:
+            return
+        self.gguf_writer.add_ple_layers(ple_layers)
+        self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
+        self.gguf_writer.add_ple_heads_per_ngram(hp["heads_per_ngram"])
+        self.gguf_writer.add_ple_conv_kernel(hp["ple_conv_kernel_size"])
+        self.gguf_writer.add_ple_eos_token_id(self._eos_token_id())
+
+        _img = self._image_token_id()
+        if _img is not None:
+            self.gguf_writer.add_ple_image_token_id(int(_img))
+        if self._ple_row_dim is not None:
+            self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
+
+        self.gguf_writer.add_ple_layer_multipliers(
+            self._read_hash_constants("ple_embedding.layer_multipliers"))
+        self.gguf_writer.add_ple_head_offsets(
+            self._read_hash_constants("ple_embedding.ngram_heads_offsets"))
+        self.gguf_writer.add_ple_head_vocab_sizes(
+            self._read_hash_constants("ple_embedding.ngram_heads_vocab_sizes"))
+
+    def _image_token_id(self) -> int | None:
+        img = self.hparams.get("image_token_id")
+        return None if img is None else int(img)
+
+    def _eos_token_id(self) -> int:
+        eos = self.hparams.get("eos_token_id")
+        if isinstance(eos, list):
+
+            return int(eos[-1])
+        if eos is None:
+            raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
+        return int(eos)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+
+        if name.endswith("ple_embedding.layer_multipliers"):
+            return
+        if name.endswith("ple_embedding.ngram_heads_offsets"):
+            return
+        if name.endswith("ple_embedding.ngram_heads_vocab_sizes"):
+            return
+
+        if ".ngram_embedding.shard_" in name:
+            yield from self._place_ple_shard(data_torch, name)
+            return
+
+        if name.endswith((".nextn_fc_embedding.weight", ".nextn_fc_hidden.weight")):
+            self._mtp_fc[name.rsplit(".", 2)[1]] = data_torch
+            if len(self._mtp_fc) < 2:
+                return
+            eh = torch.cat([self._mtp_fc.pop("nextn_fc_embedding"), self._mtp_fc.pop("nextn_fc_hidden")], dim=1)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, bid, ".weight"), eh)
+            return
+
+        if ".indexer.index_qk_proj.weight" in name:
+            n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_Q_PROJ, bid, ".weight"), data_torch[:n_q])
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_K_PROJ, bid, ".weight"), data_torch[n_q:])
+            return
+
+        if name.endswith((".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight",
+                          ".indexer.q_layernorm.weight", ".indexer.k_layernorm.weight")):
+            yield (self.map_tensor_name(name), data_torch + 1)
+            return
+
+        if name.endswith(".ple.conv1d.weight"):
+            yield (self.map_tensor_name(name), data_torch.squeeze())
+            return
+
+        for new_name, data in super().modify_tensors(data_torch, name, bid):
+            yield from self._merge_shared_input(new_name, data, bid)
+
+    def _merge_shared_input(self, new_name: str, data: Tensor, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+
+        if bid is None or self._is_nvfp4 or self.hparams.get("quantization_config"):
+            yield (new_name, data)
+            return
+
+        layer_types = self.hparams.get("layer_types") or []
+        is_linear = bid < len(layer_types) and layer_types[bid] == "linear_attention"
+
+        match = next(((merged, parts.index(part)) for merged, parts, linear_only in self._SHARED_INPUT_MERGES
+                      for part in parts
+                      if (is_linear or not linear_only) and self.match_model_tensor_name(new_name, part, bid)), None)
+        if match is None:
+            yield (new_name, data)
+            return
+
+        merged, idx = match
+        halves = self._merge_parts.setdefault((bid, merged), {})
+        halves[idx] = data
+        if len(halves) == 2:
+            del self._merge_parts[(bid, merged)]
+            yield (self.format_tensor_name(merged, bid), torch.cat([halves[0], halves[1]], dim=0))
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._mtp_fc:
+            raise ValueError(f"MTP projection missing its other half: {sorted(self._mtp_fc)}")
+        if self._merge_parts:
+            raise ValueError(f"merged weights missing a half: {sorted((bid, t.name) for bid, t in self._merge_parts)}")
+        n_parts = self.hparams.get("split_ngram_parts", 0)
+        if self._ple_shards and len(self._ple_shards) != n_parts:
+            raise ValueError(
+                f"got {len(self._ple_shards)} PLE embedding shards, expected {n_parts}"
+            )
+
+    _SHARED_INPUT_MERGES = (
+        (gguf.MODEL_TENSOR.HC_ATTN_DOWN_INJECT, (gguf.MODEL_TENSOR.HC_ATTN_DOWN, gguf.MODEL_TENSOR.HC_ATTN_INJECT), False),
+        (gguf.MODEL_TENSOR.HC_FFN_DOWN_INJECT,  (gguf.MODEL_TENSOR.HC_FFN_DOWN,  gguf.MODEL_TENSOR.HC_FFN_INJECT),  False),
+        (gguf.MODEL_TENSOR.ATTN_QKV_GATE,       (gguf.MODEL_TENSOR.ATTN_QKV,     gguf.MODEL_TENSOR.ATTN_GATE),      True),
+        (gguf.MODEL_TENSOR.SSM_BETA_ALPHA_CAT,  (gguf.MODEL_TENSOR.SSM_BETA,     gguf.MODEL_TENSOR.SSM_ALPHA),      True),
+    )
+
+    def map_tensor_name(self, name, try_suffixes=(".weight", ".bias")):
+        mapped = super().map_tensor_name(name, try_suffixes)
+        return mapped.replace(".attn_indexer_k_norm", ".indexer.k_norm")
+
+    def _place_ple_shard(self, data_torch, name):
+        idx = int(name.rpartition(".shard_")[2].partition(".")[0])
+        self._ple_shards[idx] = name
+        self._ple_row_dim = int(data_torch.shape[-1])
+        if len(self._ple_shards) == self.hparams["split_ngram_parts"]:
+            yield "per_layer_token_embd.weight", torch.cat([self.model_tensors[self._ple_shards[i]]().float() for i in sorted(self._ple_shards)])
+
+
 @Model.register("FlintForCausalLM")
 class FlintModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.FLINT
