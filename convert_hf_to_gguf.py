@@ -2592,7 +2592,7 @@ class ModelOptModel(Model):
             yield name, gen()
 
     @staticmethod
-    def _nvfp4_pack(weight, scale, scale2):
+    def _nvfp4_pack(weight, scale, scale2, big_endian=False):
         out_features = weight.shape[0]
         n_blocks = scale.shape[1]
         w = weight.reshape(out_features, n_blocks, 8)
@@ -2603,7 +2603,7 @@ class ModelOptModel(Model):
         raw = np.concatenate([d_ue.reshape(out_features, n_super, 4),
                               qs.reshape(out_features, n_super, 32)], axis=-1).reshape(out_features, n_super * 36)
         rows = np.empty((out_features, raw.shape[1] + 4), dtype=np.uint8)
-        rows[:, :4] = scale2.float().reshape(1).numpy().view(np.uint8)
+        rows[:, :4] = scale2.float().reshape(1).numpy().astype('>f4' if big_endian else '<f4').view(np.uint8)
         rows[:, 4:] = raw
         return rows
 
@@ -2611,7 +2611,7 @@ class ModelOptModel(Model):
         shape = (weight.shape[0], weight.shape[1] // 32 * 36 + 4)
         def pack(w, s, s2):
             w, s = self._transform_nvfp4_weight(name, w, s)
-            return self._nvfp4_pack(w, s, s2)
+            return self._nvfp4_pack(w, s, s2, self.is_big_endian)
         return gguf.LazyNumpyTensor(meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(np.uint8, shape),
                                    args=(weight, scale, scale2), func=pack)
 
@@ -2658,6 +2658,8 @@ class ModelOptModel(Model):
             self._prec_a4[new_name] = False
 
     def prepare_tensors(self):
+        if type(self).get_tensors is not ModelOptModel.get_tensors:
+            return super().prepare_tensors()
         consumed = set()
         expert_parts = {}
         ple_shards = []
@@ -2748,7 +2750,7 @@ class ModelOptModel(Model):
         yield self.map_tensor_name(name), data_torch
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
-        if name in self._fp8_block_weights:
+        if name in self._fp8_block_weights and not self.fp8_dequant:
             return gguf.GGMLQuantizationType.BF16
         if self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.SSM_CONV1D, bid):
             return gguf.GGMLQuantizationType.F32
@@ -2925,9 +2927,6 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
             return torch.bitwise_or(lo, hi).contiguous()
 
         def apply_col_perm(qs: Tensor, scales: Tensor, col_perm: Tensor) -> tuple[Tensor, Tensor]:
-            assert qs.ndim >= 2
-            assert scales.ndim >= 2
-
             k = qs.shape[-1] * 2
             assert col_perm.numel() == k
             assert k % 16 == 0
@@ -2939,9 +2938,6 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
             assert torch.all(group_starts % 16 == 0)
 
             group_perm = (group_starts // 16).to(dtype=torch.long)
-            expected_groups = torch.arange(scales.shape[-1], dtype=torch.long)
-            assert group_perm.numel() == scales.shape[-1]
-            assert torch.equal(torch.sort(group_perm).values, expected_groups)
 
             codes = unpack_nibbles(qs)
             codes = codes.index_select(-1, col_perm.to(device=qs.device, dtype=torch.long))
@@ -2976,15 +2972,11 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
             weight, scale = reorder_rows(weight, scale, 1)
         elif name.endswith(".linear_attn.out_proj.weight"):
-            if self._hadamard_folds_tensor(name):
-
-                self._hadamard_gdn_v_grouped = True
-            else:
-                col_perm = self._reorder_v_heads(
-                    torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
-                    1, num_k_heads, num_v_per_k, head_v_dim,
-                ).squeeze(0)
-                weight, scale = apply_col_perm(weight, scale, col_perm)
+            col_perm = self._reorder_v_heads(
+                torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                1, num_k_heads, num_v_per_k, head_v_dim,
+            ).squeeze(0)
+            weight, scale = apply_col_perm(weight, scale, col_perm)
 
         return weight, scale
 
@@ -3034,17 +3026,9 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
                 data_torch = torch.cat([qk_part, v_part], dim=0)
 
             elif ".out_proj." in name:
-                if self._hadamard_folds_tensor(name):
-
-                    self._hadamard_gdn_v_grouped = True
-                else:
-
-                    data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
+                data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
 
         yield from super().modify_tensors(data_torch, name, bid)
-
-    def _hadamard_folds_tensor(self, name):
-        return False
 
 
 @Model.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM", "Qwen3_5TextModel")

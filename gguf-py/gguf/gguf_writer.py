@@ -623,8 +623,6 @@ class GGUFWriter:
         self.add_array(Keys.General.LANGUAGES, languages)
 
     def add_tensor_extra_prec_a4(self, tensor_names: Sequence[str], values: Sequence[bool]) -> None:
-        if len(tensor_names) != len(values):
-            raise ValueError('tensor_extra prec_a4 names and values must have the same length')
         self.add_array('general.tensor_extra.name', list(tensor_names))
         self.add_array('general.tensor_extra.prec_a4', list(values))
 
