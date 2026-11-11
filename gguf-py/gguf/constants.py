@@ -2598,7 +2598,6 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4       : (  32,   17),
     GGMLQuantizationType.NVFP4       : (  64,   36),
     GGMLQuantizationType.NVFP4_KS    : (  64,   36),
-    GGMLQuantizationType.F8_E4M3_KS  : (   1,    1),
     GGMLQuantizationType.F8_E4M3_B128: ( 128,  132),
     GGMLQuantizationType.Q4_0_4_4    : (  32,   18),
     GGMLQuantizationType.Q4_0_4_8    : (  32,   18),
