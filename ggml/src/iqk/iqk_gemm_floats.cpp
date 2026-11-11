@@ -1146,7 +1146,20 @@ namespace {
 #ifdef __x86_64__
 using F8Base = QFBase;
 #else
-using F8Base = QF32Base;
+struct F8Base {
+    constexpr static int k_step = 16;
+    using Data = float32x4x4_t;
+    static inline Data load(const float * x) {
+        return {{vld1q_f32(x), vld1q_f32(x + 4), vld1q_f32(x + 8), vld1q_f32(x + 12)}};
+    }
+    static inline Data acc(Data a, const Data& x, const Data& y) {
+        for (int i = 0; i < 4; ++i) a.val[i] = vfmaq_f32(a.val[i], x.val[i], y.val[i]);
+        return a;
+    }
+    static inline float hsum(const Data& a) {
+        return vaddvq_f32(vaddq_f32(vaddq_f32(a.val[0], a.val[1]), vaddq_f32(a.val[2], a.val[3])));
+    }
+};
 #endif
 
 struct F8 : F8Base {
@@ -1191,25 +1204,83 @@ struct F8 : F8Base {
     }
     static inline Data add(Data a, Data b) { return _mm256_add_ps(a, b); }
 #else
-    static inline Data zero() { return vdupq_n_f32(0); }
-    static inline Data decode(const uint8_t * x) {
-        uint32_t packed;
-        memcpy(&packed, x, sizeof(packed));
-        const auto q = vmovl_u16(vget_low_u16(vmovl_u8(vcreate_u8(packed))));
-        const auto mag = vandq_u32(q, vdupq_n_u32(127));
-        const auto sign = vshlq_n_u32(vandq_u32(q, vdupq_n_u32(128)), 24);
-        auto v = vreinterpretq_f32_u32(vaddq_u32(vshlq_n_u32(mag, 20), vdupq_n_u32(120 << 23)));
-        const auto sub = vmulq_n_f32(vcvtq_f32_u32(mag), 1.0f/512);
-        v = vbslq_f32(vcltq_u32(mag, vdupq_n_u32(8)), sub, v);
-        v = vbslq_f32(vceqq_u32(mag, vdupq_n_u32(127)), vreinterpretq_f32_u32(vdupq_n_u32(0x7fc00000)), v);
-        return vreinterpretq_f32_u32(vorrq_u32(vreinterpretq_u32_f32(v), sign));
+    static inline Data zero() {
+        const auto z = vdupq_n_f32(0);
+        return {{z, z, z, z}};
     }
-    static inline Data add(Data a, Data b) { return vaddq_f32(a, b); }
+    static inline Data decode(const uint8_t * x) {
+        const uint8x16_t hi_fix = {0, 0, 0, 0, 0, 0, 0, 0x3c, 0x3c, 7, 7, 7, 0, 0, 0, 0};
+        const uint8x16_t lo_fix = {0, 0, 0, 0, 0, 0, 0, 0x30, 0, 0x10, 0xa0, 0xf0, 0x40, 0x70, 0x20, 0x10};
+        const auto q = vld1q_u8(x);
+        const uint8x16_t hi_base = {0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0, 0xc1, 0xc2, 0xc3};
+        const auto index = vandq_u8(vaddq_u8(q, vdupq_n_u8(8)), vdupq_n_u8(127));
+        const auto hi = veorq_u8(vqtbl1q_u8(hi_base, vshrq_n_u8(q, 4)), vqtbl1q_u8(hi_fix, index));
+        const auto lo = veorq_u8(vshlq_n_u8(q, 4), vqtbl1q_u8(lo_fix, index));
+        const auto b0 = vreinterpretq_u16_u8(vzip1q_u8(lo, hi));
+        const auto b1 = vreinterpretq_u16_u8(vzip2q_u8(lo, hi));
+        return {{vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b0), 16)),
+                 vreinterpretq_f32_u32(vshll_high_n_u16(b0, 16)),
+                 vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b1), 16)),
+                 vreinterpretq_f32_u32(vshll_high_n_u16(b1, 16))}};
+    }
 #endif
 };
 
+#ifndef __x86_64__
+
+template <int nrc> struct F8QF32 : QF32Base {
+    using Base = QF32Base;
+    constexpr static int nrc_y = nrc;
+    const float * const * y;
+    F8QF32(const DataInfo& info) : y((const float * const *)info.cy) {}
+    Data load1(int iy, int i) const { return load(y[iy] + k_step*i); }
+    Data load_tail(int iy, int i) const { return load(y[iy] + 4*i); }
+};
+
+template <int nrc_y>
+void mul_mat_f8_b128_bf16(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    constexpr int tile = 5;
+    for (int ix = 0; ix < nrc_x; ix += tile) {
+        const int nx = std::min(tile, nrc_x - ix);
+        uint16_t weights[tile][128];
+        float sum[tile*nrc_y] = {}, partial[tile*nrc_y], scale[tile];
+        const float * y[nrc_y];
+        for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const float *)info.src1_row(iy);
+        const DataInfo local{partial, (const char *)y, tile, 0, 0, 1, nullptr, 0};
+        for (int ib = 0; ib < n/128; ++ib) {
+            for (int row = 0; row < nx; ++row) {
+                const auto * x = (const uint8_t *)vx + (ix + row)*bx + ib*132;
+                memcpy(scale + row, x, sizeof(float));
+                for (int i = 0; i < 128; i += 16) {
+                    const auto values = F8::decode(x + 4 + i);
+                    for (int j = 0; j < 4; ++j) vst1_u16(weights[row] + i + 4*j, vshrn_n_u32(vreinterpretq_u32_f32(values.val[j]), 16));
+                }
+            }
+            mul_mat_Qx_Qy_T<F8QF32<nrc_y>, QBF16>(128, weights, sizeof(weights[0]), local, nx);
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                for (int row = 0; row < nx; ++row) sum[iy*tile + row] += partial[iy*tile + row]*scale[row];
+                y[iy] += 128;
+            }
+        }
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            for (int row = 0; row < nx; ++row) info.store(ix + row, iy, sum[iy*tile + row]);
+        }
+    }
+}
+
+#endif
+
 template <bool block_scaled, int nrc_y, bool row_scaled = false>
 void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+#ifndef __x86_64__
+    if constexpr (block_scaled && nrc_y == 8) {
+        mul_mat_f8_b128_bf16<4>(n, vx, bx, info, nrc_x);
+        auto next = info;
+        next.cur_y += 4;
+        mul_mat_f8_b128_bf16<4>(n, vx, bx, next, nrc_x);
+        return;
+    }
+#endif
     const float * y[nrc_y];
     for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const float *)info.src1_row(iy);
     const int block_size = block_scaled ? 128 : n;
@@ -1223,6 +1294,7 @@ void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc
             F8::Data acc[nrc_y][2];
             for (int iy = 0; iy < nrc_y; ++iy) acc[iy][0] = acc[iy][1] = F8::zero();
             int i = 0;
+#ifdef __x86_64__
             for (; i + 2*F8::k_step <= block_size; i += 2*F8::k_step) {
                 const auto x0 = F8::decode(x + i);
                 const auto x1 = F8::decode(x + i + F8::k_step);
@@ -1231,6 +1303,7 @@ void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc
                     acc[iy][1] = F8::acc(acc[iy][1], x1, F8::load(y[iy] + ib + i + F8::k_step));
                 }
             }
+#endif
             for (; i + F8::k_step <= block_size; i += F8::k_step) {
                 const auto xv = F8::decode(x + i);
                 for (int iy = 0; iy < nrc_y; ++iy) {
@@ -1238,7 +1311,11 @@ void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc
                 }
             }
             for (int iy = 0; iy < nrc_y; ++iy) {
+#ifdef __x86_64__
                 float partial = F8::hsum(F8::add(acc[iy][0], acc[iy][1]));
+#else
+                float partial = F8::hsum(acc[iy][0]);
+#endif
                 for (int j = i; j < block_size; ++j) partial += F8::decode(x[j]) * y[iy][ib + j];
                 sum[iy] += partial * scale;
             }
