@@ -56,7 +56,7 @@ static __global__ void k_get_rows_float(
             /*int64_t ne10, int64_t ne11,*/ int64_t ne12, /*int64_t ne13,*/
             /*size_t s0,*/ size_t s1, size_t s2, size_t s3,
             /*size_t nb00,*/ size_t nb01, size_t nb02, size_t nb03,
-            size_t s10, size_t s11, size_t s12, float scale) {
+            size_t s10, size_t s11, size_t s12) {
 
     const int i00 =  blockIdx.y*blockDim.x + threadIdx.x;
     const int i10 =  blockIdx.x*blockDim.y + threadIdx.y;
@@ -72,7 +72,7 @@ static __global__ void k_get_rows_float(
     const src0_t * src0_row = (const src0_t *)((const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
     if constexpr (std::is_same_v<src0_t, ggml_fp8_e4m3_t>) {
-        dst_row[i00] = i01 >= 0 && i01 < ne01 ? dst_t(ggml_cuda_f8_e4m3_to_float(src0_row[i00]) * scale) : dst_t(0);
+        dst_row[i00] = i01 >= 0 && i01 < ne01 ? dst_t(ggml_cuda_f8_value<ggml_cuda_f8_row>(src0_row, i00)) : dst_t(0);
     } else {
         dst_row[i00] = i01 >= 0 && i01 < ne01 ? dst_t(src0_row[i00]) : dst_t(0);
     }
@@ -141,7 +141,7 @@ static void get_rows_cuda_float(const ggml_tensor * src0, const ggml_tensor * sr
             /*ne10, ne11,*/ ne12, /*ne13,*/
             /* s0,*/ s1, s2, s3,
             /* nb00,*/ nb01, nb02, nb03,
-            s10, s11, s12, src0->type == GGML_TYPE_F8_E4M3 ? ggml_get_weight_scale(src0) : 1.0f);
+            s10, s11, s12);
 
     GGML_UNUSED(dst);
 }
@@ -184,7 +184,7 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
 
-    if (src0->type == GGML_TYPE_F8_E4M3) {
+    if (src0->type == GGML_TYPE_F8_E4M3_KS) {
         if (dst->type == GGML_TYPE_F16) {
             get_rows_cuda_float(src0, src1, dst, (const ggml_fp8_e4m3_t *)src0->data,
                     (const int32_t *)src1->data, (half *)dst->data, stream);

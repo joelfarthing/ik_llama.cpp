@@ -5620,8 +5620,7 @@ bool create_tensors_helper::merge_up_gate_exps(const LLM_TN & tn, int i, int bia
     auto u_meta = ml.require_tensor_meta(u_name.c_str());
     auto g_meta = ml.require_tensor_meta(g_name.c_str());
 
-    const bool same_scale = (u_meta->type != GGML_TYPE_NVFP4_KS || ggml_get_input_scale(u_meta) == ggml_get_input_scale(g_meta)) &&
-                            (u_meta->type != GGML_TYPE_F8_E4M3 || ggml_get_weight_scale(u_meta) == ggml_get_weight_scale(g_meta));
+    const bool same_scale = u_meta->type != GGML_TYPE_NVFP4_KS || ggml_get_input_scale(u_meta) == ggml_get_input_scale(g_meta);
     if (u_meta->type != g_meta->type || u_meta->ne[0] != g_meta->ne[0] || u_meta->ne[2] != g_meta->ne[2] || !same_scale) {
         LLAMA_LOG_INFO("%s: not merging because up/gate meta info is different\n", __func__);
         return false;
@@ -5643,9 +5642,6 @@ bool create_tensors_helper::merge_up_gate_exps(const LLM_TN & tn, int i, int bia
     LLAMA_LOG_INFO("%s: merging up/gate in layer %d\n", __func__, i);
 
     layer.ffn_up_gate_exps = ggml_new_tensor_3d(u_ctx, u_meta->type, u_meta->ne[0], u_meta->ne[1] + g_meta->ne[1], u_meta->ne[2]);
-    if (u_meta->type == GGML_TYPE_F8_E4M3) {
-        ggml_set_weight_scale(layer.ffn_up_gate_exps, ggml_get_weight_scale(u_meta));
-    }
     if (u_meta->type == GGML_TYPE_NVFP4_KS) {
         ggml_set_input_scale(layer.ffn_up_gate_exps, ggml_get_input_scale(u_meta));
     }
@@ -5769,19 +5765,14 @@ bool create_tensors_helper::merge_qkv(const LLM_TN & tn, int i, int bias, bool i
     auto wv = ml.require_tensor_meta(wv_name.c_str());
     GGML_ASSERT(wq && wk && wv);
 
-    const bool same_qk_scale = (wq->type != GGML_TYPE_NVFP4_KS || ggml_get_input_scale(wq) == ggml_get_input_scale(wk)) &&
-                               (wq->type != GGML_TYPE_F8_E4M3 || ggml_get_weight_scale(wq) == ggml_get_weight_scale(wk));
-    const bool same_qv_scale = (wq->type != GGML_TYPE_NVFP4_KS || ggml_get_input_scale(wq) == ggml_get_input_scale(wv)) &&
-                               (wq->type != GGML_TYPE_F8_E4M3 || ggml_get_weight_scale(wq) == ggml_get_weight_scale(wv));
+    const bool same_qk_scale = wq->type != GGML_TYPE_NVFP4_KS || ggml_get_input_scale(wq) == ggml_get_input_scale(wk);
+    const bool same_qv_scale = wq->type != GGML_TYPE_NVFP4_KS || ggml_get_input_scale(wq) == ggml_get_input_scale(wv);
     bool fused_qkv = false;
     if (ml.merge_qkv && same_qk_scale && same_qv_scale && wq->type == wk->type && wq->type == wv->type && (ignore_attn_scale || hparams.f_attention_scale == 0.0f)) {
         GGML_ASSERT(wq->ne[0] == n_embd && wq->ne[1] == n_head * n_embd_head_k);
         GGML_ASSERT(wk->ne[0] == n_embd && wk->ne[1] == n_embd_gqa);
         GGML_ASSERT(wv->ne[0] == n_embd && wv->ne[1] == n_embd_gqa);
         layer.wqkv = ggml_new_tensor_2d(ctx_split, wq->type, n_embd, n_embd_head_k * (n_head + n_head_kv + n_head_kv));
-        if (wq->type == GGML_TYPE_F8_E4M3) {
-            ggml_set_weight_scale(layer.wqkv, ggml_get_weight_scale(wq));
-        }
         if (wq->type == GGML_TYPE_NVFP4_KS) {
             ggml_set_input_scale(layer.wqkv, ggml_get_input_scale(wq));
         }
@@ -5822,9 +5813,6 @@ bool create_tensors_helper::merge_qkv(const LLM_TN & tn, int i, int bias, bool i
         GGML_ASSERT(wq->ne[0] == n_embd && wq->ne[1] == n_head * n_embd_head_k);
         GGML_ASSERT(wk->ne[0] == n_embd && wk->ne[1] == n_embd_gqa);
         layer.wqk = ggml_new_tensor_2d(ctx_split, wq->type, n_embd, n_embd_head_k * (n_head + n_head_kv));
-        if (wq->type == GGML_TYPE_F8_E4M3) {
-            ggml_set_weight_scale(layer.wqk, ggml_get_weight_scale(wq));
-        }
         if (wq->type == GGML_TYPE_NVFP4_KS) {
             ggml_set_input_scale(layer.wqk, ggml_get_input_scale(wq));
         }

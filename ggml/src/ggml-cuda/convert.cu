@@ -2188,6 +2188,12 @@ static __global__ void convert_unary(const void * __restrict__ vx, dst_t * __res
 }
 
 template <typename dst_t>
+static void convert_f8_rows_cuda(const void * vx, dst_t * y, int64_t nrows, int64_t ne0, cudaStream_t stream) {
+    const int64_t n = nrows*ne0;
+    convert_f8_rows<ggml_cuda_f8_row><<<(n + 255)/256, 256, 0, stream>>>(vx, y, n, ne0);
+}
+
+template <typename dst_t>
 static __global__ void convert_from_bf16(const nv_bfloat16 * __restrict__ x, dst_t * __restrict__ y, const int64_t k) {
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -2282,6 +2288,8 @@ static void dequantize_row_tq_cuda(const void * vx, dst_t * y, const int64_t nro
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_F8_E4M3_KS:
+            return convert_f8_rows_cuda;
         case GGML_TYPE_F8_E4M3:
             return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_TQ2_T:
@@ -2353,6 +2361,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_F8_E4M3_KS:
+            return convert_f8_rows_cuda;
         case GGML_TYPE_F8_E4M3:
             return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_TQ2_T:
@@ -2485,6 +2495,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_F8_E4M3_KS:
+            return convert_f8_rows_cuda;
         case GGML_TYPE_F8_E4M3:
             return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_TQ2_T:

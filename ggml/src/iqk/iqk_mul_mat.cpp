@@ -250,7 +250,7 @@ struct MulMat {
     }
     static bool prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny);
     static inline ggml_type is_dequant_better(ggml_type type, int nrc_y) {
-        if (type == GGML_TYPE_F8_E4M3) return GGML_TYPE_BF16;
+        if (type == GGML_TYPE_F8_E4M3_KS) return GGML_TYPE_BF16;
 #ifdef __AVX2__
 #ifdef HAVE_FANCY_SIMD
         auto q8_k_type = GGML_TYPE_Q8_K_R16;
@@ -506,9 +506,9 @@ static work_buffer_t & thread_local_work_buffer() {
 }
 
 bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x) {
-    if (typeA == GGML_TYPE_F8_E4M3) {
+    if (typeA == GGML_TYPE_F8_E4M3_KS) {
         for (int row = 0; row < nrc_x; ++row) {
-            ggml_fp8_e4m3_to_bf16_row((const ggml_fp8_e4m3_t *)((const char *)vx + row*bx),
+            ggml_fp8_e4m3_to_bf16_row((const ggml_fp8_e4m3_t *)((const char *)vx + row*bx + sizeof(float)),
                     (ggml_bf16_t *)vy + row*stride_y, n);
         }
         return true;
@@ -946,6 +946,19 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
 
         return true;
 
+    }
+
+    if (typeA == GGML_TYPE_F8_E4M3_KS && typeB == GGML_TYPE_BF16) {
+        const auto dot = ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).vec_dot;
+        DataInfo info{C, (const char *)B, size_t(nb1)/sizeof(float), size_t(strideB), 0, ne11, row_mapping, size_t(nb2)/sizeof(float)};
+        for (int ix = ith; ix < Nx; ix += nth) {
+            for (int iy = 0; iy < Ny; ++iy) {
+                float value;
+                dot(ne00, &value, 0, (const char *)A + ix*strideA, 0, info.src1_row(iy), 0, 1);
+                info.store(ix, iy, value);
+            }
+        }
+        return true;
     }
 
     if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {

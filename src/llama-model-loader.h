@@ -71,6 +71,7 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
         std::vector<float> nvfp4_scale;
+        std::vector<float> f8_scale;
         bool mxfp4_repack = false;
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
@@ -122,13 +123,12 @@ struct llama_model_loader {
             const llama_model_kv_override * param_overrides_p,
             const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
             const std::string & ngram_fname = std::string(),
-            llama_nvfp4_precision nvfp4_precision = LLAMA_NVFP4_PRECISION_AUTO,
-            bool keep_f8_sidecars = false);
+            llama_nvfp4_precision nvfp4_precision = LLAMA_NVFP4_PRECISION_AUTO);
 
     ~llama_model_loader();
 
     bool import_nvfp4(llama_nvfp4_precision precision);
-    void import_f8_e4m3(bool keep_sidecars);
+    bool import_f8_e4m3();
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
