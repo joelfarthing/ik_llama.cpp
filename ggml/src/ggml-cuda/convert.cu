@@ -2193,6 +2193,11 @@ static void convert_f8_rows_cuda(const void * vx, dst_t * y, int64_t nrows, int6
     convert_f8_rows<ggml_cuda_f8_row><<<(n + 255)/256, 256, 0, stream>>>(vx, y, n, ne0);
 }
 
+static void convert_f8_blocks_cuda(const void * vx, float * y, int64_t nrows, int64_t ne0, cudaStream_t stream) {
+    const int64_t n = nrows*ne0;
+    convert_f8_rows<ggml_cuda_f8_block><<<(n + 255)/256, 256, 0, stream>>>(vx, y, n, ne0);
+}
+
 template <typename dst_t>
 static __global__ void convert_from_bf16(const nv_bfloat16 * __restrict__ x, dst_t * __restrict__ y, const int64_t k) {
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
@@ -2495,6 +2500,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_F8_E4M3_B128:
+            return convert_f8_blocks_cuda;
         case GGML_TYPE_F8_E4M3_KS:
             return convert_f8_rows_cuda;
         case GGML_TYPE_F8_E4M3:

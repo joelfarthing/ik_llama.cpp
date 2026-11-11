@@ -31,6 +31,16 @@ struct ggml_cuda_f8_row {
     static __host__ __device__ size_t row_size(int n) { return sizeof(float) + n; }
 };
 
+struct ggml_cuda_f8_block {
+    static __device__ __forceinline__ float scale(const void * row, int col) {
+        return ggml_cuda_f8_row::scale((const char *)row + size_t(col/128)*132);
+    }
+    static __device__ __forceinline__ ggml_fp8_e4m3_t code(const void * row, int col) {
+        return ggml_cuda_f8_row::code((const char *)row + size_t(col/128)*132, col%128);
+    }
+    static __host__ __device__ size_t row_size(int n) { return size_t(n/128)*132; }
+};
+
 template <typename layout>
 static __device__ __forceinline__ float ggml_cuda_f8_value(const void * row, int col) {
     return ggml_cuda_f8_e4m3_to_float(layout::code(row, col)) * layout::scale(row, col);

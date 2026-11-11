@@ -52,3 +52,96 @@ static __global__ void mul_mat_vec_f8_e4m3(int n, int ldc, const ggml_fp8_e4m3_t
         z[size_t(col)*ldc + row] = sum * layout::scale(row_data);
     }
 }
+
+template <int width>
+static __global__ void mul_mat_vec_f8_e4m3_wide(int n, int ldc, const void * vx,
+        const float * y, float * z, size_t nb11) {
+    const int row = blockIdx.x;
+    const void * row_data = (const char *)vx + size_t(row)*ggml_cuda_f8_row::row_size(n);
+    const auto * x = ggml_cuda_f8_row::codes(row_data);
+    y += size_t(blockIdx.y)*nb11;
+    const int peel = (-uintptr_t(x)) % width;
+    const int end = peel + (n - peel)/width*width;
+    float sums[width] = {};
+    for (int j = peel + width*threadIdx.x; j < end; j += width*blockDim.x) {
+        uint32_t words[width/4];
+        if constexpr (width == 16) {
+            const uint4 codes = *(const uint4 *)(x + j);
+            words[0] = codes.x; words[1] = codes.y; words[2] = codes.z; words[3] = codes.w;
+        } else {
+            const uint2 codes = *(const uint2 *)(x + j);
+            words[0] = codes.x; words[1] = codes.y;
+        }
+#pragma unroll
+        for (int k = 0; k < width/4; ++k) {
+            const float2 w0 = ggml_cuda_f8_e4m3x2_to_float2(words[k]);
+            const float2 w1 = ggml_cuda_f8_e4m3x2_to_float2(words[k] >> 16);
+            const float4 a = *(const float4 *)(y + j + 4*k);
+            sums[4*k+0] = fmaf(w0.x, a.x, sums[4*k+0]);
+            sums[4*k+1] = fmaf(w0.y, a.y, sums[4*k+1]);
+            sums[4*k+2] = fmaf(w1.x, a.z, sums[4*k+2]);
+            sums[4*k+3] = fmaf(w1.y, a.w, sums[4*k+3]);
+        }
+    }
+    float sum = 0;
+#pragma unroll
+    for (int k = 0; k < width; ++k) sum += sums[k];
+    if (threadIdx.x < peel) sum += ggml_cuda_f8_e4m3_to_float(x[threadIdx.x]) * y[threadIdx.x];
+    const int tail = end + threadIdx.x;
+    if (tail < n) sum += ggml_cuda_f8_e4m3_to_float(x[tail]) * y[tail];
+    sum = warp_reduce_sum(sum);
+    __shared__ float tmp[8];
+    const int lane = threadIdx.x % 32;
+    if (lane == 0) tmp[threadIdx.x/32] = sum;
+    __syncthreads();
+    sum = lane < blockDim.x/32 ? tmp[lane] : 0;
+    sum = warp_reduce_sum(sum);
+    if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + row] = sum * ggml_cuda_f8_row::scale(row_data);
+}
+
+static __device__ __forceinline__ float dot_f8_e4m3_b128(int n, const void * row, const float * y) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    float sum = 0;
+    for (int b = warp; b < n/128; b += blockDim.x/32) {
+        const void * block = (const char *)row + size_t(b)*132;
+        const auto * x = ggml_cuda_f8_row::codes(block);
+        uint32_t codes;
+        if (uintptr_t(x) % alignof(uint32_t) == 0) codes = *(const uint32_t *)(x + 4*lane);
+        else memcpy(&codes, x + 4*lane, sizeof(codes));
+        const float2 w0 = ggml_cuda_f8_e4m3x2_to_float2(codes);
+        const float2 w1 = ggml_cuda_f8_e4m3x2_to_float2(codes >> 16);
+        const float * a = y + b*128 + 4*lane;
+        float partial = w0.x*a[0];
+        partial = fmaf(w0.y, a[1], partial);
+        partial = fmaf(w1.x, a[2], partial);
+        partial = fmaf(w1.y, a[3], partial);
+        partial = warp_reduce_sum(partial);
+        if (lane == 0) sum = fmaf(partial, ggml_cuda_f8_row::scale(block), sum);
+    }
+    __shared__ float tmp[8];
+    if (lane == 0) tmp[warp] = sum;
+    __syncthreads();
+    sum = lane < blockDim.x/32 ? tmp[lane] : 0;
+    return warp_reduce_sum(sum);
+}
+
+static __global__ void mul_mat_vec_f8_e4m3_b128(int n, int ldc, const void * x,
+        const float * y, float * z, size_t nb11) {
+    const void * row = (const char *)x + size_t(blockIdx.x)*ggml_cuda_f8_block::row_size(n);
+    const float sum = dot_f8_e4m3_b128(n, row, y + size_t(blockIdx.y)*nb11);
+    if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + blockIdx.x] = sum;
+}
+
+static __global__ void mul_mat_vec_f8_e4m3_b128_id(int n, int experts, int channels,
+        const char * x, const char * y, const char * ids, char * z,
+        size_t nb01, size_t nb02, size_t nb11, size_t nb12, size_t nbi0, size_t nbi1, size_t nb1, size_t nb2) {
+    const int slot = blockIdx.y;
+    const int token = blockIdx.z;
+    const int expert = *(const int *)(ids + size_t(token)*nbi1 + size_t(slot)*nbi0);
+    if (expert < 0 || expert >= experts) return;
+    const void * row = x + size_t(expert)*nb02 + size_t(blockIdx.x)*nb01;
+    const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
+    const float sum = dot_f8_e4m3_b128(n, row, a);
+    if (threadIdx.x == 0) *(float *)(z + size_t(token)*nb2 + size_t(slot)*nb1 + blockIdx.x*sizeof(float)) = sum;
+}
