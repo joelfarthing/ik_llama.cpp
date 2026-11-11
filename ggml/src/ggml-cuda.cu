@@ -2796,6 +2796,20 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const char * src0_dd_i, const float * src1_ddf_i, const char * src1_ddq_i, float * dst_dd_i,
         int64_t row_low, int64_t row_high, int64_t src1_ncols, int64_t src1_padded_row_size, cudaStream_t stream) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int shared_limit = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    const bool ks_cublas = src0->type == GGML_TYPE_F8_E4M3_KS && cc == CC_ADA_LOVELACE && src1_ncols >= 1024;
+    if (src1_ncols > 8 && dst->op_params[0] == GGML_PREC_DEFAULT && new_mma_available(cc) && !ks_cublas) {
+        const int nrows = row_high - row_low;
+        const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
+        ggml_cuda_pool_alloc<half> activations(ctx.pool(ggml_cuda_get_device()), src1_ncols*src1->ne[0]);
+        ggml_get_to_fp16_cuda(GGML_TYPE_F32)(src1_ddf_i, activations.get(), src1_ncols, src1->ne[0], stream);
+        if (src0->type == GGML_TYPE_F8_E4M3_KS) {
+            if (launch_f8_pp<ggml_cuda_f8_row>(cc, shared_limit, src0->ne[0], nrows, src1_ncols, ldc, src0_dd_i, activations.get(), dst_dd_i, stream)) return;
+        } else {
+            if (launch_f8_pp<ggml_cuda_f8_block>(cc, shared_limit, src0->ne[0], nrows, src1_ncols, ldc, src0_dd_i, activations.get(), dst_dd_i, stream)) return;
+        }
+    }
     if (src0->type == GGML_TYPE_F8_E4M3_B128 && src1_ncols > 8 && dst->op_params[0] == GGML_PREC_DEFAULT &&
         new_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         const int nrows = row_high - row_low;
