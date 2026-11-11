@@ -97,9 +97,21 @@ static __device__ __forceinline__ void f8_pp_copy(void * dst, const void * src, 
 #endif
 }
 
-template <typename layout, int BN, int NW, int stages, bool tail = true, int BK = 64>
+struct f8_moe_routing {
+    const int32_t * rows;
+    const int32_t * bounds;
+    const int32_t * tiles;
+    int experts;
+    size_t row_stride;
+    size_t expert_stride;
+    const char * bias;
+    size_t bias_stride;
+};
+
+template <typename layout, int BN, int NW, int stages, bool tail = true, int BK = 64, bool indexed = false>
 static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
-        int n, int rows, int cols, int ldc, const char * __restrict__ x, const half * __restrict__ y, float * __restrict__ z) {
+        int n, int rows, int cols, int ldc, const char * __restrict__ x, const half * __restrict__ y, float * __restrict__ z,
+        f8_moe_routing routing = {}) {
 #ifdef INT8_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
     constexpr bool blocked = std::is_same_v<layout, ggml_cuda_f8_block>;
@@ -112,10 +124,24 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
     const int tile_index = blockIdx.x + blockIdx.y*gridDim.x;
     const int group = tile_index/(8*gridDim.y);
     const int group_rows = min(8, int(gridDim.x)-8*group);
-    const int first_row = (8*group + (tile_index%(8*gridDim.y))%group_rows)*BM;
-    const int first_col = ((tile_index%(8*gridDim.y))/group_rows)*BN;
+    int first_row = (8*group + (tile_index%(8*gridDim.y))%group_rows)*BM;
+    int first_col = ((tile_index%(8*gridDim.y))/group_rows)*BN;
+    int expert = 0;
+    if constexpr (indexed) {
+        if (blockIdx.y >= routing.tiles[routing.experts]) return;
+        int hi = routing.experts;
+        while (expert + 1 < hi) {
+            const int mid = (expert + hi)/2;
+            if (routing.tiles[mid] <= int(blockIdx.y)) expert = mid;
+            else hi = mid;
+        }
+        first_row = blockIdx.x*BM;
+        first_col = routing.bounds[expert] + (blockIdx.y-routing.tiles[expert])*BN;
+        cols = routing.bounds[expert+1];
+        x += size_t(expert)*routing.expert_stride;
+    }
     const int warp_row = (threadIdx.y/WC)*32, warp_col = (threadIdx.y%WC)*(BN/WC);
-    const size_t row_bytes = layout::row_size(n);
+    const size_t row_bytes = indexed ? routing.row_stride : layout::row_size(n);
     auto load = [&](int k0, int s) {
         if (k0 < n) {
             if constexpr (!tail) {
@@ -156,7 +182,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
             for (int i = tid; i < BN*BK/8; i += NW*32) {
                 const int c = i/(BK/8), k = k0 + 8*(i%(BK/8));
                 half * dst = (half *)(b + (s*BN+c)*stride + (k-k0)/2);
-                const bool valid = !tail || (first_col+c < cols && k+7 < n);
+                const bool valid = (!tail && !indexed) || (first_col+c < cols && k+7 < n);
                 const half * src = valid ? y + size_t(first_col+c)*n + k : y;
                 if (valid && (!tail || uintptr_t(src)%16 == 0)) {
                     f8_pp_copy<16>(dst, src, 16);
@@ -248,7 +274,12 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                 if (row < rows && col < cols) {
                     float value = total[i][j].x[l];
                     if constexpr (!blocked) value *= layout::scale(x + size_t(row)*row_bytes);
-                    z[size_t(col)*ldc+row] = value;
+                    if constexpr (indexed) {
+                        if (routing.bias) value += ((const float *)(routing.bias + size_t(expert)*routing.bias_stride))[row];
+                        z[size_t(routing.rows[col])*ldc+row] = value;
+                    } else {
+                        z[size_t(col)*ldc+row] = value;
+                    }
                 }
             }
         }
@@ -258,7 +289,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
 #endif
 #else
     GGML_UNUSED(n); GGML_UNUSED(rows); GGML_UNUSED(cols); GGML_UNUSED(ldc);
-    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(z);
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(z); GGML_UNUSED(routing);
     NO_DEVICE_CODE;
 #endif
 }
@@ -275,7 +306,7 @@ static bool launch_f8_pp(int shared_limit, int n, int rows, int cols, int ldc, c
     const bool tail = n%BK != 0 || rows%128 != 0 || cols%BN != 0 || uintptr_t(x)%16 != 0 || uintptr_t(y)%16 != 0;
     auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK>;
     CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-    kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN), dim3(32, NW), bytes, stream>>>(n, rows, cols, ldc, x, y, z);
+    kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN), dim3(32, NW), bytes, stream>>>(n, rows, cols, ldc, x, y, z, {});
     return true;
 }
 
@@ -290,5 +321,90 @@ static bool launch_f8_pp(int cc, int shared_limit, int n, int rows, int cols, in
         return launch_f8_pp<layout, 128, 8, 1, 128>(shared_limit, n, rows, cols, ldc, x, y, z, stream);
     } else {
         return launch_f8_pp<layout, 64, 4, 2, 64>(shared_limit, n, rows, cols, ldc, x, y, z, stream);
+    }
+}
+
+static __global__ void f8_moe_rows(const char * ids, int32_t * rows, int32_t * bounds,
+        int slots, int tokens, size_t nb0, size_t nb1) {
+    const int expert = blockIdx.x;
+    int previous = 0;
+    for (int j = threadIdx.x; j < slots*tokens; j += 32) {
+        const int id = *(const int32_t *)(ids + size_t(j/slots)*nb1 + size_t(j%slots)*nb0);
+        previous += id >= 0 && id < expert;
+    }
+    for (int mask = 16; mask > 0; mask >>= 1) previous += __shfl_xor_sync(0xffffffff, previous, mask);
+    int count = 0;
+    for (int base = 0; base < slots*tokens; base += 32) {
+        const int j = base + threadIdx.x;
+        const int id = j < slots*tokens ? *(const int32_t *)(ids + size_t(j/slots)*nb1 + size_t(j%slots)*nb0) : -1;
+        const unsigned mask = __ballot_sync(0xffffffff, id == expert);
+        if (id == expert) rows[previous + count + __popc(mask & ((1u << threadIdx.x)-1))] = j;
+        count += __popc(mask);
+    }
+    if (threadIdx.x == 0) {
+        bounds[expert] = previous;
+        if (expert == gridDim.x-1) bounds[expert+1] = previous + count;
+    }
+}
+
+static __global__ void f8_moe_tiles(const int32_t * bounds, int32_t * tiles, int32_t * small, int experts, int width) {
+    int count = 0, nsmall = 0;
+    for (int e = 0; e < experts; ++e) {
+        tiles[e] = count;
+        const int size = bounds[e+1]-bounds[e];
+        if (size <= 8) {
+            for (int j = bounds[e]; j < bounds[e+1]; ++j) small[1+nsmall++] = j;
+        } else {
+            count += (size+width-1)/width;
+        }
+    }
+    tiles[experts] = count;
+    small[0] = nsmall;
+}
+
+static __global__ void f8_moe_convert(const char * src, half * dst, const int32_t * rows, const int32_t * bounds,
+        int experts, int n, int slots, int channels, size_t nb1, size_t nb2) {
+    const int col = blockIdx.x;
+    if (col >= bounds[experts]) return;
+    const int row = rows[col];
+    const float * input = (const float *)(src + size_t(row/slots)*nb2 + size_t(row%slots%channels)*nb1);
+    for (int j = threadIdx.x; j < n; j += blockDim.x) dst[size_t(col)*n+j] = __float2half(input[j]);
+}
+
+template <typename layout, int BN, int NW, int stages, int BK>
+static void launch_f8_moe(int n, int rows, int cols, const char * x, const half * y, float * z,
+        const f8_moe_routing & routing, cudaStream_t stream) {
+    constexpr int bytes = f8_pp_shared<BN, stages, BK>();
+    const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0 || routing.expert_stride%16 != 0;
+    auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, true> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, true>;
+    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN+routing.experts), dim3(32,NW), bytes, stream>>>(
+            n, rows, cols, rows, x, y, z, routing);
+}
+
+template <typename layout>
+static __global__ void mul_mat_f8_moe_small(int n, int rows, const char * x, const char * y, float * z,
+        const int32_t * small, int slots, int channels, size_t nb1, size_t nb2, f8_moe_routing routing) {
+    for (int i = blockIdx.y; i < small[0]; i += gridDim.y) {
+        const int col = small[1+i];
+        int expert = 0, hi = routing.experts;
+        while (expert + 1 < hi) {
+            const int mid = (expert+hi)/2;
+            if (routing.bounds[mid] <= col) expert = mid;
+            else hi = mid;
+        }
+        const int dst = routing.rows[col];
+        const auto * a = (const float *)(y + size_t(dst/slots)*nb2 + size_t(dst%slots%channels)*nb1);
+        for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+            const void * w = x + size_t(expert)*routing.expert_stride + size_t(row)*routing.row_stride;
+            float value;
+            if constexpr (std::is_same_v<layout, ggml_cuda_f8_block>) value = dot_f8_e4m3_b128(n, w, a);
+            else value = dot_f8_e4m3<layout>(n, w, a);
+            if (threadIdx.x == 0) {
+                if (routing.bias) value += ((const float *)(routing.bias + size_t(expert)*routing.bias_stride))[row];
+                z[size_t(dst)*rows+row] = value;
+            }
+            __syncthreads();
+        }
     }
 }
