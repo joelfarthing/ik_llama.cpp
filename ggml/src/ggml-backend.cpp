@@ -906,6 +906,10 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t 
 GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_CPY:
+            if (op->type == GGML_TYPE_F8_E4M3_B128) return op->src[0]->type == GGML_TYPE_F8_E4M3_B128;
+            if (op->src[0]->type == GGML_TYPE_F8_E4M3_B128) {
+                return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16;
+            }
             if (op->type == GGML_TYPE_F8_E4M3_KS) return op->src[0]->type == GGML_TYPE_F8_E4M3_KS;
             if (op->src[0]->type == GGML_TYPE_F8_E4M3_KS) {
                 return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16;
