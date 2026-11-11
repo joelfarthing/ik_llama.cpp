@@ -1246,6 +1246,10 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     }
 }
 
+static bool valid_scale_shape(const ggml_tensor * scale, const ggml_tensor * weight) {
+    return ggml_nelements(scale) == scale->ne[0] && (scale->ne[0] == 1 || scale->ne[0] == weight->ne[2]);
+}
+
 bool llama_model_loader::import_f8_e4m3() {
     int n_import = 0;
     for (const auto & w : weights) n_import += w.tensor->type == GGML_TYPE_F8_E4M3;
@@ -1262,7 +1266,7 @@ bool llama_model_loader::import_f8_e4m3() {
         w.f8_scale = { 1.0f };
         if (s) {
             const int count = s->tensor->ne[0];
-            if (ggml_nelements(s->tensor) != count || (count != 1 && count != w.tensor->ne[2]) ||
+            if (!valid_scale_shape(s->tensor, w.tensor) ||
                     (s->tensor->type != GGML_TYPE_F32 && s->tensor->type != GGML_TYPE_BF16)) {
                 throw std::runtime_error(format("tensor '%s': F8_E4M3 scale '%s' must be F32 or BF16 with shape [1] or [n_expert]", name.c_str(), s->tensor->name));
             }
@@ -1359,10 +1363,6 @@ bool llama_model_loader::import_nvfp4(llama_nvfp4_precision precision) {
         } else {
             memcpy(dst, raw.data(), raw.size());
         }
-    };
-
-    auto valid_scale_shape = [](const ggml_tensor * scale, const ggml_tensor * weight) {
-        return ggml_nelements(scale) == scale->ne[0] && (scale->ne[0] == 1 || scale->ne[0] == weight->ne[2]);
     };
 
     std::set<const ggml_tensor *> consumed;

@@ -5373,7 +5373,7 @@ GGML_CALL size_t ggml_nbytes(const struct ggml_tensor * tensor) {
     size_t blck_size = ggml_blck_size(tensor->type);
     if (blck_size == 1) {
         nbytes = ggml_type_size(tensor->type);
-        if (tensor->type == GGML_TYPE_F8_E4M3_KS) nbytes += sizeof(float);
+        nbytes += type_traits[tensor->type].row_meta_size;
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
             nbytes += (tensor->ne[i] - 1)*tensor->nb[i];
         }

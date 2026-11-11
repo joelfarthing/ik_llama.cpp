@@ -241,6 +241,12 @@ class Model:
             raise ValueError(f"FP8 scale shape {tuple(scale.shape)} needs a weight_block_size")
         raise ValueError(f"FP8 scale shape {tuple(scale.shape)} does not match {expected}")
 
+    @staticmethod
+    def _dequantize_fp8(weight: Tensor, scales: Tensor, block_cols: int | None) -> Tensor:
+        if block_cols is not None:
+            scales = scales.repeat_interleave(block_cols, dim=-1)[..., :weight.shape[-1]]
+        return weight.float() * scales
+
     def _convert_fp8(self, name: str, weight: Tensor, scale: Tensor, block_size: Sequence[int] | None):
         if len(weight.shape) < 2:
             return weight.float() * scale.float()
@@ -258,7 +264,7 @@ class Model:
             reason = "kv_b_proj column transpose requires dequantization"
         if self.fp8_dequant or reason is not None:
             logger.info("%s: dequantizing FP8 (%s)", name, "--fp8-dequant" if self.fp8_dequant else reason)
-            return DeepseekV4Model._dequantize_mtp_weight(weight, scale, block_size)
+            return self._dequantize_fp8(weight, scales, block_cols)
         codes = weight.view(torch.uint8)
         if qtype == gguf.GGMLQuantizationType.F8_E4M3_B128:
             codes = codes.reshape(*weight.shape[:-1], -1, 128)
@@ -416,7 +422,10 @@ class Model:
                             blocks = data.reshape(-1, 132) if qtype == gguf.GGMLQuantizationType.F8_E4M3_B128 else data
                             blocks[..., :4] = blocks[..., :4][..., ::-1]
                             return data
-                        data = gguf.LazyNumpyTensor._wrap_fn(swap_scales, meta_noop=True)(data)
+                        if isinstance(data, gguf.LazyNumpyTensor):
+                            data = gguf.LazyNumpyTensor._wrap_fn(swap_scales, meta_noop=True)(data)
+                        else:
+                            data = swap_scales(data)
                     self.gguf_writer.add_tensor(new_name, data, raw_dtype=d.qtype)
                     self._fp8_types.add(d.qtype)
                     logger.info("%s, %s --> %s, shape = %s", new_name, old_dtype, d.qtype.name, d.shape[::-1])
@@ -5566,9 +5575,7 @@ class DeepseekV4Model(DeepseekV2Model):
     def _dequantize_mtp_weight(weight: Tensor, scale: Tensor, block_size: Sequence[int] | None = None) -> Tensor:
         if scale.dtype in (torch.float32, torch.bfloat16, torch.float16):
             scale_f, block_cols = Model._fp8_scale_rows(weight, scale, block_size)
-            if block_cols is not None:
-                scale_f = scale_f.repeat_interleave(block_cols, dim=-1)[..., :weight.shape[-1]]
-            return weight.float() * scale_f
+            return Model._dequantize_fp8(weight, scale_f, block_cols)
         if len(weight.shape) != 2 or len(scale.shape) != 2:
             return weight
 
