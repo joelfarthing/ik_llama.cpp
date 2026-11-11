@@ -1,4 +1,6 @@
 #include "cpy.cuh"
+#include "f8.cuh"
+#include "convert.cuh"
 #include "dequantize.cuh"
 #include "graph.cuh"
 #include "cpy-utils.cuh"
@@ -8,12 +10,12 @@
 
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
-template <cpy_kernel_t cpy_1>
-static __global__ void cpy_flt(const char * cx, char * cdst_direct, const int ne,
-                               const int ne00, const int ne01, const int ne02, const int nb00, const int nb01, const int nb02,
-                               const int nb03, const int ne10, const int ne11, const int ne12, const int nb10, const int nb11,
-                               const int nb12, const int nb13, char ** cdst_indirect, int graph_cpynode_index) {
-    const int64_t i = blockDim.x*blockIdx.x + threadIdx.x;
+template <cpy_kernel_t cpy_1, typename f8_dst_t = void, typename index_t = std::conditional_t<std::is_same_v<f8_dst_t, void>, int, int64_t>>
+static __global__ void cpy_flt(const char * cx, char * cdst_direct, const index_t ne,
+                               const index_t ne00, const index_t ne01, const index_t ne02, const index_t nb00, const index_t nb01, const index_t nb02,
+                               const index_t nb03, const index_t ne10, const index_t ne11, const index_t ne12, const index_t nb10, const index_t nb11,
+                               const index_t nb12, const index_t nb13, char ** cdst_indirect, int graph_cpynode_index, float scale = 1.0f) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= ne) {
         return;
@@ -35,7 +37,14 @@ static __global__ void cpy_flt(const char * cx, char * cdst_direct, const int ne
     const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
     const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
 
-    cpy_1(cx + x_offset, cdst + dst_offset);
+    if constexpr (std::is_same_v<f8_dst_t, void>) {
+        cpy_1(cx + x_offset, cdst + dst_offset);
+    } else if constexpr (std::is_same_v<f8_dst_t, ggml_fp8_e4m3_t>) {
+        cdst[dst_offset] = cx[x_offset];
+    } else {
+        const float v = ggml_cuda_f8_e4m3_to_float(*(const ggml_fp8_e4m3_t *)(cx + x_offset)) * scale;
+        *(f8_dst_t *)(cdst + dst_offset) = ggml_cuda_cast<f8_dst_t>(v);
+    }
 }
 
 template <typename src_t, typename dst_t>
@@ -576,6 +585,28 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
             }
         }
+    } else if (src0->type == GGML_TYPE_F8_E4M3) {
+        const int num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+        const float scale = ggml_get_weight_scale(src0);
+        if (src1->type == GGML_TYPE_F32) {
+            cpy_flt<nullptr, float><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(
+                    src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13, dest_ptrs_d, graph_cpynode_index++, scale);
+        } else if (src1->type == GGML_TYPE_F16) {
+            cpy_flt<nullptr, half><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(
+                    src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13, dest_ptrs_d, graph_cpynode_index++, scale);
+        } else if (src1->type == GGML_TYPE_BF16) {
+            cpy_flt<nullptr, nv_bfloat16><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(
+                    src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13, dest_ptrs_d, graph_cpynode_index++, scale);
+        } else if (src1->type == GGML_TYPE_F8_E4M3) {
+            cpy_flt<nullptr, ggml_fp8_e4m3_t><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(
+                    src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13, dest_ptrs_d, graph_cpynode_index++, scale);
+        } else {
+            GGML_ABORT("unsupported F8 copy destination");
+        }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (fast_cpy) {
             ggml_cpy_flt_contiguous_cuda<float, float>(src0_ddc, src1_ddc, ne, main_stream, dest_ptrs_d, graph_cpynode_index);
@@ -692,6 +723,14 @@ void* ggml_cuda_cpy_fn(const ggml_tensor * src0, ggml_tensor * src1) {
             return (void*) cpy_flt<cpy_1_flt<float, float>>;
         } else {
             return nullptr;
+        }
+    } else if (src0->type == GGML_TYPE_F8_E4M3) {
+        switch (src1->type) {
+            case GGML_TYPE_F32:     return (void *)cpy_flt<nullptr, float>;
+            case GGML_TYPE_F16:     return (void *)cpy_flt<nullptr, half>;
+            case GGML_TYPE_BF16:    return (void *)cpy_flt<nullptr, nv_bfloat16>;
+            case GGML_TYPE_F8_E4M3: return (void *)cpy_flt<nullptr, ggml_fp8_e4m3_t>;
+            default:               return nullptr;
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         return fast_cpy ? (void *)cpy_flt_contiguous<float, float> : (void*) cpy_flt<cpy_1_flt<float, float>>;

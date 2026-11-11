@@ -377,7 +377,9 @@ extern "C" {
     GGML_API void        ggml_fp32_to_fp16_row(const float *, ggml_fp16_t *, int64_t);
 
     // google brain half-precision bfloat16
+    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
     typedef struct { uint16_t bits; } ggml_bf16_t;
+    GGML_API void ggml_fp8_e4m3_to_bf16_row(const ggml_fp8_e4m3_t *, ggml_bf16_t *, int64_t);
     GGML_API ggml_bf16_t ggml_fp32_to_bf16(float);
     GGML_API float       ggml_bf16_to_fp32(ggml_bf16_t);  // consider just doing << 16
     GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t);
@@ -428,6 +430,7 @@ extern "C" {
         GGML_TYPE_NVFP4     = 40,
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
         GGML_TYPE_Q2_0      = 42,  // same type id as mainline GGML_TYPE_Q2_0
+        GGML_TYPE_F8_E4M3   = 43,
         //
         //
         GGML_TYPE_Q8_0_X4 = 97,
@@ -971,6 +974,8 @@ extern "C" {
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);
 
+    GGML_API void ggml_set_weight_scale(struct ggml_tensor * tensor, float scale);
+    GGML_API float ggml_get_weight_scale(const struct ggml_tensor * tensor);
     GGML_API void ggml_set_input_scale(struct ggml_tensor * tensor, float scale);
     GGML_API float ggml_get_input_scale(const struct ggml_tensor * tensor);
     GGML_API bool  ggml_mxfp4_to_nvfp4_ks(const void * src, void * dst, int n_per_row);

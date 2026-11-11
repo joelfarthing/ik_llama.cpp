@@ -151,6 +151,14 @@ static void llama_tensor_dequantize_internal(
     }
     float * f32_output = (float *) output.data();
 
+    if (tensor->type == GGML_TYPE_F8_E4M3) {
+        const auto to_float = ggml_internal_get_type_traits(tensor->type).to_float;
+        to_float(tensor->data, f32_output, nelements);
+        const float scale = ggml_get_weight_scale(tensor);
+        for (size_t i = 0; i < nelements; ++i) f32_output[i] *= scale;
+        return;
+    }
+
     ggml_type_traits_t qtype;
     if (ggml_is_quantized(tensor->type)) {
         qtype = ggml_internal_get_type_traits(tensor->type);
@@ -1485,8 +1493,14 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     }
     llama_model_loader ml(fname_inp, 0, use_mmap, /*check_tensors*/ true, /* repack_tensors */ false,
             /* use_thp */ false, /* merge_qkv */ false, /* merge_up_gate_exps */ false,
-            /* defer_experts */ false, kv_overrides, nullptr);
+            /* defer_experts */ false, kv_overrides, nullptr, std::string(), LLAMA_NVFP4_PRECISION_AUTO, true);
     ml.init_mappings(false); // no prefetching
+    auto has_f8_sidecars = [&ml](const ggml_tensor * tensor) {
+        if (tensor->type != GGML_TYPE_F8_E4M3) return false;
+        const std::string name(tensor->name);
+        const std::string base = name.substr(0, name.rfind('.'));
+        return ml.get_weight((base + ".scale").c_str()) || ml.get_weight((base + ".input_scale").c_str());
+    };
 
     llama_model model;
     try {
@@ -1670,6 +1684,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     if (!output_meta) {
         output_meta = ml.get_tensor_meta("token_embd.weight");
     }
+    if (params->extra_output_type == GGML_TYPE_F8_E4M3) {
+        throw std::runtime_error("F8_E4M3 is not a quantization target");
+    }
     ggml_tensor * output_tensor = nullptr;
     if (params->extra_output_type != GGML_TYPE_COUNT) {
         auto meta = ml.get_tensor_meta("output.weight");
@@ -1683,6 +1700,9 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                     ggml_type_name(params->extra_output_type));
             auto weights = ml.get_weight(meta->name);
             output_tensor = weights->tensor;
+            if (has_f8_sidecars(output_tensor)) {
+                throw std::runtime_error(format("tensor '%s': creating an extra output by requantizing F8_E4M3 with sidecars is not supported", output_tensor->name));
+            }
             extra = *output_tensor;
             auto new_type = params->extra_output_type;
             extra.type = new_type;
@@ -1722,6 +1742,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         quantize &= params->quantize_output_tensor || name != "output.weight";
         quantize &= !params->only_copy;
+        quantize &= tensor->type != GGML_TYPE_F8_E4M3 || params->allow_requantize;
 
         // do not quantize expert gating tensors
         // NOTE: can't use LLM_TN here because the layer number is not known
@@ -2065,6 +2086,13 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 chunk_size_multiplier = num_rows;
             }
 
+            if (has_f8_sidecars(tensor)) {
+                throw std::runtime_error(format("tensor '%s': requantizing F8_E4M3 with sidecars is not supported; copy it with its .scale and .input_scale sidecars without --allow-requantize", name.c_str()));
+            }
+            if (new_type == GGML_TYPE_F8_E4M3) {
+                throw std::runtime_error("F8_E4M3 is not a quantization target");
+            }
+
             LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
             fflush(stdout);
 
@@ -2220,7 +2248,7 @@ static void estimate_imatrix_internal(const std::string & fname_inp,
 
     llama_model_loader ml(fname_inp, 0, use_mmap, /*check_tensors*/ true, /* repack_tensors */ false,
             /* use_thp */ false, /* merge_qkv */ false, /* merge_up_gate_exps */ false,
-            /* defer_experts */ false, nullptr, nullptr);
+            /* defer_experts */ false, nullptr, nullptr, std::string(), LLAMA_NVFP4_PRECISION_AUTO, true);
     ml.init_mappings(false); // no prefetching
 
     llama_model model;

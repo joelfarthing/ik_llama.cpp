@@ -77,6 +77,21 @@ struct llama_model_loader {
             const int tensor_idx = gguf_find_tensor(gguf_ctx, name);
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
 
+            if (tensor->type == GGML_TYPE_F8_E4M3) {
+                size_t end = file->size();
+                for (int i = 0; i < gguf_get_n_tensors(gguf_ctx); ++i) {
+                    const size_t next = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, i);
+                    if (next > offs && next < end) end = next;
+                }
+                const size_t size = ggml_nbytes(tensor);
+                const size_t alignment = gguf_get_alignment(gguf_ctx);
+                const size_t padded = GGML_PAD(size, alignment);
+                if (end < offs || end - offs < size || end - offs > padded) {
+                    throw std::runtime_error(format("tensor '%s': type 43 is not one-byte F8_E4M3 (expected %zu bytes, at most %zu with padding, stored extent %zu); block-scaled MXFP8 is not supported",
+                                name, size, padded, end >= offs ? end - offs : 0));
+                }
+            }
+
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 auto data_offset = gguf_get_data_offset(gguf_ctx);
                 auto tensor_offset = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
@@ -107,11 +122,13 @@ struct llama_model_loader {
             const llama_model_kv_override * param_overrides_p,
             const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
             const std::string & ngram_fname = std::string(),
-            llama_nvfp4_precision nvfp4_precision = LLAMA_NVFP4_PRECISION_AUTO);
+            llama_nvfp4_precision nvfp4_precision = LLAMA_NVFP4_PRECISION_AUTO,
+            bool keep_f8_sidecars = false);
 
     ~llama_model_loader();
 
     bool import_nvfp4(llama_nvfp4_precision precision);
+    void import_f8_e4m3(bool keep_sidecars);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

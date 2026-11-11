@@ -15688,6 +15688,16 @@ static bool validate_fp16(ggml_fp16_t f, size_t i) {
     }
 
 bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes) {
+    if (type == GGML_TYPE_F8_E4M3) {
+        const uint8_t * codes = data;
+        for (size_t i = 0; i < nbytes; ++i) {
+            if ((codes[i] & 0x7f) == 0x7f) {
+                fprintf(stderr, "%s: found NaN at F8_E4M3 element %zu\n", __func__, i);
+                return false;
+            }
+        }
+        return true;
+    }
     if (type < 0 || type >= GGML_TYPE_COUNT) {
         fprintf(stderr, "%s: invalid type %d\n", __func__, type);
         return false;
