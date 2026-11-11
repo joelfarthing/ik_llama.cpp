@@ -6,6 +6,7 @@
 //
 
 #include "convert.cuh"
+#include "f8.cuh"
 #include "dequantize.cuh"
 #include "tq.cuh"
 
@@ -2179,7 +2180,11 @@ static __global__ void convert_unary(const void * __restrict__ vx, dst_t * __res
 
     const src_t * x = (src_t *) vx;
 
-    y[i] = x[i];
+    if constexpr (std::is_same_v<src_t, ggml_fp8_e4m3_t>) {
+        y[i] = ggml_cuda_cast<dst_t>(ggml_cuda_f8_e4m3_to_float(x[i]));
+    } else {
+        y[i] = x[i];
+    }
 }
 
 template <typename dst_t>
@@ -2277,6 +2282,8 @@ static void dequantize_row_tq_cuda(const void * vx, dst_t * y, const int64_t nro
 
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_TQ2_T:
             return dequantize_row_tq_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:
@@ -2346,6 +2353,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_TQ2_T:
             return dequantize_row_tq_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:
@@ -2476,6 +2485,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_TQ2_T:
             return dequantize_row_tq_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:

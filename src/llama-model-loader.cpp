@@ -306,7 +306,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         bool repack_tensors, bool use_thp, bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
-        const std::string & ngram_fname, llama_nvfp4_precision nvfp4_precision) {
+        const std::string & ngram_fname, llama_nvfp4_precision nvfp4_precision, bool keep_f8_sidecars) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -468,6 +468,8 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         gguf_free(gguf_ngram);
     }
 
+    import_f8_e4m3(keep_f8_sidecars);
+
     n_kv      = gguf_get_n_kv(meta);
     n_tensors = weights.size();
 
@@ -521,6 +523,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             case GGML_TYPE_F32:     ftype = LLAMA_FTYPE_ALL_F32;        break;
             case GGML_TYPE_F16:     ftype = LLAMA_FTYPE_MOSTLY_F16;     break;
             case GGML_TYPE_BF16:    ftype = LLAMA_FTYPE_MOSTLY_BF16;    break;
+            case GGML_TYPE_F8_E4M3: ftype = LLAMA_FTYPE_MOSTLY_F8_E4M3; break;
             case GGML_TYPE_BF16_R16:ftype = LLAMA_FTYPE_MOSTLY_BF16_R16;break;
             case GGML_TYPE_Q4_0:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0;    break;
             case GGML_TYPE_Q4_1:    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
@@ -1164,6 +1167,9 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
             offset);
 
     ggml_set_name(tensor, name.c_str());
+    if (cur->type == GGML_TYPE_F8_E4M3) {
+        ggml_set_weight_scale(tensor, ggml_get_weight_scale(cur));
+    }
     if (cur->type == GGML_TYPE_NVFP4_KS) {
         ggml_set_input_scale(tensor, ggml_get_input_scale(cur));
     }
@@ -1238,6 +1244,44 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         } catch(...) {
             // the tensor is not in the model
         }
+    }
+}
+
+void llama_model_loader::import_f8_e4m3(bool keep_sidecars) {
+    std::set<const ggml_tensor *> consumed;
+    for (auto & w : weights) {
+        if (w.tensor->type != GGML_TYPE_F8_E4M3) continue;
+        const std::string name(w.tensor->name);
+        const std::string base = name.substr(0, name.rfind('.'));
+        const auto * s = get_weight((base + ".scale").c_str());
+        float scale = 1.0f;
+        if (s) {
+            if (ggml_nelements(s->tensor) != 1 ||
+                    (s->tensor->type != GGML_TYPE_F32 && s->tensor->type != GGML_TYPE_BF16)) {
+                throw std::runtime_error(format("tensor '%s': F8_E4M3 scale '%s' must contain exactly one F32 or BF16 value (got %lld elements of %s)",
+                            name.c_str(), s->tensor->name, (long long)ggml_nelements(s->tensor), ggml_type_name(s->tensor->type)));
+            }
+            files.at(s->idx)->seek(s->offs, SEEK_SET);
+            if (s->tensor->type == GGML_TYPE_F32) {
+                files.at(s->idx)->read_raw(&scale, sizeof(scale));
+            } else {
+                ggml_bf16_t value;
+                files.at(s->idx)->read_raw(&value, sizeof(value));
+                scale = ggml_bf16_to_fp32(value);
+            }
+            if (!std::isfinite(scale)) {
+                throw std::runtime_error(format("tensor '%s': F8_E4M3 scale is not finite", name.c_str()));
+            }
+            consumed.insert(s->tensor);
+        }
+        ggml_set_weight_scale(w.tensor, scale);
+        const auto * input = get_weight((base + ".input_scale").c_str());
+        if (input) consumed.insert(input->tensor);
+    }
+    if (!keep_sidecars) {
+        weights.erase(std::remove_if(weights.begin(), weights.end(), [&consumed](const llama_tensor_weight & w) {
+            return consumed.count(w.tensor) > 0;
+        }), weights.end());
     }
 }
 
