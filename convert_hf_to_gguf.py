@@ -44,6 +44,44 @@ class SentencePieceTokenTypes(IntEnum):
 AnyModel = TypeVar("AnyModel", bound="type[Model]")
 
 
+class FP8Tensor:
+    def __init__(self, data: Tensor, qtype: gguf.GGMLQuantizationType):
+        self.data = data
+        self.qtype = qtype
+
+    @property
+    def shape(self):
+        return gguf.quant_shape_from_byte_shape(self.data.shape, self.qtype)
+
+    @property
+    def dtype(self):
+        return torch.float8_e4m3fn
+
+    def reshape(self, *shape):
+        if len(shape) == 1:
+            shape = tuple(shape[0])
+        return FP8Tensor(self.data.reshape(*shape[:-1], self.data.shape[-1]), self.qtype)
+
+    def swapaxes(self, axis0, axis1):
+        return FP8Tensor(self.data.swapaxes(axis0, axis1), self.qtype)
+
+    def dequantize(self):
+        data = self.data
+        if self.qtype == gguf.GGMLQuantizationType.F8_E4M3_B128:
+            data = data.reshape(*data.shape[:-1], -1, 132)
+        scale = data[..., :4].contiguous().view(torch.float32)
+        return (data[..., 4:].contiguous().view(torch.float8_e4m3fn).float() * scale).reshape(self.shape)
+
+    @classmethod
+    def stack(cls, tensors):
+        if not any(isinstance(t, cls) for t in tensors):
+            return torch.stack(tensors, dim=0)
+        if all(isinstance(t, cls) and t.qtype == tensors[0].qtype for t in tensors):
+            return cls(torch.stack([t.data for t in tensors], dim=0), tensors[0].qtype)
+        logger.warning("FP8 expert stack has mixed layouts or dtypes; dequantizing the stack")
+        return torch.stack([t.dequantize() if isinstance(t, cls) else t for t in tensors], dim=0)
+
+
 class Model:
     _model_classes: dict[str, type[Model]] = {}
     mtp_only = False
@@ -75,7 +113,7 @@ class Model:
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
                  split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False, small_first_shard: bool = False,
-                 target_model_dir: Path | None = None):
+                 target_model_dir: Path | None = None, fp8_dequant: bool = False):
         if type(self) is Model:
             raise TypeError(f"{type(self).__name__!r} should not be directly instantiated")
 
@@ -102,6 +140,8 @@ class Model:
         self.model_name = model_name
         self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
         self.target_model_dir = target_model_dir
+        self.fp8_dequant = fp8_dequant
+        self._fp8_types: set[gguf.GGMLQuantizationType] = set()
 
         # Apply heuristics to figure out typical tensor encoding based on first layer tensor encoding type
         if self.ftype == gguf.LlamaFileType.GUESSED:
@@ -181,6 +221,82 @@ class Model:
         # only verify tensor name presence; it doesn't matter if they are not in the right files
         if len(sym_diff := tensor_names_from_parts.symmetric_difference(self.tensor_names)) > 0:
             raise ValueError(f"Mismatch between weight map and model parts for tensor names: {sym_diff}")
+
+    @staticmethod
+    def _fp8_scale_rows(weight: Tensor, scale: Tensor, block_size: Sequence[int] | None) -> tuple[Tensor, int | None]:
+        rows, cols = weight.shape[-2:]
+        scale = scale.float()
+        if block_size is not None:
+            if len(block_size) != 2 or min(block_size) <= 0:
+                raise ValueError(f"Invalid FP8 weight_block_size: {block_size}")
+            block_rows, block_cols = block_size
+            expected = (*weight.shape[:-2], (rows + block_rows - 1) // block_rows, (cols + block_cols - 1) // block_cols)
+            if tuple(scale.shape) == expected:
+                return scale.repeat_interleave(block_rows, dim=-2)[..., :rows, :], block_cols
+        if scale.numel() == 1:
+            return scale.reshape(1, 1).expand(*weight.shape[:-1], 1), None
+        if tuple(scale.shape) in (tuple(weight.shape[:-1]), (*weight.shape[:-1], 1)):
+            return scale.reshape(*weight.shape[:-1], 1), None
+        if block_size is None:
+            raise ValueError(f"FP8 scale shape {tuple(scale.shape)} needs a weight_block_size")
+        raise ValueError(f"FP8 scale shape {tuple(scale.shape)} does not match {expected}")
+
+    def _convert_fp8(self, name: str, weight: Tensor, scale: Tensor, block_size: Sequence[int] | None):
+        if len(weight.shape) < 2:
+            return weight.float() * scale.float()
+        scales, block_cols = self._fp8_scale_rows(weight, scale, block_size)
+        qtype = gguf.GGMLQuantizationType.F8_E4M3_KS
+        reason = None
+        if block_cols is not None:
+            qtype = gguf.GGMLQuantizationType.F8_E4M3_B128
+            if block_cols != 128 or weight.shape[-1] % 128:
+                reason = "block layout is not representable as F8_E4M3_B128"
+        if type(self).modify_tensors not in (Model.modify_tensors, LlamaModel.modify_tensors,
+                                           Qwen2MoeModel.modify_tensors, DeepseekV2Model.modify_tensors):
+            reason = f"{type(self).__name__} tensor transforms require dequantization"
+        if type(self).modify_tensors is DeepseekV2Model.modify_tensors and name.endswith("kv_b_proj.weight"):
+            reason = "kv_b_proj column transpose requires dequantization"
+        if self.fp8_dequant or reason is not None:
+            logger.info("%s: dequantizing FP8 (%s)", name, "--fp8-dequant" if self.fp8_dequant else reason)
+            return DeepseekV4Model._dequantize_mtp_weight(weight, scale, block_size)
+        codes = weight.view(torch.uint8)
+        if qtype == gguf.GGMLQuantizationType.F8_E4M3_B128:
+            codes = codes.reshape(*weight.shape[:-1], -1, 128)
+            scales = scales.unsqueeze(-1)
+        packed = torch.cat((scales.contiguous().view(torch.uint8), codes), dim=-1)
+        packed = packed.reshape(*weight.shape[:-1], -1)
+        return FP8Tensor(packed, qtype)
+
+    def get_fp8_tensors(self):
+        quant = self.hparams.get("quantization_config") or {}
+        compressed_fp8 = quant.get("quant_method") == "compressed-tensors" and any(
+            (group.get("weights") or {}).get("type") == "float" and (group.get("weights") or {}).get("num_bits") == 8
+            for group in (quant.get("config_groups") or {}).values()
+        )
+        enabled = quant.get("quant_method") == "fp8" or quant.get("quant_algo") == "FP8" or compressed_fp8
+        if not enabled or self.keep_source_dtypes or self.mtp_only:
+            yield from self.get_tensors()
+            return
+        weights: dict[str, Tensor] = {}
+        scales: dict[str, Tensor] = {}
+        for name, data in self.get_tensors():
+            if name.endswith((".input_scale", ".input_scale_inv", ".activation_scale", ".activation_scale_inv",
+                              ".output_scale", ".k_scale", ".v_scale", ".input_zero_point")):
+                continue
+            if name.endswith((".weight_scale", ".weight_scale_inv")):
+                weight_name = name.rsplit(".", 1)[0] + ".weight"
+                scales[weight_name] = data
+            elif data.dtype == torch.float8_e4m3fn:
+                weight_name = name
+                weights[name] = data
+            else:
+                yield name, data
+                continue
+            if weight_name in weights and weight_name in scales:
+                yield weight_name, self._convert_fp8(weight_name, weights.pop(weight_name), scales.pop(weight_name),
+                                                     quant.get("weight_block_size"))
+        if weights or scales:
+            raise ValueError(f"Unpaired FP8 weights: {sorted(weights)}; scales: {sorted(scales)}")
 
     def format_tensor_name(self, key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight") -> str:
         if key not in gguf.MODEL_TENSORS[self.model_arch]:
@@ -273,7 +389,7 @@ class Model:
     def prepare_tensors(self):
         max_name_len = max(len(s) for _, s in self.tensor_map.mapping.values()) + len(".weight,")
 
-        for name, data_torch in chain(self.generate_extra_tensors(), self.get_tensors()):
+        for name, data_torch in chain(self.generate_extra_tensors(), self.get_fp8_tensors()):
             # we don't need these
             if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")):
                 continue
@@ -281,7 +397,7 @@ class Model:
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32) and not self.mtp_only and not self.keep_source_dtypes:
+            if not isinstance(data_torch, FP8Tensor) and data_torch.dtype not in (torch.float16, torch.float32) and not self.mtp_only and not self.keep_source_dtypes:
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -291,10 +407,21 @@ class Model:
                     bid = int(part)
                     break
 
-            for new_name, data in ((
-                n,
-                (d if self.mtp_only and self.model_arch in (gguf.MODEL_ARCH.DEEPSEEK4, gguf.MODEL_ARCH.DEEPSEEK41) and n == "output_hc_scale.weight" else d.squeeze()).numpy(),
-            ) for n, d in self.modify_tensors(data_torch, name, bid)):
+            for new_name, d in self.modify_tensors(data_torch, name, bid):
+                if isinstance(d, FP8Tensor):
+                    data = d.data.numpy()
+                    if self.is_big_endian:
+                        def swap_scales(data, qtype=d.qtype):
+                            data = data.copy()
+                            blocks = data.reshape(-1, 132) if qtype == gguf.GGMLQuantizationType.F8_E4M3_B128 else data
+                            blocks[..., :4] = blocks[..., :4][..., ::-1]
+                            return data
+                        data = gguf.LazyNumpyTensor._wrap_fn(swap_scales, meta_noop=True)(data)
+                    self.gguf_writer.add_tensor(new_name, data, raw_dtype=d.qtype)
+                    self._fp8_types.add(d.qtype)
+                    logger.info("%s, %s --> %s, shape = %s", new_name, old_dtype, d.qtype.name, d.shape[::-1])
+                    continue
+                data = (d if self.mtp_only and self.model_arch in (gguf.MODEL_ARCH.DEEPSEEK4, gguf.MODEL_ARCH.DEEPSEEK41) and new_name == "output_hc_scale.weight" else d.squeeze()).numpy()
                 data: np.ndarray  # type hint
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
@@ -386,6 +513,9 @@ class Model:
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
 
     def prepare_metadata(self, vocab_only: bool):
+        if self._fp8_types:
+            self.ftype = (gguf.LlamaFileType.MOSTLY_F8_E4M3_B128 if gguf.GGMLQuantizationType.F8_E4M3_B128 in self._fp8_types
+                          else gguf.LlamaFileType.MOSTLY_F8_E4M3_KS)
 
         total_params, shared_params, expert_params, expert_count = self.gguf_writer.get_total_parameter_count()
 
@@ -1724,7 +1854,7 @@ class LlamaModel(Model):
                         datas.append(self._experts[bid][ename])
                         del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                    data_torch = FP8Tensor.stack(datas)
 
                     merged_name = f"layers.{bid}.feed_forward.experts.{wid}.weight"
 
@@ -2345,7 +2475,7 @@ class Qwen2MoeModel(Model):
                         datas.append(self._experts[bid][ename])
                         del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                    data_torch = FP8Tensor.stack(datas)
 
                     merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
@@ -5058,7 +5188,7 @@ class DeepseekV2Model(Model):
                         datas.append(self._experts[bid][ename])
                         del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
+                    data_torch = FP8Tensor.stack(datas)
 
                     merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
 
@@ -5433,7 +5563,12 @@ class DeepseekV4Model(DeepseekV2Model):
         return raw.reshape(out_features, n_blocks * 17)
 
     @staticmethod
-    def _dequantize_mtp_weight(weight: Tensor, scale: Tensor) -> Tensor:
+    def _dequantize_mtp_weight(weight: Tensor, scale: Tensor, block_size: Sequence[int] | None = None) -> Tensor:
+        if scale.dtype in (torch.float32, torch.bfloat16, torch.float16):
+            scale_f, block_cols = Model._fp8_scale_rows(weight, scale, block_size)
+            if block_cols is not None:
+                scale_f = scale_f.repeat_interleave(block_cols, dim=-1)[..., :weight.shape[-1]]
+            return weight.float() * scale_f
         if len(weight.shape) != 2 or len(scale.shape) != 2:
             return weight
 
@@ -7543,6 +7678,7 @@ class LazyTorchTensor(gguf.LazyBase):
     _dtype_map: dict[torch.dtype, type] = {
         torch.float16: np.float16,
         torch.float32: np.float32,
+        torch.uint8: np.uint8,
     }
 
     # used for safetensors slices
@@ -7613,6 +7749,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q6_0", "auto"], default="f16",
         help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, q4_0, q4_1, q5_0, q5_1, q6_0 for a smaller conversion to then create an iMatrix file for example, and auto for the highest-fidelity 16-bit float type depending on the first loaded tensor type",
+    )
+    parser.add_argument(
+        "--fp8-dequant", action="store_true",
+        help="dequantize FP8 checkpoint weights to --outtype instead of preserving FP8 codes and scales",
     )
     parser.add_argument(
         "--bigendian", action="store_true",
@@ -8036,7 +8176,7 @@ def main() -> None:
                                      split_max_tensors=args.split_max_tensors,
                                      split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
                                      small_first_shard=args.no_tensor_first_split,
-                                     target_model_dir=args.target_model_dir)
+                                     target_model_dir=args.target_model_dir, fp8_dequant=args.fp8_dequant)
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")
