@@ -282,6 +282,9 @@ static bool launch_f8_pp(int shared_limit, int n, int rows, int cols, int ldc, c
 template <typename layout>
 static bool launch_f8_pp(int cc, int shared_limit, int n, int rows, int cols, int ldc, const char * x, const half * y, float * z, cudaStream_t stream) {
     if (cc >= 1200) {
+        if constexpr (std::is_same_v<layout, ggml_cuda_f8_block>) {
+            return launch_f8_pp<layout, 128, 8, 1, 128>(shared_limit, n, rows, cols, ldc, x, y, z, stream);
+        }
         return launch_f8_pp<layout, 128, 8, 2, 64>(shared_limit, n, rows, cols, ldc, x, y, z, stream);
     } else if (cc == CC_ADA_LOVELACE && std::is_same_v<layout, ggml_cuda_f8_block>) {
         return launch_f8_pp<layout, 128, 8, 1, 128>(shared_limit, n, rows, cols, ldc, x, y, z, stream);
