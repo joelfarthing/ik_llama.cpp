@@ -1656,7 +1656,11 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(float) + 128,
         .is_quantized             = false,
         .to_float                 = ggml_fp8_e4m3_b128_to_fp32_row,
+#ifdef IQK_IMPLEMENT
+        .vec_dot                  = iqk_vec_dot_f8_e4m3_b128,
+#else
         .vec_dot                  = ggml_vec_dot_f8_e4m3_b128,
+#endif
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
@@ -1666,8 +1670,13 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(ggml_fp8_e4m3_t),
         .is_quantized             = false,
         .to_float                 = ggml_fp8_e4m3_ks_to_fp32_row,
+#ifdef IQK_IMPLEMENT
+        .vec_dot                  = iqk_vec_dot_f8_e4m3_ks,
+        .vec_dot_type             = GGML_TYPE_F32,
+#else
         .vec_dot                  = ggml_vec_dot_f8_e4m3_ks,
         .vec_dot_type             = GGML_TYPE_BF16,
+#endif
         .row_meta_size            = sizeof(float),
         .nrows                    = 1,
     },
@@ -19079,7 +19088,7 @@ static int ggml_compute_forward_mul_mat(
     //   compute by src0 rows
 
 #if GGML_USE_IQK_MULMAT
-    if (type != GGML_TYPE_F8_E4M3_B128 && dst->type == GGML_TYPE_F32) {
+    if (dst->type == GGML_TYPE_F32) {
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,

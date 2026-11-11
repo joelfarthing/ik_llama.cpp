@@ -1141,4 +1141,142 @@ void iqk_gemm_default_floats(int D, int nq, const char * cx, size_t bx, DataInfo
 
 #endif
 
+namespace {
+
+#ifdef __x86_64__
+using F8Base = QFBase;
+#else
+using F8Base = QF32Base;
+#endif
+
+struct F8 : F8Base {
+    static inline float decode(uint8_t x) {
+        const uint32_t mag = x & 127;
+        float value = mag * (1.0f/512);
+        uint32_t bits;
+        memcpy(&bits, &value, sizeof(bits));
+        if (mag >= 8) bits = (mag << 20) + (120u << 23);
+        if (mag == 127) bits = 0x7fc00000;
+        bits |= uint32_t(x & 128) << 24;
+        memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+#if defined __AVX512F__
+    static inline Data zero() { return _mm512_setzero_ps(); }
+    static inline Data decode(const uint8_t * x) {
+        const auto q = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)x));
+        const auto mag = _mm512_and_si512(q, _mm512_set1_epi32(127));
+        const auto sign = _mm512_slli_epi32(_mm512_and_si512(q, _mm512_set1_epi32(128)), 24);
+        auto v = _mm512_castsi512_ps(_mm512_add_epi32(_mm512_slli_epi32(mag, 20), _mm512_set1_epi32(120 << 23)));
+        const auto sub = _mm512_mul_ps(_mm512_cvtepi32_ps(mag), _mm512_set1_ps(1.0f/512));
+        v = _mm512_mask_mov_ps(v, _mm512_cmplt_epi32_mask(mag, _mm512_set1_epi32(8)), sub);
+        v = _mm512_mask_mov_ps(v, _mm512_cmpeq_epi32_mask(mag, _mm512_set1_epi32(127)),
+                _mm512_castsi512_ps(_mm512_set1_epi32(0x7fc00000)));
+        return _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(v), sign));
+    }
+    static inline Data add(Data a, Data b) { return _mm512_add_ps(a, b); }
+#elif defined __AVX2__
+    static inline Data zero() { return _mm256_setzero_ps(); }
+    static inline Data decode(const uint8_t * x) {
+        const auto q = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)x));
+        const auto mag = _mm256_and_si256(q, _mm256_set1_epi32(127));
+        const auto sign = _mm256_slli_epi32(_mm256_and_si256(q, _mm256_set1_epi32(128)), 24);
+        auto v = _mm256_castsi256_ps(_mm256_add_epi32(_mm256_slli_epi32(mag, 20), _mm256_set1_epi32(120 << 23)));
+        const auto sub = _mm256_mul_ps(_mm256_cvtepi32_ps(mag), _mm256_set1_ps(1.0f/512));
+        v = _mm256_blendv_ps(v, sub, _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(8), mag)));
+        v = _mm256_blendv_ps(v, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fc00000)),
+                _mm256_castsi256_ps(_mm256_cmpeq_epi32(mag, _mm256_set1_epi32(127))));
+        return _mm256_castsi256_ps(_mm256_or_si256(_mm256_castps_si256(v), sign));
+    }
+    static inline Data add(Data a, Data b) { return _mm256_add_ps(a, b); }
+#else
+    static inline Data zero() { return vdupq_n_f32(0); }
+    static inline Data decode(const uint8_t * x) {
+        uint32_t packed;
+        memcpy(&packed, x, sizeof(packed));
+        const auto q = vmovl_u16(vget_low_u16(vmovl_u8(vcreate_u8(packed))));
+        const auto mag = vandq_u32(q, vdupq_n_u32(127));
+        const auto sign = vshlq_n_u32(vandq_u32(q, vdupq_n_u32(128)), 24);
+        auto v = vreinterpretq_f32_u32(vaddq_u32(vshlq_n_u32(mag, 20), vdupq_n_u32(120 << 23)));
+        const auto sub = vmulq_n_f32(vcvtq_f32_u32(mag), 1.0f/512);
+        v = vbslq_f32(vcltq_u32(mag, vdupq_n_u32(8)), sub, v);
+        v = vbslq_f32(vceqq_u32(mag, vdupq_n_u32(127)), vreinterpretq_f32_u32(vdupq_n_u32(0x7fc00000)), v);
+        return vreinterpretq_f32_u32(vorrq_u32(vreinterpretq_u32_f32(v), sign));
+    }
+    static inline Data add(Data a, Data b) { return vaddq_f32(a, b); }
+#endif
+};
+
+template <bool block_scaled, int nrc_y, bool row_scaled = false>
+void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    const float * y[nrc_y];
+    for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const float *)info.src1_row(iy);
+    const int block_size = block_scaled ? 128 : n;
+    for (int ix = 0; ix < nrc_x; ++ix) {
+        const auto * x = (const uint8_t *)vx + ix*bx;
+        float sum[nrc_y] = {};
+        for (int ib = 0; ib < n; ib += block_size) {
+            float scale = 1;
+            if constexpr (block_scaled || row_scaled) memcpy(&scale, x, sizeof(scale));
+            x += sizeof(float);
+            F8::Data acc[nrc_y][2];
+            for (int iy = 0; iy < nrc_y; ++iy) acc[iy][0] = acc[iy][1] = F8::zero();
+            int i = 0;
+            for (; i + 2*F8::k_step <= block_size; i += 2*F8::k_step) {
+                const auto x0 = F8::decode(x + i);
+                const auto x1 = F8::decode(x + i + F8::k_step);
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    acc[iy][0] = F8::acc(acc[iy][0], x0, F8::load(y[iy] + ib + i));
+                    acc[iy][1] = F8::acc(acc[iy][1], x1, F8::load(y[iy] + ib + i + F8::k_step));
+                }
+            }
+            for (; i + F8::k_step <= block_size; i += F8::k_step) {
+                const auto xv = F8::decode(x + i);
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    acc[iy][0] = F8::acc(acc[iy][0], xv, F8::load(y[iy] + ib + i));
+                }
+            }
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                float partial = F8::hsum(F8::add(acc[iy][0], acc[iy][1]));
+                for (int j = i; j < block_size; ++j) partial += F8::decode(x[j]) * y[iy][ib + j];
+                sum[iy] += partial * scale;
+            }
+            x += block_size;
+        }
+        for (int iy = 0; iy < nrc_y; ++iy) info.store(ix, iy, sum[iy]);
+    }
+}
+
+}
+
+bool iqk_set_kernels_f8(int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, bool scale_ks) {
+    if (typeB != GGML_TYPE_F32) return false;
+    if (typeA == GGML_TYPE_F8_E4M3_KS) {
+        if (scale_ks) {
+            IQK_SET_MUL_MAT_FUNCTIONS_T2(mul_mat_f8, false, true, kernels);
+        } else {
+            IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_f8, false, kernels);
+        }
+        return true;
+    }
+    if (typeA == GGML_TYPE_F8_E4M3_B128) {
+        IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_f8, true, kernels);
+        return true;
+    }
+    return false;
+}
+
+extern "C" IQK_API void iqk_vec_dot_f8_e4m3_ks(int n, float * s, size_t, const void * x, size_t bx,
+        const void * y, size_t by, int) {
+    const DataInfo info{s, (const char *)y, 0, by, 0, 1, nullptr, 0};
+    mul_mat_f8<false, 1>(n, x, bx, info, 1);
+}
+
+extern "C" IQK_API void iqk_vec_dot_f8_e4m3_b128(int n, float * s, size_t, const void * x, size_t bx,
+        const void * y, size_t by, int) {
+    const DataInfo info{s, (const char *)y, 0, by, 0, 1, nullptr, 0};
+    mul_mat_f8<true, 1>(n, x, bx, info, 1);
+}
+
 #endif
