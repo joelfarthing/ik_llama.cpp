@@ -10,7 +10,7 @@
 
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
-template <cpy_kernel_t cpy_1, typename f8_dst_t = void, typename index_t = std::conditional_t<std::is_same_v<f8_dst_t, void>, int, int64_t>>
+template <cpy_kernel_t cpy_1, typename f8_dst_t = void, typename index_t = std::conditional_t<std::is_same_v<f8_dst_t, void>, int, int64_t>, bool blocked = false>
 static __global__ void cpy_flt(const char * cx, char * cdst_direct, const index_t ne,
                                const index_t ne00, const index_t ne01, const index_t ne02, const index_t nb00, const index_t nb01, const index_t nb02,
                                const index_t nb03, const index_t ne10, const index_t ne11, const index_t ne12, const index_t nb10, const index_t nb11,
@@ -37,7 +37,17 @@ static __global__ void cpy_flt(const char * cx, char * cdst_direct, const index_
     const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
     const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
 
-    if constexpr (std::is_same_v<f8_dst_t, void>) {
+    if constexpr (blocked) {
+        const char * block = cx + i03*nb03 + i02*nb02 + i01*nb01 + (i00/128)*nb00;
+        if constexpr (std::is_same_v<f8_dst_t, ggml_fp8_e4m3_t>) {
+            char * dst_block = cdst + i13*nb13 + i12*nb12 + i11*nb11 + (i10/128)*nb10;
+            dst_block[4+i10%128] = block[4+i00%128];
+            if (i00%128 == 0) memcpy(dst_block, block, sizeof(float));
+        } else {
+            const float v = ggml_cuda_f8_value<ggml_cuda_f8_row>(block, i00%128);
+            *(f8_dst_t *)(cdst + dst_offset) = ggml_cuda_cast<f8_dst_t>(v);
+        }
+    } else if constexpr (std::is_same_v<f8_dst_t, void>) {
         cpy_1(cx + x_offset, cdst + dst_offset);
     } else if constexpr (std::is_same_v<f8_dst_t, ggml_fp8_e4m3_t>) {
         cdst[dst_offset + sizeof(float)] = cx[x_offset + sizeof(float)];
@@ -586,6 +596,27 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
             }
         }
+    } else if (src0->type == GGML_TYPE_F8_E4M3_B128) {
+        const int num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+        if (src1->type == GGML_TYPE_F32) {
+            cpy_flt<nullptr, float, int64_t, true><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(
+                    src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13, dest_ptrs_d, graph_cpynode_index++);
+        } else if (src1->type == GGML_TYPE_F16) {
+            cpy_flt<nullptr, half, int64_t, true><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(
+                    src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13, dest_ptrs_d, graph_cpynode_index++);
+        } else if (src1->type == GGML_TYPE_BF16) {
+            cpy_flt<nullptr, nv_bfloat16, int64_t, true><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(
+                    src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13, dest_ptrs_d, graph_cpynode_index++);
+        } else if (src1->type == GGML_TYPE_F8_E4M3_B128) {
+            cpy_flt<nullptr, ggml_fp8_e4m3_t, int64_t, true><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(
+                    src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
+                    ne10, ne11, ne12, nb10, nb11, nb12, nb13, dest_ptrs_d, graph_cpynode_index++);
+        } else {
+            GGML_ABORT("unsupported F8 copy destination");
+        }
     } else if (src0->type == GGML_TYPE_F8_E4M3_KS) {
         const int num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         if (src1->type == GGML_TYPE_F32) {
@@ -723,6 +754,14 @@ void* ggml_cuda_cpy_fn(const ggml_tensor * src0, ggml_tensor * src1) {
             return (void*) cpy_flt<cpy_1_flt<float, float>>;
         } else {
             return nullptr;
+        }
+    } else if (src0->type == GGML_TYPE_F8_E4M3_B128) {
+        switch (src1->type) {
+            case GGML_TYPE_F32:     return (void *)cpy_flt<nullptr, float, int64_t, true>;
+            case GGML_TYPE_F16:     return (void *)cpy_flt<nullptr, half, int64_t, true>;
+            case GGML_TYPE_BF16:    return (void *)cpy_flt<nullptr, nv_bfloat16, int64_t, true>;
+            case GGML_TYPE_F8_E4M3_B128: return (void *)cpy_flt<nullptr, ggml_fp8_e4m3_t, int64_t, true>;
+            default:               return nullptr;
         }
     } else if (src0->type == GGML_TYPE_F8_E4M3_KS) {
         switch (src1->type) {

@@ -73,6 +73,8 @@ static __global__ void k_get_rows_float(
 
     if constexpr (std::is_same_v<src0_t, ggml_fp8_e4m3_t>) {
         dst_row[i00] = i01 >= 0 && i01 < ne01 ? dst_t(ggml_cuda_f8_value<ggml_cuda_f8_row>(src0_row, i00)) : dst_t(0);
+    } else if constexpr (std::is_same_v<src0_t, ggml_cuda_f8_block>) {
+        dst_row[i00] = i01 >= 0 && i01 < ne01 ? dst_t(ggml_cuda_f8_value<ggml_cuda_f8_block>(src0_row, i00)) : dst_t(0);
     } else {
         dst_row[i00] = i01 >= 0 && i01 < ne01 ? dst_t(src0_row[i00]) : dst_t(0);
     }
@@ -183,6 +185,17 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
+
+    if (src0->type == GGML_TYPE_F8_E4M3_B128) {
+        if (dst->type == GGML_TYPE_F16) {
+            get_rows_cuda_float(src0, src1, dst, (const ggml_cuda_f8_block *)src0->data,
+                    (const int32_t *)src1->data, (half *)dst->data, stream);
+        } else {
+            get_rows_cuda_float(src0, src1, dst, (const ggml_cuda_f8_block *)src0->data,
+                    (const int32_t *)src1->data, (float *)dst->data, stream);
+        }
+        return;
+    }
 
     if (src0->type == GGML_TYPE_F8_E4M3_KS) {
         if (dst->type == GGML_TYPE_F16) {
