@@ -19087,8 +19087,14 @@ static int ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
+#if defined(__aarch64__)
+    const bool use_iqk = ne11 != 1 || (type != GGML_TYPE_F8_E4M3_KS && type != GGML_TYPE_F8_E4M3_B128);
+#else
+    const bool use_iqk = true;
+#endif
+
 #if GGML_USE_IQK_MULMAT
-    if (dst->type == GGML_TYPE_F32) {
+    if (use_iqk && dst->type == GGML_TYPE_F32) {
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,
@@ -19157,7 +19163,7 @@ static int ggml_compute_forward_mul_mat(
 
     const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
 
-    if (src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
+    if (use_iqk && src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, row_size*ne11, row_size*ne11*ne12,
