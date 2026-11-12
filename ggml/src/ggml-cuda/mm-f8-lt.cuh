@@ -124,7 +124,8 @@ struct ggml_cuda_f8_lt_context {
                 auto check = cublasLtMatmulAlgoCheck(handle, p->op, p->a, p->b, p->d, p->d, &results[i].algo, &checked);
                 if (check != CUBLAS_STATUS_SUCCESS || checked.state != CUBLAS_STATUS_SUCCESS || checked.workspaceSize > workspace_size) continue;
                 results[i].workspaceSize = checked.workspaceSize;
-                const bool candidate_preferred = attribute(results[i].algo, CUBLASLT_ALGO_CONFIG_ID) == 35 &&
+                const bool candidate_preferred = ggml_cuda_info().devices[device].cc == CC_ADA_LOVELACE &&
+                    attribute(results[i].algo, CUBLASLT_ALGO_CONFIG_ID) == 35 &&
                     attribute(results[i].algo, CUBLASLT_ALGO_CONFIG_TILE_ID) == CUBLASLT_MATMUL_TILE_128x128 &&
                     attribute(results[i].algo, CUBLASLT_ALGO_CONFIG_STAGES_ID) == CUBLASLT_MATMUL_STAGES_64x3;
                 if (selected < 0 || candidate_preferred > preferred ||
