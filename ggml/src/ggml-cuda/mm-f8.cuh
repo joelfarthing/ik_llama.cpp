@@ -305,7 +305,11 @@ static bool launch_f8_pp(int shared_limit, int n, int rows, int cols, int ldc, c
     if (bytes > shared_limit) return false;
     const bool tail = n%BK != 0 || rows%128 != 0 || cols%BN != 0 || uintptr_t(x)%16 != 0 || uintptr_t(y)%16 != 0;
     auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK>;
-    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    if (tail) {
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
+    } else {
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
+    }
     kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN), dim3(32, NW), bytes, stream>>>(n, rows, cols, ldc, x, y, z, {});
     return true;
 }
@@ -362,10 +366,17 @@ static __global__ void f8_moe_tiles(const int32_t * bounds, int32_t * tiles, int
     small[0] = nsmall;
 }
 
-static __global__ void f8_moe_convert(const char * src, half * dst, const int32_t * rows, const int32_t * bounds,
+static __global__ void f8_moe_convert(const char * src, half * dst, const int32_t * rows, const int32_t * bounds, const int32_t * tiles,
         int experts, int n, int slots, int channels, size_t nb1, size_t nb2) {
     const int col = blockIdx.x;
     if (col >= bounds[experts]) return;
+    int expert = 0, hi = experts;
+    while (expert + 1 < hi) {
+        const int mid = (expert+hi)/2;
+        if (bounds[mid] <= col) expert = mid;
+        else hi = mid;
+    }
+    if (tiles[expert] == tiles[expert+1]) return;
     const int row = rows[col];
     const float * input = (const float *)(src + size_t(row/slots)*nb2 + size_t(row%slots%channels)*nb1);
     for (int j = threadIdx.x; j < n; j += blockDim.x) dst[size_t(col)*n+j] = __float2half(input[j]);
@@ -377,7 +388,11 @@ static void launch_f8_moe(int n, int rows, int cols, const char * x, const half 
     constexpr int bytes = f8_pp_shared<BN, stages, BK>();
     const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0 || routing.expert_stride%16 != 0;
     auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, true> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, true>;
-    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    if (tail) {
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
+    } else {
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
+    }
     kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN+routing.experts), dim3(32,NW), bytes, stream>>>(
             n, rows, cols, rows, x, y, z, routing);
 }

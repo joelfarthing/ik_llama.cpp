@@ -1256,7 +1256,13 @@ void mul_mat_f8_b128_bf16(int n, const void * vx, size_t bx, const DataInfo& inf
                     for (int j = 0; j < 4; ++j) vst1_u16(weights[row] + i + 4*j, vshrn_n_u32(vreinterpretq_u32_f32(values.val[j]), 16));
                 }
             }
-            mul_mat_Qx_Qy_T<F8QF32<nrc_y>, QBF16>(128, weights, sizeof(weights[0]), local, nx);
+            if constexpr (nrc_y == 8) {
+                mul_mat_Qx_Qy_T<F8QF32<4>, QBF16>(128, weights, sizeof(weights[0]), local, nx);
+                const DataInfo next{partial + 4*tile, (const char *)(y + 4), tile, 0, 0, 1, nullptr, 0};
+                mul_mat_Qx_Qy_T<F8QF32<4>, QBF16>(128, weights, sizeof(weights[0]), next, nx);
+            } else {
+                mul_mat_Qx_Qy_T<F8QF32<nrc_y>, QBF16>(128, weights, sizeof(weights[0]), local, nx);
+            }
             for (int iy = 0; iy < nrc_y; ++iy) {
                 for (int row = 0; row < nx; ++row) sum[iy*tile + row] += partial[iy*tile + row]*scale[row];
                 y[iy] += 128;
@@ -1274,10 +1280,7 @@ template <bool block_scaled, int nrc_y, bool row_scaled = false>
 void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
 #ifndef __x86_64__
     if constexpr (block_scaled && nrc_y == 8) {
-        mul_mat_f8_b128_bf16<4>(n, vx, bx, info, nrc_x);
-        auto next = info;
-        next.cur_y += 4;
-        mul_mat_f8_b128_bf16<4>(n, vx, bx, next, nrc_x);
+        mul_mat_f8_b128_bf16<8>(n, vx, bx, info, nrc_x);
         return;
     }
 #endif

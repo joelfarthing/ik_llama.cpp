@@ -355,12 +355,38 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     files.emplace_back(new llama_file(fname.c_str(), "rb"));
     contexts.emplace_back(ctx);
 
+    auto add_weights = [&](ggml_context * tensor_ctx, gguf_context * gguf_ctx, uint16_t idx) {
+        const int count = gguf_get_n_tensors(gguf_ctx);
+        std::vector<size_t> tensor_ends;
+        for (int i = 0; i < count; ++i) {
+            if (gguf_get_tensor_type(gguf_ctx, i) != GGML_TYPE_F8_E4M3) continue;
+            std::vector<std::pair<size_t, int>> offsets;
+            offsets.reserve(count);
+            for (int j = 0; j < count; ++j) {
+                offsets.emplace_back(gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, j), j);
+            }
+            std::sort(offsets.begin(), offsets.end());
+            tensor_ends.resize(count);
+            size_t end = files.back()->size();
+            for (int j = count; j > 0;) {
+                const size_t offset = offsets[j-1].first;
+                do {
+                    --j;
+                    tensor_ends[offsets[j].second] = end;
+                } while (j > 0 && offsets[j-1].first == offset);
+                end = std::min(end, offset);
+            }
+            break;
+        }
+        for (ggml_tensor * cur = ggml_get_first_tensor(tensor_ctx); cur; cur = ggml_get_next_tensor(tensor_ctx, cur)) {
+            weights.emplace_back(files.back().get(), idx, cur->name, gguf_ctx, cur, tensor_ends);
+        }
+    };
+
     // Save tensors data offset of the main file.
     // For subsidiary files, `meta` tensor data offset must not be used,
     // so we build a unified tensors index for weights.
-    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-        weights.emplace_back(files.back().get(), 0, cur->name, meta, cur);
-    }
+    add_weights(ctx, meta, 0);
     uint16_t n_split = 0;
     get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
 
@@ -431,9 +457,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
             contexts.emplace_back(ctx);
 
             // Save tensors data offset info of the shard.
-            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-                weights.emplace_back(files.back().get(), idx, cur->name, ctx_gguf, cur);
-            }
+            add_weights(ctx, ctx_gguf, idx);
 
             gguf_free(ctx_gguf);
         }
@@ -462,9 +486,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         ngram_file_idx = (int) files.size();
         files.emplace_back(new llama_file(ngram_fname.c_str(), "rb"));
         contexts.emplace_back(ctx_ngram);
-        for (ggml_tensor * cur = ggml_get_first_tensor(ctx_ngram); cur; cur = ggml_get_next_tensor(ctx_ngram, cur)) {
-            weights.emplace_back(files.back().get(), ngram_file_idx, cur->name, gguf_ngram, cur);
-        }
+        add_weights(ctx_ngram, gguf_ngram, ngram_file_idx);
         gguf_free(gguf_ngram);
     }
 

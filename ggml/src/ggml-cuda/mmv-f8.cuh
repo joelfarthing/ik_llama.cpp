@@ -134,7 +134,8 @@ static __global__ void mul_mat_vec_f8_e4m3_b128(int n, int ldc, const void * x,
     if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + blockIdx.x] = sum;
 }
 
-static __global__ void mul_mat_vec_f8_e4m3_b128_id(int n, int experts, int channels,
+template <bool blocked>
+static __global__ void mul_mat_vec_f8_e4m3_id(int n, int experts, int channels,
         const char * x, const char * y, const char * ids, char * z,
         size_t nb01, size_t nb02, size_t nb11, size_t nb12, size_t nbi0, size_t nbi1, size_t nb1, size_t nb2) {
     const int slot = blockIdx.y;
@@ -143,14 +144,16 @@ static __global__ void mul_mat_vec_f8_e4m3_b128_id(int n, int experts, int chann
     if (expert < 0 || expert >= experts) return;
     const void * row = x + size_t(expert)*nb02 + size_t(blockIdx.x)*nb01;
     const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
-    const float sum = dot_f8_e4m3_b128(n, row, a);
+    float sum;
+    if constexpr (blocked) sum = dot_f8_e4m3_b128(n, row, a);
+    else sum = dot_f8_e4m3<ggml_cuda_f8_row>(n, row, a);
     if (threadIdx.x == 0) *(float *)(z + size_t(token)*nb2 + size_t(slot)*nb1 + blockIdx.x*sizeof(float)) = sum;
 }
 
 template <bool blocked>
 static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int experts, int channels,
         const char * up, const char * gate, const char * y, const char * ids,
-        const char * bias_up, const char * bias_gate, float * u, float * g,
+        const char * bias_up, const char * bias_gate, float * dst, ggml_unary_op unary, float limit,
         size_t nbu1, size_t nbu2, size_t nbg1, size_t nbg2, size_t nb11, size_t nb12,
         size_t nbi0, size_t nbi1, size_t nbbu1, size_t nbbg1) {
     const int slot = blockIdx.y;
@@ -159,7 +162,7 @@ static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int exper
     const int expert = *(const int *)(ids + size_t(token)*nbi1 + size_t(slot)*nbi0);
     const size_t out = (size_t(token)*gridDim.y + slot)*rows + row;
     if (expert < 0 || expert >= experts) {
-        if (threadIdx.x == 0) u[out] = g[out] = 0;
+        if (threadIdx.x == 0) dst[out] = 0;
         return;
     }
     const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
@@ -174,7 +177,26 @@ static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int exper
     if (threadIdx.x == 0) {
         if (bias_up) su += ((const float *)(bias_up + size_t(expert)*nbbu1))[row];
         if (bias_gate) sg += ((const float *)(bias_gate + size_t(expert)*nbbg1))[row];
-        u[out] = su;
-        g[out] = sg;
+        switch (unary) {
+            case GGML_UNARY_OP_SILU:
+                if (limit < 1e-6f) dst[out] = sg * su / (1.0f + expf(-sg));
+                else dst[out] = min(sg / (1.0f + expf(-sg)), limit) * max(-limit, min(limit, su));
+                break;
+            case GGML_UNARY_OP_RELU:
+                dst[out] = fmaxf(sg, 0) * su;
+                break;
+            case GGML_UNARY_OP_GELU:
+                dst[out] = 0.5f*sg*su*(1.0f + tanhf(0.79788456080286535587989211986876f*sg*(1.0f + 0.044715f*sg*sg)));
+                break;
+            case GGML_UNARY_OP_SIGMOID:
+                dst[out] = su / (1.0f + expf(-sg));
+                break;
+            case GGML_UNARY_OP_SWIGLU_OAI:
+                sg = fminf(sg, 7.0f);
+                su = fmaxf(fminf(su, 7.0f), -7.0f);
+                dst[out] = (sg / (1.0f + expf(-sg * 1.702f))) * (1.0f + su);
+                break;
+            default: assert(false);
+        }
     }
 }

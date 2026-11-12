@@ -74,16 +74,12 @@ struct llama_model_loader {
         std::vector<float> f8_scale;
         bool mxfp4_repack = false;
 
-        llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const char * name, const struct gguf_context * gguf_ctx, ggml_tensor * tensor, const std::vector<size_t> & tensor_ends) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx, name);
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
 
             if (tensor->type == GGML_TYPE_F8_E4M3) {
-                size_t end = file->size();
-                for (int i = 0; i < gguf_get_n_tensors(gguf_ctx); ++i) {
-                    const size_t next = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, i);
-                    if (next > offs && next < end) end = next;
-                }
+                const size_t end = tensor_ends[tensor_idx];
                 const size_t size = ggml_nbytes(tensor);
                 const size_t alignment = gguf_get_alignment(gguf_ctx);
                 const size_t padded = GGML_PAD(size, alignment);
