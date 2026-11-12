@@ -658,7 +658,7 @@ static void ggml_fp8_e4m3_to_fp32_row(const void * vx, float * y, int64_t n) {
 static void ggml_fp8_e4m3_ks_to_fp32_row(const void * vx, float * y, int64_t n) {
     float scale;
     memcpy(&scale, vx, sizeof(scale));
-    ggml_fp8_e4m3_to_fp32_row((const char *)vx + sizeof(scale), y, n);
+    ggml_fp8_e4m3_to_fp32_row((const char *)vx + ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).row_meta_size, y, n);
     for (int64_t i = 0; i < n; ++i) y[i] *= scale;
 }
 
@@ -666,7 +666,10 @@ static void ggml_fp8_e4m3_b128_to_fp32_row(const void * vx, float * y, int64_t n
     const char * x = vx;
     assert(n % 128 == 0);
     for (int64_t i = 0; i < n; i += 128) {
-        ggml_fp8_e4m3_ks_to_fp32_row(x, y + i, 128);
+        float scale;
+        memcpy(&scale, x, sizeof(scale));
+        ggml_fp8_e4m3_to_fp32_row(x + sizeof(scale), y + i, 128);
+        for (int j = 0; j < 128; ++j) y[i + j] *= scale;
         x += sizeof(float) + 128;
     }
 }
@@ -1677,7 +1680,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .vec_dot                  = ggml_vec_dot_f8_e4m3_ks,
         .vec_dot_type             = GGML_TYPE_BF16,
 #endif
-        .row_meta_size            = sizeof(float),
+        .row_meta_size            = 16,
         .nrows                    = 1,
     },
     [GGML_TYPE_BF16] = {
@@ -3478,7 +3481,7 @@ static void ggml_vec_dot_f8_e4m3(int n, float * restrict s, size_t bs, const voi
 }
 
 static void ggml_vec_dot_f8_e4m3_ks(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
-    ggml_vec_dot_f8_e4m3(n, s, bs, (const char *)vx + sizeof(float), bx, vy, by, nrc);
+    ggml_vec_dot_f8_e4m3(n, s, bs, (const char *)vx + type_traits[GGML_TYPE_F8_E4M3_KS].row_meta_size, bx, vy, by, nrc);
     float scale;
     memcpy(&scale, vx, sizeof(scale));
     *s *= scale;
@@ -13830,7 +13833,7 @@ static void ggml_compute_forward_dup_f8_e4m3(const struct ggml_compute_params * 
         }
         float scale;
         memcpy(&scale, (const char *)src->data + so - (i % src->ne[0])*src->nb[0], sizeof(scale));
-        const float value = ggml_table_f8_e4m3[*((const uint8_t *)src->data + so + sizeof(float))] * scale;
+        const float value = ggml_table_f8_e4m3[*((const uint8_t *)src->data + so + type_traits[src->type].row_meta_size)] * scale;
         char * out = (char *)dst->data + dest;
         if (dst->type == GGML_TYPE_F32) {
             *(float *)out = value;

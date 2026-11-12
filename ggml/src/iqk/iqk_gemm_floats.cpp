@@ -1290,7 +1290,7 @@ void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc
         for (int ib = 0; ib < n; ib += block_size) {
             float scale = 1;
             if constexpr (block_scaled || row_scaled) memcpy(&scale, x, sizeof(scale));
-            x += sizeof(float);
+            x += block_scaled ? sizeof(float) : ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).row_meta_size;
             F8::Data acc[nrc_y][2];
             for (int iy = 0; iy < nrc_y; ++iy) acc[iy][0] = acc[iy][1] = F8::zero();
             int i = 0;

@@ -127,7 +127,7 @@ def dequantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
     elif qtype == GGMLQuantizationType.F8_E4M3:
         return fp8_e4m3_to_fp32(data)
     elif qtype == GGMLQuantizationType.F8_E4M3_KS:
-        return fp8_e4m3_to_fp32(data[..., 4:]) * data[..., :4].copy().view(np.float32)
+        return fp8_e4m3_to_fp32(data[..., GGML_ROW_META_SIZES[qtype]:]) * data[..., :4].copy().view(np.float32)
     elif qtype == GGMLQuantizationType.F8_E4M3_B128:
         blocks = data.reshape((*data.shape[:-1], -1, 132))
         values = fp8_e4m3_to_fp32(blocks[..., 4:]) * blocks[..., :4].copy().view(np.float32)

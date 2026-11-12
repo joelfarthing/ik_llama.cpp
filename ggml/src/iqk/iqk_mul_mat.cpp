@@ -511,7 +511,7 @@ static work_buffer_t & thread_local_work_buffer() {
 bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x) {
     if (typeA == GGML_TYPE_F8_E4M3_KS) {
         for (int row = 0; row < nrc_x; ++row) {
-            ggml_fp8_e4m3_to_bf16_row((const ggml_fp8_e4m3_t *)((const char *)vx + row*bx + sizeof(float)),
+            ggml_fp8_e4m3_to_bf16_row((const ggml_fp8_e4m3_t *)((const char *)vx + row*bx + ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).row_meta_size),
                     (ggml_bf16_t *)vy + row*stride_y, n);
         }
         return true;

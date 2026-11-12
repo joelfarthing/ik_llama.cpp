@@ -1512,8 +1512,10 @@ static void read_nvfp4_rows(const llama_model_loader::llama_tensor_weight & w, c
         }
         return;
     }
+    const size_t row_meta = ggml_internal_get_type_traits(cur->type).row_meta_size;
     for (int r = 0; r < nrows; ++r) {
-        memmove(dst + r*row_out + sizeof(float), src + r*row_in, row_in);
+        memmove(dst + r*row_out + row_meta, src + r*row_in, row_in);
+        memset(dst + r*row_out + sizeof(float), 0, row_meta - sizeof(float));
         memcpy(dst + r*row_out, &scales[((r0 + r)/ne1) % n_scale], sizeof(float));
     }
 }

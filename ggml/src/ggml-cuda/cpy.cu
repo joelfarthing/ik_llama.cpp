@@ -44,14 +44,14 @@ static __global__ void cpy_flt(const char * cx, char * cdst_direct, const index_
             dst_block[4+i10%128] = block[4+i00%128];
             if (i00%128 == 0) memcpy(dst_block, block, sizeof(float));
         } else {
-            const float v = ggml_cuda_f8_value<ggml_cuda_f8_row>(block, i00%128);
+            const float v = ggml_cuda_f8_value<ggml_cuda_f8_block>(block, i00%128);
             *(f8_dst_t *)(cdst + dst_offset) = ggml_cuda_cast<f8_dst_t>(v);
         }
     } else if constexpr (std::is_same_v<f8_dst_t, void>) {
         cpy_1(cx + x_offset, cdst + dst_offset);
     } else if constexpr (std::is_same_v<f8_dst_t, ggml_fp8_e4m3_t>) {
-        cdst[dst_offset + sizeof(float)] = cx[x_offset + sizeof(float)];
-        if (i00 == 0) memcpy(cdst + dst_offset, cx + x_offset, sizeof(float));
+        cdst[dst_offset + ggml_cuda_f8_row::row_meta_size] = cx[x_offset + ggml_cuda_f8_row::row_meta_size];
+        if (i00 == 0) memcpy(cdst + dst_offset, cx + x_offset, ggml_cuda_f8_row::row_meta_size);
     } else {
         const float v = ggml_cuda_f8_value<ggml_cuda_f8_row>(cx + x_offset - i00*nb00, i00*nb00);
         *(f8_dst_t *)(cdst + dst_offset) = ggml_cuda_cast<f8_dst_t>(v);

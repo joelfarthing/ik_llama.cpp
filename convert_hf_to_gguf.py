@@ -70,7 +70,8 @@ class FP8Tensor:
         if self.qtype == gguf.GGMLQuantizationType.F8_E4M3_B128:
             data = data.reshape(*data.shape[:-1], -1, 132)
         scale = data[..., :4].contiguous().view(torch.float32)
-        return (data[..., 4:].contiguous().view(torch.float8_e4m3fn).float() * scale).reshape(self.shape)
+        offset = gguf.GGML_ROW_META_SIZES.get(self.qtype, 4)
+        return (data[..., offset:].contiguous().view(torch.float8_e4m3fn).float() * scale).reshape(self.shape)
 
     @classmethod
     def stack(cls, tensors):
@@ -269,7 +270,10 @@ class Model:
         if qtype == gguf.GGMLQuantizationType.F8_E4M3_B128:
             codes = codes.reshape(*weight.shape[:-1], -1, 128)
             scales = scales.unsqueeze(-1)
-        packed = torch.cat((scales.contiguous().view(torch.uint8), codes), dim=-1)
+        header = scales.contiguous().view(torch.uint8)
+        if qtype == gguf.GGMLQuantizationType.F8_E4M3_KS:
+            header = torch.nn.functional.pad(header, (0, gguf.GGML_ROW_META_SIZES[qtype] - header.shape[-1]))
+        packed = torch.cat((header, codes), dim=-1)
         packed = packed.reshape(*weight.shape[:-1], -1)
         return FP8Tensor(packed, qtype)
 

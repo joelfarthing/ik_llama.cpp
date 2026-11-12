@@ -2711,7 +2711,7 @@ GGML_ROW_META_SIZES: dict[GGMLQuantizationType, int] = {
     GGMLQuantizationType.IQ3_KS      :  2,
     GGMLQuantizationType.IQ4_KS      :  4,
     GGMLQuantizationType.NVFP4_KS    :  4,
-    GGMLQuantizationType.F8_E4M3_KS  :  4,
+    GGMLQuantizationType.F8_E4M3_KS  : 16,
     GGMLQuantizationType.IQ4_KS_R4   :  4,
     GGMLQuantizationType.IQ4_KSS     :  4,
     GGMLQuantizationType.IQ5_KS      :  4,

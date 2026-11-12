@@ -106,7 +106,7 @@ static __device__ __forceinline__ float dot_f8_e4m3_b128(int n, const void * row
     float sum = 0;
     for (int b = warp; b < n/128; b += blockDim.x/32) {
         const void * block = (const char *)row + size_t(b)*132;
-        const auto * x = ggml_cuda_f8_row::codes(block);
+        const auto * x = ggml_cuda_f8_block::codes(block);
         uint32_t codes;
         if (uintptr_t(x) % alignof(uint32_t) == 0) codes = *(const uint32_t *)(x + 4*lane);
         else memcpy(&codes, x + 4*lane, sizeof(codes));

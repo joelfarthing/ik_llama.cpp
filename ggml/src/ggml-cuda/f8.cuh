@@ -15,28 +15,32 @@ static __device__ __forceinline__ float ggml_cuda_f8_e4m3_to_float(ggml_fp8_e4m3
 }
 
 struct ggml_cuda_f8_row {
+    static constexpr size_t row_meta_size = 16;
     static __device__ __forceinline__ float scale(const void * row, int = 0) {
         float value;
         memcpy(&value, row, sizeof(value));
         return value;
     }
     static __device__ __forceinline__ const ggml_fp8_e4m3_t * codes(const void * row) {
-        return (const ggml_fp8_e4m3_t *)((const char *)row + sizeof(float));
+        return (const ggml_fp8_e4m3_t *)((const char *)row + row_meta_size);
     }
     static __device__ __forceinline__ ggml_fp8_e4m3_t code(const void * row, int col) { return codes(row)[col]; }
     static __device__ __forceinline__ uint16_t pair(const void * row, int col) {
         return *(const uint16_t *)(codes(row) + col);
     }
     static __device__ __forceinline__ float dot_scale(const void *, int) { return 1.0f; }
-    static __host__ __device__ size_t row_size(int n) { return sizeof(float) + n; }
+    static __host__ __device__ size_t row_size(int n) { return row_meta_size + n; }
 };
 
 struct ggml_cuda_f8_block {
+    static __device__ __forceinline__ const ggml_fp8_e4m3_t * codes(const void * block) {
+        return (const ggml_fp8_e4m3_t *)((const char *)block + sizeof(float));
+    }
     static __device__ __forceinline__ float scale(const void * row, int col) {
         return ggml_cuda_f8_row::scale((const char *)row + size_t(col/128)*132);
     }
     static __device__ __forceinline__ ggml_fp8_e4m3_t code(const void * row, int col) {
-        return ggml_cuda_f8_row::code((const char *)row + size_t(col/128)*132, col%128);
+        return codes((const char *)row + size_t(col/128)*132)[col%128];
     }
     static __host__ __device__ size_t row_size(int n) { return size_t(n/128)*132; }
 };

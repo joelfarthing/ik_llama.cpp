@@ -150,7 +150,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     const char * row = x + size_t(first_row+r)*row_bytes;
                     const char * begin;
                     if constexpr (blocked) begin = row + size_t(k0/128)*132 + 4 + k0%128;
-                    else begin = row + 4 + k0;
+                    else begin = row + ggml_cuda_f8_row::row_meta_size + k0;
                     const char * src = (const char *)(uintptr_t(begin) & ~uintptr_t(15)) + 16*j;
                     f8_pp_copy<16>(codes + (s*BM+r)*code_stride + 4*j, src, min(16, int(begin+BK-src)));
                 }
@@ -163,7 +163,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     const char * src = x;
                     if (valid) {
                         if constexpr (blocked) src = row + size_t(k/128)*132 + 4 + k%128;
-                        else src = row + 4 + k;
+                        else src = row + ggml_cuda_f8_row::row_meta_size + k;
                     }
                     if (tail && valid && uintptr_t(src)%4 != 0) {
                         uint32_t v;
@@ -223,7 +223,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     if constexpr (!tail) {
                         const char * ptr = x + size_t(first_row+row)*row_bytes;
                         if constexpr (blocked) ptr += size_t(k0/128)*132 + 4 + k0%128;
-                        else ptr += 4 + k0;
+                        else ptr += ggml_cuda_f8_row::row_meta_size + k0;
                         shift = (uintptr_t(ptr)%16)/2;
                     }
                     const uint16_t v = ((const uint16_t *)(codes + (s*BM+row)*code_stride))[shift+k+at[i].get_j(l)];
