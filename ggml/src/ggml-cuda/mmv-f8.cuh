@@ -54,17 +54,15 @@ static __global__ void mul_mat_vec_f8_e4m3(int n, int ldc, const ggml_fp8_e4m3_t
     if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + blockIdx.x] = sum;
 }
 
-template <int width>
-static __global__ void mul_mat_vec_f8_e4m3_wide(int n, int ldc, const void * vx,
-        const float * y, float * z, size_t nb11) {
-    const int row = blockIdx.x;
-    const void * row_data = (const char *)vx + size_t(row)*ggml_cuda_f8_row::row_size(n);
+template <int width, bool aligned = false, bool warp = false>
+static __device__ __forceinline__ float dot_f8_e4m3_wide(int n, const void * row_data, const float * y) {
     const auto * x = ggml_cuda_f8_row::codes(row_data);
-    y += size_t(blockIdx.y)*nb11;
-    const int peel = (-uintptr_t(x)) % width;
-    const int end = peel + (n - peel)/width*width;
+    const int peel = aligned ? 0 : (-uintptr_t(x)) % width;
+    const int end = aligned ? n : peel + (n - peel)/width*width;
+    const int thread = warp ? threadIdx.x % 32 : threadIdx.x;
+    const int step = warp ? 32 : blockDim.x;
     float sums[width] = {};
-    for (int j = peel + width*threadIdx.x; j < end; j += width*blockDim.x) {
+    for (int j = peel + width*thread; j < end; j += width*step) {
         uint32_t words[width/4];
         if constexpr (width == 16) {
             const uint4 codes = *(const uint4 *)(x + j);
@@ -87,17 +85,30 @@ static __global__ void mul_mat_vec_f8_e4m3_wide(int n, int ldc, const void * vx,
     float sum = 0;
 #pragma unroll
     for (int k = 0; k < width; ++k) sum += sums[k];
-    if (threadIdx.x < peel) sum += ggml_cuda_f8_e4m3_to_float(x[threadIdx.x]) * y[threadIdx.x];
-    const int tail = end + threadIdx.x;
-    if (tail < n) sum += ggml_cuda_f8_e4m3_to_float(x[tail]) * y[tail];
+    if constexpr (!aligned) {
+        if (threadIdx.x < peel) sum += ggml_cuda_f8_e4m3_to_float(x[threadIdx.x]) * y[threadIdx.x];
+        const int tail = end + threadIdx.x;
+        if (tail < n) sum += ggml_cuda_f8_e4m3_to_float(x[tail]) * y[tail];
+    }
     sum = warp_reduce_sum(sum);
-    __shared__ float tmp[8];
-    const int lane = threadIdx.x % 32;
-    if (lane == 0) tmp[threadIdx.x/32] = sum;
-    __syncthreads();
-    sum = lane < blockDim.x/32 ? tmp[lane] : 0;
-    sum = warp_reduce_sum(sum);
-    if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + row] = sum * ggml_cuda_f8_row::scale(row_data);
+    if constexpr (!warp) {
+        __shared__ float tmp[8];
+        const int lane = threadIdx.x % 32;
+        if (lane == 0) tmp[threadIdx.x/32] = sum;
+        __syncthreads();
+        sum = lane < blockDim.x/32 ? tmp[lane] : 0;
+        sum = warp_reduce_sum(sum);
+    }
+    return sum * ggml_cuda_f8_row::scale(row_data);
+}
+
+template <int width, bool aligned = false>
+static __global__ void mul_mat_vec_f8_e4m3_wide(int n, int ldc, const void * vx,
+        const float * y, float * z, size_t nb11) {
+    const int row = blockIdx.x;
+    const void * row_data = (const char *)vx + size_t(row)*ggml_cuda_f8_row::row_size(n);
+    const float sum = dot_f8_e4m3_wide<width, aligned>(n, row_data, y + size_t(blockIdx.y)*nb11);
+    if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + row] = sum;
 }
 
 static __device__ __forceinline__ float dot_f8_e4m3_b128(int n, const void * row, const float * y) {
@@ -134,23 +145,28 @@ static __global__ void mul_mat_vec_f8_e4m3_b128(int n, int ldc, const void * x,
     if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + blockIdx.x] = sum;
 }
 
-template <bool blocked>
+template <bool blocked, bool aligned = false>
 static __global__ void mul_mat_vec_f8_e4m3_id(int n, int experts, int channels,
         const char * x, const char * y, const char * ids, char * z,
-        size_t nb01, size_t nb02, size_t nb11, size_t nb12, size_t nbi0, size_t nbi1, size_t nb1, size_t nb2) {
+        size_t nb01, size_t nb02, size_t nb11, size_t nb12, size_t nbi0, size_t nbi1, size_t nb1, size_t nb2, int rows = 0) {
+    const int r = aligned ? blockIdx.x*(blockDim.x/32) + threadIdx.x/32 : blockIdx.x;
+    if constexpr (aligned) {
+        if (r >= rows) return;
+    }
     const int slot = blockIdx.y;
     const int token = blockIdx.z;
     const int expert = *(const int *)(ids + size_t(token)*nbi1 + size_t(slot)*nbi0);
     if (expert < 0 || expert >= experts) return;
-    const void * row = x + size_t(expert)*nb02 + size_t(blockIdx.x)*nb01;
+    const void * row = x + size_t(expert)*nb02 + size_t(r)*nb01;
     const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
     float sum;
     if constexpr (blocked) sum = dot_f8_e4m3_b128(n, row, a);
+    else if constexpr (aligned) sum = dot_f8_e4m3_wide<16, true, true>(n, row, a);
     else sum = dot_f8_e4m3<ggml_cuda_f8_row>(n, row, a);
-    if (threadIdx.x == 0) *(float *)(z + size_t(token)*nb2 + size_t(slot)*nb1 + blockIdx.x*sizeof(float)) = sum;
+    if (aligned ? threadIdx.x % 32 == 0 : threadIdx.x == 0) *(float *)(z + size_t(token)*nb2 + size_t(slot)*nb1 + r*sizeof(float)) = sum;
 }
 
-template <bool blocked>
+template <bool blocked, bool aligned = false>
 static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int experts, int channels,
         const char * up, const char * gate, const char * y, const char * ids,
         const char * bias_up, const char * bias_gate, float * dst, ggml_unary_op unary, float limit,
@@ -158,11 +174,14 @@ static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int exper
         size_t nbi0, size_t nbi1, size_t nbbu1, size_t nbbg1) {
     const int slot = blockIdx.y;
     const int token = blockIdx.z;
-    const int row = blockIdx.x;
+    const int row = aligned ? blockIdx.x*(blockDim.x/32) + threadIdx.x/32 : blockIdx.x;
+    if constexpr (aligned) {
+        if (row >= rows) return;
+    }
     const int expert = *(const int *)(ids + size_t(token)*nbi1 + size_t(slot)*nbi0);
     const size_t out = (size_t(token)*gridDim.y + slot)*rows + row;
     if (expert < 0 || expert >= experts) {
-        if (threadIdx.x == 0) dst[out] = 0;
+        if (aligned ? threadIdx.x % 32 == 0 : threadIdx.x == 0) dst[out] = 0;
         return;
     }
     const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
@@ -170,11 +189,13 @@ static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int exper
     const void * gr = gate + size_t(expert)*nbg2 + size_t(row)*nbg1;
     float su, sg;
     if constexpr (blocked) su = dot_f8_e4m3_b128(n, ur, a);
+    else if constexpr (aligned) su = dot_f8_e4m3_wide<16, true, true>(n, ur, a);
     else su = dot_f8_e4m3<ggml_cuda_f8_row>(n, ur, a);
-    __syncthreads();
+    if constexpr (!aligned) __syncthreads();
     if constexpr (blocked) sg = dot_f8_e4m3_b128(n, gr, a);
+    else if constexpr (aligned) sg = dot_f8_e4m3_wide<16, true, true>(n, gr, a);
     else sg = dot_f8_e4m3<ggml_cuda_f8_row>(n, gr, a);
-    if (threadIdx.x == 0) {
+    if (aligned ? threadIdx.x % 32 == 0 : threadIdx.x == 0) {
         if (bias_up) su += ((const float *)(bias_up + size_t(expert)*nbbu1))[row];
         if (bias_gate) sg += ((const float *)(bias_gate + size_t(expert)*nbbg1))[row];
         switch (unary) {
