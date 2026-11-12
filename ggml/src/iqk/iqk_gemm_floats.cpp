@@ -1239,7 +1239,8 @@ void mul_mat_f8_b128_bf16(int n, const void * vx, size_t bx, const DataInfo& inf
     for (int ix = 0; ix < nrc_x; ix += tile) {
         const int nx = std::min(tile, nrc_x - ix);
         uint16_t weights[tile][128];
-        float sum[tile*nrc_y] = {}, partial[tile*nrc_y], scale[tile];
+        float sum[tile*nrc_y] = {}, partial[tile*nrc_y];
+        alignas(32) float scale[tile];
         const float * y[nrc_y];
         for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const float *)info.src1_row(iy);
         const DataInfo local{partial, (const char *)y, tile, 0, 0, 1, nullptr, 0};
@@ -1346,7 +1347,7 @@ bool iqk_set_kernels_f8(int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>&
 extern "C" IQK_API void iqk_vec_dot_f8_e4m3_ks(int n, float * s, size_t, const void * x, size_t bx,
         const void * y, size_t by, int) {
     const DataInfo info{s, (const char *)y, 0, by, 0, 1, nullptr, 0};
-    mul_mat_f8<false, 1>(n, x, bx, info, 1);
+    mul_mat_f8<false, 1, true>(n, x, bx, info, 1);
 }
 
 extern "C" IQK_API void iqk_vec_dot_f8_e4m3_b128(int n, float * s, size_t, const void * x, size_t bx,

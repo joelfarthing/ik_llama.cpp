@@ -3479,6 +3479,9 @@ static void ggml_vec_dot_f8_e4m3(int n, float * restrict s, size_t bs, const voi
 
 static void ggml_vec_dot_f8_e4m3_ks(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
     ggml_vec_dot_f8_e4m3(n, s, bs, (const char *)vx + sizeof(float), bx, vy, by, nrc);
+    float scale;
+    memcpy(&scale, vx, sizeof(scale));
+    *s *= scale;
 }
 
 static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t * restrict x, size_t bx, ggml_fp16_t * restrict y, size_t by, int nrc) {
@@ -18993,55 +18996,6 @@ static inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
     return a;
 }
 
-static void ggml_compute_forward_f8_e4m3_scale(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    if (dst->src[0]->type != GGML_TYPE_F8_E4M3_KS) return;
-    ggml_barrier(params->shared);
-    const struct ggml_tensor * src = dst->src[0];
-    const int nc = dst->ne[0];
-    if (dst->op == GGML_OP_MUL_MAT) {
-        const int nblocks = (nc + 63)/64;
-        const int64_t nwork = nblocks*dst->ne[2]*dst->ne[3];
-        for (int64_t work = params->ith; work < nwork; work += params->nth) {
-            const int first = (work % nblocks)*64;
-            const int count = MIN(64, nc - first);
-            const int i2 = (work/nblocks) % dst->ne[2];
-            const int i3 = work/(nblocks*dst->ne[2]);
-            const size_t offset = (i2/(dst->ne[2]/src->ne[2]))*src->nb[2] + (i3/(dst->ne[3]/src->ne[3]))*src->nb[3];
-            float scales[64];
-            for (int j = 0; j < count; ++j) {
-                memcpy(scales + j, (const char *)src->data + offset + (first + j)*src->nb[1], sizeof(float));
-            }
-            for (int i1 = 0; i1 < dst->ne[1]; ++i1) {
-                float * out = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]) + first;
-                ggml_vec_mul_f32(count, out, out, scales);
-            }
-        }
-        return;
-    }
-    const int64_t n = ggml_nelements(dst);
-    const int64_t per_thread = (n + params->nth - 1)/params->nth;
-    const int64_t end = MIN((params->ith + 1)*per_thread, n);
-    for (int64_t i = params->ith*per_thread; i < end;) {
-        const int row = i/nc;
-        const int first = i % nc;
-        const int count = MIN(end - i, nc - first);
-        i += count;
-        const int i1 = row % dst->ne[1];
-        const int i2 = row / dst->ne[1] % dst->ne[2];
-        const int i3 = row / (dst->ne[1]*dst->ne[2]);
-        const struct ggml_tensor * ids = dst->src[2];
-        const int expert = *(const int32_t *)((const char *)ids->data + i1*ids->nb[0] + i2*ids->nb[1]);
-        if (expert < 0 || expert >= src->ne[2]) continue;
-        const size_t offset = expert*src->nb[2];
-        float * out = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
-        for (int j = first; j < first + count; ++j) {
-            float scale;
-            memcpy(&scale, (const char *)src->data + offset + j*src->nb[1], sizeof(scale));
-            out[j] *= scale;
-        }
-    }
-}
-
 static int ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
@@ -27928,12 +27882,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
         case GGML_OP_MUL_MAT:
             {
                 i = ggml_compute_forward_mul_mat(params, tensor, cgraph, i);
-                ggml_compute_forward_f8_e4m3_scale(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
-                ggml_compute_forward_f8_e4m3_scale(params, tensor);
             } break;
         case GGML_OP_MOE_FUSED_UP_GATE:
             {
