@@ -3109,34 +3109,39 @@ static bool ggml_cuda_mul_mat_f8_id(ggml_backend_cuda_context & ctx, const ggml_
     }
     const bool blocked = weight->type == GGML_TYPE_F8_E4M3_B128;
     const int cols = ids->ne[0]*ids->ne[1], experts = weight->ne[2];
-    const int small_capacity = std::min(cols, 8*experts);
     const bool wide = cc >= 1200 && cols > 32*experts;
     const bool single = cc >= 1200 || (blocked && cc == CC_ADA_LOVELACE);
     const size_t bytes = wide ? f8_pp_shared<64,1,128>() : single ? f8_pp_shared<32,1,128>() : f8_pp_shared<32,2,64>();
     if (bytes > ggml_cuda_info().devices[ctx.device].smpbo) return false;
     auto stream = ctx.stream();
-    ggml_cuda_pool_alloc<int32_t> routing_data(ctx.pool(), cols + 2*(experts+1) + 1 + small_capacity);
+    const int chunks = (cols+255)/256;
+    ggml_cuda_pool_alloc<int32_t> routing_data(ctx.pool(), size_t(2*cols + 3*(experts+1)) + size_t(chunks)*experts);
     auto rows = routing_data.get();
     auto bounds = rows + cols;
     auto tiles = bounds + experts + 1;
     auto small = tiles + experts + 1;
-    f8_moe_rows<<<experts,32,0,stream>>>((const char *)ids->data, rows, bounds,
-            ids->ne[0], ids->ne[1], ids->nb[0], ids->nb[1]);
+    auto counts = small + experts + 1;
+    auto ranks = counts + size_t(chunks)*experts;
+    f8_moe_histogram<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks,
+            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
+    f8_moe_prefix<<<1,256,0,stream>>>(counts, bounds, experts, chunks);
+    f8_moe_scatter<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks, bounds, rows,
+            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     f8_moe_tiles<<<1,1,0,stream>>>(bounds, tiles, small, experts, wide ? 64 : 32);
+    f8_moe_zero_invalid<<<std::min(cols, 128),256,0,stream>>>((const char *)ids->data, bounds,
+            (float *)dst->data, gate ? up : nullptr, dst->ne[0], ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     ggml_cuda_pool_alloc<half> activations(ctx.pool(), size_t(cols)*src->ne[0]);
-    f8_moe_convert<<<cols,256,0,stream>>>((const char *)src->data, activations.get(), rows, bounds, tiles,
+    f8_moe_convert<<<cols,256,0,stream>>>((const char *)src->data, activations.get(), rows, bounds,
             experts, src->ne[0], ids->ne[0], src->ne[1], src->nb[1], src->nb[2]);
     auto multiply = [&](const ggml_tensor * w, const ggml_tensor * bias, float * output) {
-        CUDA_CHECK(cudaMemsetAsync(output, 0, ggml_nbytes(dst), stream));
         f8_moe_routing routing{rows, bounds, tiles, experts, w->nb[1], w->nb[2],
                 bias ? (const char *)bias->data : nullptr, bias ? bias->nb[1] : 0};
         auto launch = [&](auto layout) {
             using L = decltype(layout);
-            const dim3 small_grid(std::min(cc >= 1200 ? 64 : 32, int(dst->ne[0])),
-                    std::min(cc >= 1200 ? 128 : 64, small_capacity));
-            mul_mat_f8_moe_small<L><<<small_grid,256,0,stream>>>(
-                    src->ne[0], dst->ne[0], (const char *)w->data, (const char *)src->data, output,
-                    small, ids->ne[0], src->ne[1], src->nb[1], src->nb[2], routing);
+            auto small_routing = routing;
+            small_routing.tiles = small;
+            launch_f8_moe<L,8,4,1,128>(src->ne[0], dst->ne[0], cols,
+                    (const char *)w->data, activations.get(), output, small_routing, stream, true);
             if (wide) {
                 launch_f8_moe<L,64,4,1,128>(src->ne[0], dst->ne[0], cols,
                         (const char *)w->data, activations.get(), output, routing, stream);

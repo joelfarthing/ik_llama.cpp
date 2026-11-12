@@ -328,26 +328,56 @@ static bool launch_f8_pp(int cc, int shared_limit, int n, int rows, int cols, in
     }
 }
 
-static __global__ void f8_moe_rows(const char * ids, int32_t * rows, int32_t * bounds,
-        int slots, int tokens, size_t nb0, size_t nb1) {
-    const int expert = blockIdx.x;
-    int previous = 0;
-    for (int j = threadIdx.x; j < slots*tokens; j += 32) {
-        const int id = *(const int32_t *)(ids + size_t(j/slots)*nb1 + size_t(j%slots)*nb0);
-        previous += id >= 0 && id < expert;
+static __global__ void f8_moe_histogram(const char * ids, int32_t * counts, int32_t * ranks,
+        int slots, int tokens, int experts, size_t nb0, size_t nb1) {
+    __shared__ int32_t local_ids[256];
+    const int tid = threadIdx.x, col = 256*blockIdx.x + tid;
+    const int id = col < slots*tokens ? *(const int32_t *)(ids + size_t(col/slots)*nb1 + size_t(col%slots)*nb0) : -1;
+    local_ids[tid] = id;
+    for (int e = tid; e < experts; e += blockDim.x) counts[blockIdx.x*experts+e] = 0;
+    __syncthreads();
+    if (id < 0 || id >= experts) return;
+    int rank = 0;
+    for (int j = 0; j < tid; ++j) rank += local_ids[j] == id;
+    ranks[col] = rank;
+    atomicAdd(counts + blockIdx.x*experts+id, 1);
+}
+
+static __global__ void f8_moe_prefix(int32_t * counts, int32_t * bounds, int experts, int chunks) {
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        int sum = 0;
+        for (int c = 0; c < chunks; ++c) {
+            const int count = counts[c*experts+e];
+            counts[c*experts+e] = sum;
+            sum += count;
+        }
+        bounds[e+1] = sum;
     }
-    for (int mask = 16; mask > 0; mask >>= 1) previous += __shfl_xor_sync(0xffffffff, previous, mask);
-    int count = 0;
-    for (int base = 0; base < slots*tokens; base += 32) {
-        const int j = base + threadIdx.x;
-        const int id = j < slots*tokens ? *(const int32_t *)(ids + size_t(j/slots)*nb1 + size_t(j%slots)*nb0) : -1;
-        const unsigned mask = __ballot_sync(0xffffffff, id == expert);
-        if (id == expert) rows[previous + count + __popc(mask & ((1u << threadIdx.x)-1))] = j;
-        count += __popc(mask);
-    }
+    __syncthreads();
     if (threadIdx.x == 0) {
-        bounds[expert] = previous;
-        if (expert == gridDim.x-1) bounds[expert+1] = previous + count;
+        bounds[0] = 0;
+        for (int e = 0; e < experts; ++e) bounds[e+1] += bounds[e];
+    }
+}
+
+static __global__ void f8_moe_scatter(const char * ids, const int32_t * counts, const int32_t * ranks,
+        const int32_t * bounds, int32_t * rows, int slots, int tokens, int experts, size_t nb0, size_t nb1) {
+    const int col = 256*blockIdx.x + threadIdx.x;
+    if (col >= slots*tokens) return;
+    const int id = *(const int32_t *)(ids + size_t(col/slots)*nb1 + size_t(col%slots)*nb0);
+    if (id >= 0 && id < experts) rows[bounds[id]+counts[blockIdx.x*experts+id]+ranks[col]] = col;
+}
+
+static __global__ void f8_moe_zero_invalid(const char * ids, const int32_t * bounds, float * dst, float * up,
+        int rows, int slots, int tokens, int experts, size_t nb0, size_t nb1) {
+    if (bounds[experts] == slots*tokens) return;
+    for (int col = blockIdx.x; col < slots*tokens; col += gridDim.x) {
+        const int id = *(const int32_t *)(ids + size_t(col/slots)*nb1 + size_t(col%slots)*nb0);
+        if (id >= 0 && id < experts) continue;
+        for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+            dst[size_t(col)*rows+row] = 0;
+            if (up) up[size_t(col)*rows+row] = 0;
+        }
     }
 }
 
@@ -355,28 +385,19 @@ static __global__ void f8_moe_tiles(const int32_t * bounds, int32_t * tiles, int
     int count = 0, nsmall = 0;
     for (int e = 0; e < experts; ++e) {
         tiles[e] = count;
+        small[e] = nsmall;
         const int size = bounds[e+1]-bounds[e];
-        if (size <= 8) {
-            for (int j = bounds[e]; j < bounds[e+1]; ++j) small[1+nsmall++] = j;
-        } else {
-            count += (size+width-1)/width;
-        }
+        if (size <= 8) nsmall += size > 0;
+        else count += (size+width-1)/width;
     }
     tiles[experts] = count;
-    small[0] = nsmall;
+    small[experts] = nsmall;
 }
 
-static __global__ void f8_moe_convert(const char * src, half * dst, const int32_t * rows, const int32_t * bounds, const int32_t * tiles,
+static __global__ void f8_moe_convert(const char * src, half * dst, const int32_t * rows, const int32_t * bounds,
         int experts, int n, int slots, int channels, size_t nb1, size_t nb2) {
     const int col = blockIdx.x;
     if (col >= bounds[experts]) return;
-    int expert = 0, hi = experts;
-    while (expert + 1 < hi) {
-        const int mid = (expert+hi)/2;
-        if (bounds[mid] <= col) expert = mid;
-        else hi = mid;
-    }
-    if (tiles[expert] == tiles[expert+1]) return;
     const int row = rows[col];
     const float * input = (const float *)(src + size_t(row/slots)*nb2 + size_t(row%slots%channels)*nb1);
     for (int j = threadIdx.x; j < n; j += blockDim.x) dst[size_t(col)*n+j] = __float2half(input[j]);
@@ -384,7 +405,7 @@ static __global__ void f8_moe_convert(const char * src, half * dst, const int32_
 
 template <typename layout, int BN, int NW, int stages, int BK>
 static void launch_f8_moe(int n, int rows, int cols, const char * x, const half * y, float * z,
-        const f8_moe_routing & routing, cudaStream_t stream) {
+        const f8_moe_routing & routing, cudaStream_t stream, bool small = false) {
     constexpr int bytes = f8_pp_shared<BN, stages, BK>();
     const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0 || routing.expert_stride%16 != 0;
     auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, true> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, true>;
@@ -393,33 +414,6 @@ static void launch_f8_moe(int n, int rows, int cols, const char * x, const half 
     } else {
         CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
     }
-    kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN+routing.experts), dim3(32,NW), bytes, stream>>>(
+    kernel<<<dim3((rows+127)/128, small ? routing.experts : (cols+BN-1)/BN+routing.experts), dim3(32,NW), bytes, stream>>>(
             n, rows, cols, rows, x, y, z, routing);
-}
-
-template <typename layout>
-static __global__ void mul_mat_f8_moe_small(int n, int rows, const char * x, const char * y, float * z,
-        const int32_t * small, int slots, int channels, size_t nb1, size_t nb2, f8_moe_routing routing) {
-    for (int i = blockIdx.y; i < small[0]; i += gridDim.y) {
-        const int col = small[1+i];
-        int expert = 0, hi = routing.experts;
-        while (expert + 1 < hi) {
-            const int mid = (expert+hi)/2;
-            if (routing.bounds[mid] <= col) expert = mid;
-            else hi = mid;
-        }
-        const int dst = routing.rows[col];
-        const auto * a = (const float *)(y + size_t(dst/slots)*nb2 + size_t(dst%slots%channels)*nb1);
-        for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-            const void * w = x + size_t(expert)*routing.expert_stride + size_t(row)*routing.row_stride;
-            float value;
-            if constexpr (std::is_same_v<layout, ggml_cuda_f8_block>) value = dot_f8_e4m3_b128(n, w, a);
-            else value = dot_f8_e4m3<layout>(n, w, a);
-            if (threadIdx.x == 0) {
-                if (routing.bias) value += ((const float *)(routing.bias + size_t(expert)*routing.bias_stride))[row];
-                z[size_t(dst)*rows+row] = value;
-            }
-            __syncthreads();
-        }
-    }
 }
