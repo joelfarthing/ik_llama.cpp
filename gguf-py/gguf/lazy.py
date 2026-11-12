@@ -256,11 +256,10 @@ class LazyChunkedTensor:
         return LazyChunkedTensor(self._chunks, shape, dtype, qtype, self._byteswap)
 
     def byteswap(self, inplace: bool = False) -> LazyChunkedTensor:
-        if inplace:
-            raise NotImplementedError("a chunked tensor cannot be byteswapped in place")
         return LazyChunkedTensor(self._chunks, self.shape, self.dtype, self._qtype, not self._byteswap)
 
     def tofile(self, *args, **kwargs) -> None:
+        from .constants import GGMLQuantizationType
         from .quants import quantize
 
         written = 0
@@ -270,6 +269,8 @@ class LazyChunkedTensor:
 
                 chunk = quantize(chunk, self._qtype)
             if self._byteswap:
+                if self._qtype == GGMLQuantizationType.BF16:
+                    chunk = chunk.view(np.uint16)
                 chunk = chunk.byteswap(inplace=False)
             chunk.tofile(*args, **kwargs)
             written += chunk.nbytes
