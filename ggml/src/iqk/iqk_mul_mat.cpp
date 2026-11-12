@@ -251,6 +251,9 @@ struct MulMat {
     static bool prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny);
     static inline ggml_type is_dequant_better(ggml_type type, int nrc_y) {
         if (type == GGML_TYPE_F8_E4M3_KS) return nrc_y >= 32 ? GGML_TYPE_BF16 : type;
+#if defined __AVX2__ && !defined __AVX512F__
+        if (type == GGML_TYPE_F8_E4M3_B128) return nrc_y >= 32 ? GGML_TYPE_F32 : type;
+#endif
 #ifdef __AVX2__
 #ifdef HAVE_FANCY_SIMD
         auto q8_k_type = GGML_TYPE_Q8_K_R16;
@@ -513,6 +516,16 @@ bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy,
         }
         return true;
     }
+
+#if defined __AVX2__ && !defined __AVX512F__
+    if (typeA == GGML_TYPE_F8_E4M3_B128) {
+        const auto to_float = ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_B128).to_float;
+        for (int row = 0; row < nrc_x; ++row) {
+            to_float((const char *)vx + row*bx, (float *)vy + row*stride_y, n);
+        }
+        return true;
+    }
+#endif
 
 
     switch (typeA) {

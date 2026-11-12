@@ -1192,15 +1192,11 @@ struct F8 : F8Base {
 #elif defined __AVX2__
     static inline Data zero() { return _mm256_setzero_ps(); }
     static inline Data decode(const uint8_t * x) {
-        const auto q = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)x));
-        const auto mag = _mm256_and_si256(q, _mm256_set1_epi32(127));
-        const auto sign = _mm256_slli_epi32(_mm256_and_si256(q, _mm256_set1_epi32(128)), 24);
-        auto v = _mm256_castsi256_ps(_mm256_add_epi32(_mm256_slli_epi32(mag, 20), _mm256_set1_epi32(120 << 23)));
-        const auto sub = _mm256_mul_ps(_mm256_cvtepi32_ps(mag), _mm256_set1_ps(1.0f/512));
-        v = _mm256_blendv_ps(v, sub, _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(8), mag)));
-        v = _mm256_blendv_ps(v, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fc00000)),
-                _mm256_castsi256_ps(_mm256_cmpeq_epi32(mag, _mm256_set1_epi32(127))));
-        return _mm256_castsi256_ps(_mm256_or_si256(_mm256_castps_si256(v), sign));
+        const auto q = _mm_cvtepi8_epi16(_mm_loadl_epi64((const __m128i *)x));
+        auto bits = _mm_and_si128(_mm_slli_epi16(q, 7), _mm_set1_epi16(-16385));
+        const auto nan = _mm_cmpeq_epi16(_mm_and_si128(bits, _mm_set1_epi16(0x7fff)), _mm_set1_epi16(0x3f80));
+        bits = _mm_or_si128(bits, _mm_and_si128(nan, _mm_set1_epi16(0x7c00)));
+        return _mm256_mul_ps(_mm256_cvtph_ps(bits), _mm256_set1_ps(256));
     }
     static inline Data add(Data a, Data b) { return _mm256_add_ps(a, b); }
 #else
