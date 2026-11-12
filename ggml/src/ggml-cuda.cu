@@ -3225,7 +3225,9 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
                 launch_f8_moe<L,8,4,1,128,G>(src->ne[0], dst->ne[0], cols,
                         (const char *)w->data, activations.get(), output, small_routing, stream, scales, true);
                 if constexpr (G != 0) {
-                    launch_f8_moe<L,128,8,1,128,G>(src->ne[0], dst->ne[0], cols,
+                    if (cc >= 1200) launch_f8_moe<L,128,8,2,128,G>(src->ne[0], dst->ne[0], cols,
+                            (const char *)w->data, activations.get(), output, routing, stream, scales);
+                    else launch_f8_moe<L,128,8,1,128,G>(src->ne[0], dst->ne[0], cols,
                             (const char *)w->data, activations.get(), output, routing, stream, scales);
                 } else if (wide) {
                     launch_f8_moe<L,64,4,1,128>(src->ne[0], dst->ne[0], cols,
