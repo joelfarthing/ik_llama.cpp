@@ -108,18 +108,73 @@ struct f8_moe_routing {
     size_t bias_stride;
 };
 
-template <typename layout, int BN, int NW, int stages, bool tail = true, int BK = 64, bool indexed = false>
+static constexpr int f8_activation_group = 128;
+
+template <int G>
+using f8_activation = std::conditional_t<G == 0, half, uint8_t>;
+
+static bool f8_mma_available(int cc) {
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= CC_ADA_LOVELACE;
+#else
+    GGML_UNUSED(cc);
+    return false;
+#endif
+}
+
+static bool f8_w8a8(const ggml_tensor * weight, int cc) {
+    return (weight->type == GGML_TYPE_F8_E4M3_KS || weight->type == GGML_TYPE_F8_E4M3_B128) &&
+        ggml_get_input_scale(weight) == -1.0f && f8_mma_available(cc);
+}
+
+template <int G>
+static __device__ void f8_quantize_group(const float * input, uint8_t * output, float * scales, int n, int group) {
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080 && __CUDA_ARCH__ >= 890
+    const int lane = threadIdx.x%32;
+    float values[G/32], amax = 0;
+#pragma unroll
+    for (int j = 0; j < G/32; ++j) {
+        const int k = group*G + lane + 32*j;
+        values[j] = k < n ? input[k] : 0;
+        amax = fmaxf(amax, fabsf(values[j]));
+    }
+    amax = warp_reduce_max(amax);
+    const float scale = __fdiv_rn(amax, 448.0f);
+    if (lane == 0) scales[group] = scale == 0 ? 1.0f : scale;
+#pragma unroll
+    for (int j = 0; j < G/32; ++j) {
+        const int k = group*G + lane + 32*j;
+        if (k < n) output[k] = scale == 0 ? 0 : __nv_cvt_float_to_fp8(__fdiv_rn(values[j], scale), __NV_SATFINITE, __NV_E4M3);
+    }
+#else
+    GGML_UNUSED(input); GGML_UNUSED(output); GGML_UNUSED(scales); GGML_UNUSED(n); GGML_UNUSED(group);
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <int G>
+static __global__ void f8_quantize(const float * input, uint8_t * output, float * scales, int n, size_t stride) {
+    const int group = blockIdx.x*4 + threadIdx.x/32;
+    if (group < (n+G-1)/G) {
+        f8_quantize_group<G>(input + blockIdx.y*stride, output + size_t(blockIdx.y)*n,
+                scales + size_t(blockIdx.y)*((n+G-1)/G), n, group);
+    }
+}
+
+template <typename layout, int BN, int NW, int stages, bool tail = true, int BK = 64, bool indexed = false, int G = 0>
 static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
-        int n, int rows, int cols, int ldc, const char * __restrict__ x, const half * __restrict__ y, float * __restrict__ z,
-        f8_moe_routing routing = {}) {
+        int n, int rows, int cols, int ldc, const char * __restrict__ x, const f8_activation<G> * __restrict__ y, float * __restrict__ z,
+        f8_moe_routing routing = {}, const float * activation_scales = nullptr) {
 #ifdef INT8_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
     constexpr bool blocked = std::is_same_v<layout, ggml_cuda_f8_block>;
-    constexpr int BM = 128, stride = BK/2+4, code_stride = BK/4+4, WC = NW/4, NJ = BN/WC/8;
+    constexpr int BM = 128, stride = (G ? BK/4 : BK/2)+4, code_stride = BK/4+4, WC = NW/4, NJ = BN/WC/8;
     extern __shared__ __align__(16) uint32_t storage[];
     uint32_t * codes = storage;
-    half2 * b = (half2 *)(codes + stages*BM*code_stride);
+    using packed = std::conditional_t<G == 0, half2, uint32_t>;
+    packed * b = (packed *)(codes + stages*BM*code_stride);
     float * scales = (float *)(b + stages*BN*stride);
+    float * activation_tile_scales = scales + stages*BM;
     const int tid = threadIdx.y*32 + threadIdx.x;
     const int tile_index = blockIdx.x + blockIdx.y*gridDim.x;
     const int group = tile_index/(8*gridDim.y);
@@ -141,7 +196,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
         x += size_t(expert)*routing.expert_stride;
     }
     const int warp_row = (threadIdx.y/WC)*32, warp_col = (threadIdx.y%WC)*(BN/WC);
-    const size_t row_bytes = indexed ? routing.row_stride : layout::row_size(n);
+    const size_t row_bytes = indexed ? routing.row_stride : layout::row_size(G && blocked ? (n+127)/128*128 : n);
     auto load = [&](int k0, int s) {
         if (k0 < n) {
             if constexpr (!tail) {
@@ -179,19 +234,46 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     }
                 }
             }
-            for (int i = tid; i < BN*BK/8; i += NW*32) {
-                const int c = i/(BK/8), k = k0 + 8*(i%(BK/8));
-                half * dst = (half *)(b + (s*BN+c)*stride + (k-k0)/2);
-                const bool valid = (!tail && !indexed) || (first_col+c < cols && k+7 < n);
-                const half * src = valid ? y + size_t(first_col+c)*n + k : y;
-                if (valid && (!tail || uintptr_t(src)%16 == 0)) {
-                    f8_pp_copy<16>(dst, src, 16);
-                } else {
+            if constexpr (G != 0) {
+                for (int i = tid; i < BN*((BK+G-1)/G); i += NW*32) {
+                    const int c = i/((BK+G-1)/G), g = k0/G+i%((BK+G-1)/G);
+                    const bool valid = first_col+c < cols && g < (n+G-1)/G;
+                    const float * src = valid ? activation_scales + size_t(first_col+c)*((n+G-1)/G)+g : activation_scales;
+                    f8_pp_copy<4>(activation_tile_scales+s*BN*((BK+G-1)/G)+i, src, valid ? 4 : 0);
+                }
+                for (int i = tid; i < BN*BK/16; i += NW*32) {
+                    const int c = i/(BK/16), k = k0 + 16*(i%(BK/16));
+                    auto * dst = (uint8_t *)(b + (s*BN+c)*stride + (k-k0)/4);
+                    const bool valid = first_col+c < cols && k+15 < n;
+                    const auto * src = valid ? y + size_t(first_col+c)*n + k : y;
+                    if (valid && uintptr_t(src)%16 == 0) {
+                        f8_pp_copy<16>(dst, src, 16);
+                    } else {
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) dst[j] = first_col+c < cols && k+j < n ? y[size_t(first_col+c)*n+k+j] : __float2half(0);
+                        for (int j = 0; j < 16; ++j) dst[j] = first_col+c < cols && k+j < n ? y[size_t(first_col+c)*n+k+j] : 0;
+                    }
+                }
+            } else {
+                for (int i = tid; i < BN*BK/8; i += NW*32) {
+                    const int c = i/(BK/8), k = k0 + 8*(i%(BK/8));
+                    half * dst = (half *)(b + (s*BN+c)*stride + (k-k0)/2);
+                    const bool valid = (!tail && !indexed) || (first_col+c < cols && k+7 < n);
+                    const half * src = valid ? y + size_t(first_col+c)*n + k : y;
+                    if (valid && (!tail || uintptr_t(src)%16 == 0)) {
+                        f8_pp_copy<16>(dst, src, 16);
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) dst[j] = first_col+c < cols && k+j < n ? y[size_t(first_col+c)*n+k+j] : __float2half(0);
+                    }
                 }
             }
-            if constexpr (blocked) {
+            if constexpr (blocked && G != 0) {
+                for (int r = tid; r < BM; r += NW*32) {
+                    const bool valid = !tail || first_row+r < rows;
+                    const char * src = valid ? x + size_t(first_row+r)*row_bytes + size_t(k0/128)*132 : x;
+                    f8_pp_copy<4>(scales+s*BM+r, src, valid ? 4 : 0);
+                }
+            } else if constexpr (blocked) {
                 for (int r = tid; r < BM; r += NW*32) {
                     scales[s*BM+r] = (!tail || first_row+r < rows) ? layout::scale(x + size_t(first_row+r)*row_bytes, k0) : 0;
                 }
@@ -203,7 +285,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
     };
 #pragma unroll
     for (int s = 0; s < stages-1; ++s) load(s*BK, s);
-    tile<16, 8, float> total[2][NJ], partial[2][NJ];
+    tile<16, 8, float> total[2][NJ], partial[G && blocked ? 1 : 2][G && blocked ? 1 : NJ];
     for (int k0 = 0, step = 0; k0 < n; k0 += BK, ++step) {
         const int s = step%stages;
         load(k0 + (stages-1)*BK, (step+stages-1)%stages);
@@ -211,42 +293,174 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
         asm volatile("cp.async.wait_group %0;" :: "n"(stages-1));
 #endif
         __syncthreads();
+        if constexpr (G != 0) {
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= 890
+            int shifts[2][2] = {};
+            if constexpr (blocked && !tail) {
 #pragma unroll
-        for (int k = 0; k < BK/2; k += 8) {
-            tile<16, 8, half2> at[2];
+                for (int i = 0; i < 2; ++i) {
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-#pragma unroll
-                for (int l = 0; l < at[i].ne; ++l) {
-                    const int row = warp_row+16*i+at[i].get_i(l);
-                    int shift = 0;
-                    if constexpr (!tail) {
+                    for (int l = 0; l < 2; ++l) {
+                        const int row = warp_row+16*i+threadIdx.x/4+8*l;
                         const char * ptr = x + size_t(first_row+row)*row_bytes;
                         if constexpr (blocked) ptr += size_t(k0/128)*132 + 4 + k0%128;
                         else ptr += ggml_cuda_f8_row::row_meta_size + k0;
-                        shift = (uintptr_t(ptr)%16)/2;
+                        shifts[i][l] = (uintptr_t(ptr)%16)/4;
                     }
-                    const uint16_t v = ((const uint16_t *)(codes + (s*BM+row)*code_stride))[shift+k+at[i].get_j(l)];
-#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080 && __CUDA_ARCH__ >= 890
-                    at[i].x[l] = __nv_cvt_fp8x2_to_halfraw2(v, __NV_E4M3);
-#else
-                    const float2 f = ggml_cuda_f8_e4m3x2_to_float2(v);
-                    at[i].x[l] = make_half2(f.x, f.y);
-#endif
                 }
             }
+            if constexpr (blocked) {
 #pragma unroll
-            for (int j = 0; j < NJ; ++j) {
-                tile<8, 8, half2> bt;
-                load_ldmatrix(bt, b + (s*BN+warp_col+8*j)*stride+k, stride);
+                for (int g = 0; g < BK; g += G) {
+                    uint32_t at[2][G/32][4];
+#pragma unroll
+                    for (int k = 0; k < G; k += 32) {
+#pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                            for (int l = 0; l < 4; ++l) {
+                                const int row = warp_row+16*i+threadIdx.x/4+8*(l%2);
+                                const int shift = shifts[i][l%2];
+                                at[i][k/32][l] = codes[(s*BM+row)*code_stride+shift+(g+k)/4+threadIdx.x%4+4*(l/2)];
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        const int c = warp_col+8*j+threadIdx.x/4;
+                        uint32_t bt[G/32][2];
+#pragma unroll
+                        for (int k = 0; k < G; k += 32) {
+                            bt[k/32][0] = b[(s*BN+c)*stride+(g+k)/4+threadIdx.x%4];
+                            bt[k/32][1] = b[(s*BN+c)*stride+(g+k)/4+threadIdx.x%4+4];
+                        }
+                        const int sc = warp_col+8*j+2*(threadIdx.x%4);
+                        const float column_scale[2] = {
+                            activation_tile_scales[(s*BN+sc)*((BK+G-1)/G)+g/G],
+                            activation_tile_scales[(s*BN+sc+1)*((BK+G-1)/G)+g/G]};
+#pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+                            tile<16, 8, float> acc;
+#pragma unroll
+                            for (int k = 0; k < G/32; ++k) {
+                                asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                    : "+f"(acc.x[0]), "+f"(acc.x[1]), "+f"(acc.x[2]), "+f"(acc.x[3])
+                                    : "r"(at[i][k][0]), "r"(at[i][k][1]), "r"(at[i][k][2]), "r"(at[i][k][3]), "r"(bt[k][0]), "r"(bt[k][1]));
+                            }
+                            float row_scale[2];
+                            if constexpr (blocked) {
+                                row_scale[0] = scales[s*BM+warp_row+16*i+threadIdx.x/4];
+                                row_scale[1] = scales[s*BM+warp_row+16*i+threadIdx.x/4+8];
+                            }
+#pragma unroll
+                            for (int l = 0; l < total[i][j].ne; ++l) {
+                                const float scale = __fmul_rn(row_scale[l/2], column_scale[l%2]);
+                                total[i][j].x[l] = fmaf(acc.x[l], scale, total[i][j].x[l]);
+                            }
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int k = 0; k < BK && k0+k < n; k += 32) {
+                    uint32_t at[2][4];
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                        for (int l = 0; l < 4; ++l) {
+                            const int row = warp_row+16*i+threadIdx.x/4+8*(l%2);
+                            int shift = 0;
+                            if constexpr (!tail) {
+                                const char * ptr = x + size_t(first_row+row)*row_bytes;
+                                if constexpr (blocked) ptr += size_t(k0/128)*132 + 4 + k0%128;
+                                else ptr += ggml_cuda_f8_row::row_meta_size + k0;
+                                shift = (uintptr_t(ptr)%16)/4;
+                            }
+                            at[i][l] = codes[(s*BM+row)*code_stride+shift+k/4+threadIdx.x%4+4*(l/2)];
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        const int c = warp_col+8*j+threadIdx.x/4;
+                        const uint32_t b0 = b[(s*BN+c)*stride+k/4+threadIdx.x%4];
+                        const uint32_t b1 = b[(s*BN+c)*stride+k/4+threadIdx.x%4+4];
+#pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+                            auto & acc = partial[i][j];
+                            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                : "+f"(acc.x[0]), "+f"(acc.x[1]), "+f"(acc.x[2]), "+f"(acc.x[3])
+                                : "r"(at[i][0]), "r"(at[i][1]), "r"(at[i][2]), "r"(at[i][3]), "r"(b0), "r"(b1));
+                        }
+                    }
+                    if ((k0+k+32)%G == 0 || k0+k+32 >= n) {
+#pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                            for (int j = 0; j < NJ; ++j) {
+                                const int c = warp_col+8*j+2*(threadIdx.x%4);
+                                const float column_scale[2] = {
+                                    activation_tile_scales[(s*BN+c)*((BK+G-1)/G)+k/G],
+                                    activation_tile_scales[(s*BN+c+1)*((BK+G-1)/G)+k/G]};
+                                float row_scale[2];
+                                if constexpr (blocked) {
+                                    row_scale[0] = scales[s*BM+warp_row+16*i+threadIdx.x/4];
+                                    row_scale[1] = scales[s*BM+warp_row+16*i+threadIdx.x/4+8];
+                                }
+#pragma unroll
+                                for (int l = 0; l < total[i][j].ne; ++l) {
+                                    float scale = column_scale[l%2];
+                                    if constexpr (blocked) scale *= row_scale[l/2];
+                                    total[i][j].x[l] = fmaf(partial[i][j].x[l], scale, total[i][j].x[l]);
+                                    partial[i][j].x[l] = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+#else
+            NO_DEVICE_CODE;
+#endif
+        } else {
+#pragma unroll
+            for (int k = 0; k < BK/2; k += 8) {
+                tile<16, 8, half2> at[2];
 #pragma unroll
                 for (int i = 0; i < 2; ++i) {
-                    if constexpr (blocked) mma(partial[i][j], at[i], bt);
-                    else mma(total[i][j], at[i], bt);
+#pragma unroll
+                    for (int l = 0; l < at[i].ne; ++l) {
+                        const int row = warp_row+16*i+at[i].get_i(l);
+                        int shift = 0;
+                        if constexpr (!tail) {
+                            const char * ptr = x + size_t(first_row+row)*row_bytes;
+                            if constexpr (blocked) ptr += size_t(k0/128)*132 + 4 + k0%128;
+                            else ptr += ggml_cuda_f8_row::row_meta_size + k0;
+                            shift = (uintptr_t(ptr)%16)/2;
+                        }
+                        const uint16_t v = ((const uint16_t *)(codes + (s*BM+row)*code_stride))[shift+k+at[i].get_j(l)];
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080 && __CUDA_ARCH__ >= 890
+                        at[i].x[l] = __nv_cvt_fp8x2_to_halfraw2(v, __NV_E4M3);
+#else
+                        const float2 f = ggml_cuda_f8_e4m3x2_to_float2(v);
+                        at[i].x[l] = make_half2(f.x, f.y);
+#endif
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NJ; ++j) {
+                    tile<8, 8, half2> bt;
+                    load_ldmatrix(bt, b + (s*BN+warp_col+8*j)*stride+k, stride);
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        if constexpr (blocked) mma(partial[i][j], at[i], bt);
+                        else mma(total[i][j], at[i], bt);
+                    }
                 }
             }
         }
-        if constexpr (blocked) {
+        if constexpr (blocked && G == 0) {
             if (step%(128/BK) == 128/BK-1 || k0+BK >= n) {
 #pragma unroll
                 for (int i = 0; i < 2; ++i) {
@@ -289,28 +503,28 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
 #endif
 #else
     GGML_UNUSED(n); GGML_UNUSED(rows); GGML_UNUSED(cols); GGML_UNUSED(ldc);
-    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(z); GGML_UNUSED(routing);
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(z); GGML_UNUSED(routing); GGML_UNUSED(activation_scales);
     NO_DEVICE_CODE;
 #endif
 }
 
-template <int BN, int stages, int BK = 64>
+template <int BN, int stages, int BK = 64, int G = 0>
 static constexpr int f8_pp_shared() {
-    return 4*stages*(128*(BK/4+4)+BN*(BK/2+4)+128);
+    return 4*stages*(128*(BK/4+4)+BN*((G ? BK/4 : BK/2)+4)+128+(G ? BN*((BK+G-1)/G) : 0));
 }
 
-template <typename layout, int BN, int NW, int stages, int BK>
-static bool launch_f8_pp(int shared_limit, int n, int rows, int cols, int ldc, const char * x, const half * y, float * z, cudaStream_t stream) {
-    constexpr int bytes = f8_pp_shared<BN, stages, BK>();
+template <typename layout, int BN, int NW, int stages, int BK, int G = 0>
+static bool launch_f8_pp(int shared_limit, int n, int rows, int cols, int ldc, const char * x, const f8_activation<G> * y, float * z, cudaStream_t stream, const float * activation_scales = nullptr) {
+    constexpr int bytes = f8_pp_shared<BN, stages, BK, G>();
     if (bytes > shared_limit) return false;
     const bool tail = n%BK != 0 || rows%128 != 0 || cols%BN != 0 || uintptr_t(x)%16 != 0 || uintptr_t(y)%16 != 0;
-    auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK>;
+    auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, false, G> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, false, G>;
     if (tail) {
         CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
     } else {
         CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
     }
-    kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN), dim3(32, NW), bytes, stream>>>(n, rows, cols, ldc, x, y, z, {});
+    kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN), dim3(32, NW), bytes, stream>>>(n, rows, cols, ldc, x, y, z, {}, activation_scales);
     return true;
 }
 
@@ -394,26 +608,33 @@ static __global__ void f8_moe_tiles(const int32_t * bounds, int32_t * tiles, int
     small[experts] = nsmall;
 }
 
-static __global__ void f8_moe_convert(const char * src, half * dst, const int32_t * rows, const int32_t * bounds,
-        int experts, int n, int slots, int channels, size_t nb1, size_t nb2) {
+template <int G = 0>
+static __global__ void f8_moe_convert(const char * src, f8_activation<G> * dst, const int32_t * rows, const int32_t * bounds,
+        int experts, int n, int slots, int channels, size_t nb1, size_t nb2, float * activation_scales = nullptr) {
     const int col = blockIdx.x;
     if (col >= bounds[experts]) return;
     const int row = rows[col];
     const float * input = (const float *)(src + size_t(row/slots)*nb2 + size_t(row%slots%channels)*nb1);
-    for (int j = threadIdx.x; j < n; j += blockDim.x) dst[size_t(col)*n+j] = __float2half(input[j]);
+    if constexpr (G != 0) {
+        for (int g = threadIdx.x/32; g < (n+G-1)/G; g += blockDim.x/32) {
+            f8_quantize_group<G>(input, dst + size_t(col)*n, activation_scales + size_t(col)*((n+G-1)/G), n, g);
+        }
+    } else {
+        for (int j = threadIdx.x; j < n; j += blockDim.x) dst[size_t(col)*n+j] = __float2half(input[j]);
+    }
 }
 
-template <typename layout, int BN, int NW, int stages, int BK>
-static void launch_f8_moe(int n, int rows, int cols, const char * x, const half * y, float * z,
-        const f8_moe_routing & routing, cudaStream_t stream, bool small = false) {
-    constexpr int bytes = f8_pp_shared<BN, stages, BK>();
+template <typename layout, int BN, int NW, int stages, int BK, int G = 0>
+static void launch_f8_moe(int n, int rows, int cols, const char * x, const f8_activation<G> * y, float * z,
+        const f8_moe_routing & routing, cudaStream_t stream, const float * activation_scales = nullptr, bool small = false) {
+    constexpr int bytes = f8_pp_shared<BN, stages, BK, G>();
     const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0 || routing.expert_stride%16 != 0;
-    auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, true> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, true>;
+    auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, true, G> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, true, G>;
     if (tail) {
         CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
     } else {
         CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
     }
     kernel<<<dim3((rows+127)/128, small ? routing.experts : (cols+BN-1)/BN+routing.experts), dim3(32,NW), bytes, stream>>>(
-            n, rows, cols, rows, x, y, z, routing);
+            n, rows, cols, rows, x, y, z, routing, activation_scales);
 }

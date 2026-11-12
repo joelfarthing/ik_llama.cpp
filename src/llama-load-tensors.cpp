@@ -5642,7 +5642,7 @@ bool create_tensors_helper::merge_up_gate_exps(const LLM_TN & tn, int i, int bia
     LLAMA_LOG_INFO("%s: merging up/gate in layer %d\n", __func__, i);
 
     layer.ffn_up_gate_exps = ggml_new_tensor_3d(u_ctx, u_meta->type, u_meta->ne[0], u_meta->ne[1] + g_meta->ne[1], u_meta->ne[2]);
-    if (u_meta->type == GGML_TYPE_NVFP4_KS) {
+    if (u_meta->type == GGML_TYPE_NVFP4_KS || u_meta->type == GGML_TYPE_F8_E4M3_KS || u_meta->type == GGML_TYPE_F8_E4M3_B128) {
         ggml_set_input_scale(layer.ffn_up_gate_exps, ggml_get_input_scale(u_meta));
     }
     snprintf(layer.ffn_up_gate_exps->name, GGML_MAX_NAME, "blk.%d.ffn_gate_up_exps.weight", i);
@@ -5773,7 +5773,7 @@ bool create_tensors_helper::merge_qkv(const LLM_TN & tn, int i, int bias, bool i
         GGML_ASSERT(wk->ne[0] == n_embd && wk->ne[1] == n_embd_gqa);
         GGML_ASSERT(wv->ne[0] == n_embd && wv->ne[1] == n_embd_gqa);
         layer.wqkv = ggml_new_tensor_2d(ctx_split, wq->type, n_embd, n_embd_head_k * (n_head + n_head_kv + n_head_kv));
-        if (wq->type == GGML_TYPE_NVFP4_KS) {
+        if (wq->type == GGML_TYPE_NVFP4_KS || wq->type == GGML_TYPE_F8_E4M3_KS || wq->type == GGML_TYPE_F8_E4M3_B128) {
             ggml_set_input_scale(layer.wqkv, ggml_get_input_scale(wq));
         }
         snprintf(layer.wqkv->name, GGML_MAX_NAME, "blk.%d.attn_qkv.weight", i);
@@ -5813,7 +5813,7 @@ bool create_tensors_helper::merge_qkv(const LLM_TN & tn, int i, int bias, bool i
         GGML_ASSERT(wq->ne[0] == n_embd && wq->ne[1] == n_head * n_embd_head_k);
         GGML_ASSERT(wk->ne[0] == n_embd && wk->ne[1] == n_embd_gqa);
         layer.wqk = ggml_new_tensor_2d(ctx_split, wq->type, n_embd, n_embd_head_k * (n_head + n_head_kv));
-        if (wq->type == GGML_TYPE_NVFP4_KS) {
+        if (wq->type == GGML_TYPE_NVFP4_KS || wq->type == GGML_TYPE_F8_E4M3_KS || wq->type == GGML_TYPE_F8_E4M3_B128) {
             ggml_set_input_scale(layer.wqk, ggml_get_input_scale(wq));
         }
         snprintf(layer.wqk->name, GGML_MAX_NAME, "blk.%d.attn_qk.weight", i);

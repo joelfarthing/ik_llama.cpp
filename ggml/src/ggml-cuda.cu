@@ -21,6 +21,7 @@
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/f8.cuh"
 #include "ggml-cuda/mm-f8.cuh"
+#include "ggml-cuda/mm-f8-lt.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
@@ -2797,6 +2798,15 @@ static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const flo
     }
 }
 
+static bool launch_f8_w8a8(const ggml_tensor * weight, int shared_limit, int n, int rows, int cols, int ldc,
+        const char * x, const uint8_t * y, float * z, const float * scales, cudaStream_t stream) {
+    if (weight->type == GGML_TYPE_F8_E4M3_KS) {
+        return launch_f8_pp<ggml_cuda_f8_row,128,8,2,64,f8_activation_group>(shared_limit, n, rows, cols, ldc, x, y, z, stream, scales);
+    }
+    return launch_f8_pp<ggml_cuda_f8_block,128,8,1,128,f8_activation_group>(shared_limit, n, rows, cols, ldc, x, y, z, stream, scales);
+}
+
+template <bool w8a8 = false>
 static void ggml_cuda_op_mul_mat_f8_e4m3(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
@@ -2804,6 +2814,18 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
         int64_t row_low, int64_t row_high, int64_t src1_ncols, int64_t src1_padded_row_size, cudaStream_t stream) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int shared_limit = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    if constexpr (w8a8) {
+        if (src1_ncols > 8 && dst->op_params[0] == GGML_PREC_DEFAULT && f8_mma_available(cc)) {
+            constexpr int G = f8_activation_group;
+            const int n = src0->ne[0], nrows = row_high-row_low;
+            const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
+            ggml_cuda_pool_alloc<uint8_t> activations(ctx.pool(ggml_cuda_get_device()), size_t(src1_ncols)*n);
+            ggml_cuda_pool_alloc<float> scales(ctx.pool(ggml_cuda_get_device()), size_t(src1_ncols)*((n+G-1)/G));
+            f8_quantize<G><<<dim3((n+4*G-1)/(4*G),src1_ncols),128,0,stream>>>(src1_ddf_i, activations.get(), scales.get(), n, src1->ne[0]);
+            if (launch_f8_w8a8(src0, shared_limit, n, nrows, src1_ncols, ldc,
+                    src0_dd_i, activations.get(), dst_dd_i, scales.get(), stream)) return;
+        }
+    }
     const bool ks_cublas = src0->type == GGML_TYPE_F8_E4M3_KS && cc == CC_ADA_LOVELACE && src1_ncols >= 1024;
     if (src1_ncols > 8 && dst->op_params[0] == GGML_PREC_DEFAULT && new_mma_available(cc) && !ks_cublas) {
         const int nrows = row_high - row_low;
@@ -2857,11 +2879,71 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
     }
 }
 
+static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
+        ggml_tensor * dst, const ggml_cgraph * cgraph, int node_n) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    auto compatible = [&](const ggml_tensor * node) {
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 ||
+                node->op_params[0] != GGML_PREC_DEFAULT || !f8_w8a8(node->src[0], cc) ||
+                !ggml_is_contiguous(node->src[0]) || !ggml_is_contiguous(node) ||
+                node->src[0]->ne[2]*node->src[0]->ne[3] != 1) return false;
+        for (auto t : {(const ggml_tensor *)node->src[0], (const ggml_tensor *)node->src[1], node}) {
+            if (!ggml_backend_buffer_is_cuda(t->buffer) ||
+                    ((ggml_backend_cuda_buffer_context *)t->buffer->context)->device != ctx.device) return false;
+        }
+        return true;
+    };
+    if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) || src1->ne[1] <= 8 ||
+            src1->ne[2]*src1->ne[3] != 1 || !compatible(dst)) return -1;
+    constexpr int G = f8_activation_group;
+    const int n = src1->ne[0], cols = src1->ne[1];
+    const bool use_lt = f8_lt_supported(ctx, dst);
+    ggml_cuda_pool_alloc<uint8_t> activations(ctx.pool(), size_t(cols)*n);
+    ggml_cuda_pool_alloc<float> scales(ctx.pool(), size_t(cols)*(use_lt ? 1 : (n+G-1)/G));
+    auto stream = ctx.stream();
+#ifdef GGML_CUDA_F8_LT
+    if (use_lt) f8_lt_quantize<<<cols,256,0,stream>>>((const float *)src1->data, activations.get(), scales.get(), n, src1->nb[1]/sizeof(float));
+    else
+#endif
+    f8_quantize<G><<<dim3((n+4*G-1)/(4*G),cols),128,0,stream>>>(
+            (const float *)src1->data, activations.get(), scales.get(), n, src1->nb[1]/sizeof(float));
+    for (;;) {
+        const auto * weight = dst->src[0];
+        bool done = false;
+#ifdef GGML_CUDA_F8_LT
+        if (use_lt) {
+            auto & lt = f8_lt_context(ctx);
+            done = lt.launch(weight->ne[1], n, cols, dst->ne[0], (const char *)weight->data,
+                    activations.get(), scales.get(), (float *)dst->data, stream);
+        } else
+#endif
+        done = launch_f8_w8a8(weight, ggml_cuda_info().devices[ctx.device].smpbo, n, weight->ne[1], cols, dst->ne[0],
+                (const char *)weight->data, activations.get(), (float *)dst->data, scales.get(), stream);
+        if (!done) {
+            ggml_cuda_op_mul_mat(ctx, weight, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3<true>, nullptr);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (!cgraph) break;
+        int next = node_n+1;
+        while (next < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[next])) ++next;
+        if (next == cgraph->n_nodes || !compatible(cgraph->nodes[next]) || f8_lt_supported(ctx, cgraph->nodes[next]) != use_lt) break;
+        node_n = next;
+        dst = cgraph->nodes[node_n];
+    }
+    return node_n;
+}
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
 
     if (src0->type == GGML_TYPE_F8_E4M3_KS || src0->type == GGML_TYPE_F8_E4M3_B128) {
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3, nullptr);
+        if (ggml_get_input_scale(src0) == -1.0f && f8_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
+            const int last = ggml_cuda_mul_mat_f8_reuse(ctx, src1, dst, cgraph, node_n);
+            if (last >= 0) return last;
+            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3<true>, nullptr);
+        } else {
+            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3<>, nullptr);
+        }
         return node_n;
     }
 
@@ -3096,7 +3178,8 @@ static bool ggml_cuda_f8_aligned(const ggml_tensor * weight, const ggml_tensor *
         uintptr_t(src->data) % 16 == 0 && src->nb[1] % 16 == 0 && src->nb[2] % 16 == 0;
 }
 
-static bool ggml_cuda_mul_mat_f8_id(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
+template <int G>
+static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         const ggml_tensor * src, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * gate = nullptr,
         const ggml_tensor * bias_up = nullptr, const ggml_tensor * bias_gate = nullptr, float * up = nullptr) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
@@ -3127,39 +3210,62 @@ static bool ggml_cuda_mul_mat_f8_id(ggml_backend_cuda_context & ctx, const ggml_
     f8_moe_prefix<<<1,256,0,stream>>>(counts, bounds, experts, chunks);
     f8_moe_scatter<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks, bounds, rows,
             ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
-    f8_moe_tiles<<<1,1,0,stream>>>(bounds, tiles, small, experts, wide ? 64 : 32);
+    f8_moe_tiles<<<1,1,0,stream>>>(bounds, tiles, small, experts, G ? 128 : wide ? 64 : 32);
     f8_moe_zero_invalid<<<std::min(cols, 128),256,0,stream>>>((const char *)ids->data, bounds,
             (float *)dst->data, gate ? up : nullptr, dst->ne[0], ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
-    ggml_cuda_pool_alloc<half> activations(ctx.pool(), size_t(cols)*src->ne[0]);
-    f8_moe_convert<<<cols,256,0,stream>>>((const char *)src->data, activations.get(), rows, bounds,
-            experts, src->ne[0], ids->ne[0], src->ne[1], src->nb[1], src->nb[2]);
-    auto multiply = [&](const ggml_tensor * w, const ggml_tensor * bias, float * output) {
-        f8_moe_routing routing{rows, bounds, tiles, experts, w->nb[1], w->nb[2],
-                bias ? (const char *)bias->data : nullptr, bias ? bias->nb[1] : 0};
-        auto launch = [&](auto layout) {
-            using L = decltype(layout);
-            auto small_routing = routing;
-            small_routing.tiles = small;
-            launch_f8_moe<L,8,4,1,128>(src->ne[0], dst->ne[0], cols,
-                    (const char *)w->data, activations.get(), output, small_routing, stream, true);
-            if (wide) {
-                launch_f8_moe<L,64,4,1,128>(src->ne[0], dst->ne[0], cols,
-                        (const char *)w->data, activations.get(), output, routing, stream);
-            } else if (single) {
-                launch_f8_moe<L,32,4,1,128>(src->ne[0], dst->ne[0], cols,
-                        (const char *)w->data, activations.get(), output, routing, stream);
-            } else {
-                launch_f8_moe<L,32,4,2,64>(src->ne[0], dst->ne[0], cols,
-                        (const char *)w->data, activations.get(), output, routing, stream);
-            }
+    ggml_cuda_pool_alloc<f8_activation<G>> activations(ctx.pool(), size_t(cols)*src->ne[0]);
+    auto run = [&](const float * scales) {
+        auto multiply = [&](const ggml_tensor * w, const ggml_tensor * bias, float * output) {
+            f8_moe_routing routing{rows, bounds, tiles, experts, w->nb[1], w->nb[2],
+                    bias ? (const char *)bias->data : nullptr, bias ? bias->nb[1] : 0};
+            auto launch = [&](auto layout) {
+                using L = decltype(layout);
+                auto small_routing = routing;
+                small_routing.tiles = small;
+                launch_f8_moe<L,8,4,1,128,G>(src->ne[0], dst->ne[0], cols,
+                        (const char *)w->data, activations.get(), output, small_routing, stream, scales, true);
+                if constexpr (G != 0) {
+                    launch_f8_moe<L,128,8,1,128,G>(src->ne[0], dst->ne[0], cols,
+                            (const char *)w->data, activations.get(), output, routing, stream, scales);
+                } else if (wide) {
+                    launch_f8_moe<L,64,4,1,128>(src->ne[0], dst->ne[0], cols,
+                            (const char *)w->data, activations.get(), output, routing, stream);
+                } else if (single) {
+                    launch_f8_moe<L,32,4,1,128>(src->ne[0], dst->ne[0], cols,
+                            (const char *)w->data, activations.get(), output, routing, stream);
+                } else {
+                    launch_f8_moe<L,32,4,2,64>(src->ne[0], dst->ne[0], cols,
+                            (const char *)w->data, activations.get(), output, routing, stream);
+                }
+            };
+            if (blocked) launch(ggml_cuda_f8_block{});
+            else launch(ggml_cuda_f8_row{});
         };
-        if (blocked) launch(ggml_cuda_f8_block{});
-        else launch(ggml_cuda_f8_row{});
+        multiply(weight, bias_up, gate ? up : (float *)dst->data);
+        if (gate) multiply(gate, bias_gate, (float *)dst->data);
     };
-    multiply(weight, bias_up, gate ? up : (float *)dst->data);
-    if (gate) multiply(gate, bias_gate, (float *)dst->data);
+    if constexpr (G != 0) {
+        ggml_cuda_pool_alloc<float> scales(ctx.pool(), size_t(cols)*((src->ne[0]+G-1)/G));
+        f8_moe_convert<G><<<cols,256,0,stream>>>((const char *)src->data, activations.get(), rows, bounds,
+                experts, src->ne[0], ids->ne[0], src->ne[1], src->nb[1], src->nb[2], scales.get());
+        run(scales.get());
+    } else {
+        f8_moe_convert<<<cols,256,0,stream>>>((const char *)src->data, activations.get(), rows, bounds,
+                experts, src->ne[0], ids->ne[0], src->ne[1], src->nb[1], src->nb[2]);
+        run(nullptr);
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+static bool ggml_cuda_mul_mat_f8_id(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
+        const ggml_tensor * src, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * gate = nullptr,
+        const ggml_tensor * bias_up = nullptr, const ggml_tensor * bias_gate = nullptr, float * up = nullptr) {
+    if (ggml_get_input_scale(weight) == -1.0f && f8_mma_available(ggml_cuda_info().devices[ctx.device].cc) &&
+            (!gate || ggml_get_input_scale(gate) == -1.0f)) {
+        return ggml_cuda_mul_mat_f8_id_impl<f8_activation_group>(ctx, weight, src, ids, dst, gate, bias_up, bias_gate, up);
+    }
+    return ggml_cuda_mul_mat_f8_id_impl<0>(ctx, weight, src, ids, dst, gate, bias_up, bias_gate, up);
 }
 
 static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * next) {
@@ -5121,6 +5227,19 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
         }
     }
 
+    if (cuda_graph_update_required) {
+        graph->f8_w8a8 = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const auto * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT &&
+                    (node->src[0]->type == GGML_TYPE_F8_E4M3_KS || node->src[0]->type == GGML_TYPE_F8_E4M3_B128) &&
+                    ggml_get_input_scale(node->src[0]) == -1.0f) {
+                graph->f8_w8a8 = true;
+                break;
+            }
+        }
+    }
+
     graph->uid = cgraph->uid;
 
     return cuda_graph_update_required;
@@ -5283,6 +5402,9 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     }
 
     if (use_cuda_graph && cuda_graph_update_required) {
+#ifdef GGML_CUDA_F8_LT
+        if (graph->f8_w8a8) f8_lt_prepare(*cuda_ctx, cgraph);
+#endif
         // Start CUDA graph capture
         // Why are we protecting an atomic_int with a mutex?
         {

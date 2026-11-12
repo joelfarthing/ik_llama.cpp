@@ -292,6 +292,16 @@ static void populate_moe_siblings(const char * name, tensor_reload_source & src)
 // ------------------------------------------------------------------
 // Snapshot helper
 // ------------------------------------------------------------------
+static void reload_fp8_input_scale(ggml_tensor * tensor, const tensor_reload_source & src) {
+    const bool was_fp8 = src.original_type == GGML_TYPE_F8_E4M3_KS || src.original_type == GGML_TYPE_F8_E4M3_B128;
+    const bool is_fp8 = tensor->type == GGML_TYPE_F8_E4M3_KS || tensor->type == GGML_TYPE_F8_E4M3_B128;
+    if (was_fp8 || is_fp8) {
+        ggml_set_input_scale(tensor, was_fp8 && is_fp8 ? src.original_input_scale : 0.0f);
+    } else if (src.original_type == GGML_TYPE_NVFP4_KS && tensor->type == GGML_TYPE_NVFP4_KS) {
+        ggml_set_input_scale(tensor, src.original_input_scale);
+    }
+}
+
 static void snapshot_tensor_source(struct ggml_tensor * tensor,
                                    tensor_reload_source & src)
 {
@@ -301,6 +311,7 @@ static void snapshot_tensor_source(struct ggml_tensor * tensor,
     src.original_data   = tensor->data;
     src.original_nbytes = ggml_nbytes(tensor);
     src.original_type   = tensor->type;
+    src.original_input_scale = ggml_get_input_scale(tensor);
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         src.original_ne[i] = tensor->ne[i];
         src.original_nb[i] = tensor->nb[i];
@@ -421,6 +432,7 @@ static bool reattach_split_tensor_to_shared(llama_model & model, const char * na
     tensor->buffer = src.original_buffer;
     tensor->data   = src.original_data;
     tensor->type   = src.original_type;
+    reload_fp8_input_scale(tensor, src);
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         tensor->ne[i] = src.original_ne[i];
         tensor->nb[i] = src.original_nb[i];
@@ -442,6 +454,7 @@ static bool reattach_split_tensor_to_shared(llama_model & model, const char * na
                 extra->splits[i]->data   = os.data;
                 extra->splits[i]->buffer = os.buffer;
                 extra->splits[i]->type   = src.original_type;
+                reload_fp8_input_scale(extra->splits[i], src);
                 for (int j = 0; j < GGML_MAX_DIMS; ++j) {
                     extra->splits[i]->ne[j] = os.ne[j];
                     extra->splits[i]->nb[j] = os.nb[j];
@@ -763,6 +776,7 @@ static bool reload_tensor_non_split_path(
         tensor->buffer = src.original_buffer;
         tensor->data   = src.original_data;
         tensor->type   = src.original_type;
+        reload_fp8_input_scale(tensor, src);
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
             tensor->ne[i] = src.original_ne[i];
             tensor->nb[i] = src.original_nb[i];
@@ -813,7 +827,7 @@ static bool reload_tensor_non_split_path(
 static bool apply_tensor_type_change(
         llama_model & /*model*/,
         struct ggml_tensor * tensor,
-        tensor_reload_source & /*src*/,
+        tensor_reload_source & src,
         ggml_type curr_type)
 {
 #ifndef NDEBUG
@@ -821,6 +835,7 @@ static bool apply_tensor_type_change(
     (void)name;
 #endif
     tensor->type = curr_type;
+    reload_fp8_input_scale(tensor, src);
 
     int n_dims = 0;
     for (int i = GGML_MAX_DIMS - 1; i >= 0; --i) {
@@ -877,6 +892,7 @@ static bool apply_tensor_type_change(
             auto split = extra->splits[i];
             if (!split) continue;
             split->type = curr_type;
+            reload_fp8_input_scale(split, src);
             auto t = ggml_new_tensor(ctx, curr_type, n_dims, split->ne);
             if (t) {
                 for (int j = 0; j < GGML_MAX_DIMS; ++j) split->nb[j] = t->nb[j];

@@ -119,7 +119,8 @@ struct llama_model_loader {
             const llama_model_kv_override * param_overrides_p,
             const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
             const std::string & ngram_fname = std::string(),
-            llama_nvfp4_precision nvfp4_precision = LLAMA_NVFP4_PRECISION_AUTO);
+            llama_nvfp4_precision nvfp4_precision = LLAMA_NVFP4_PRECISION_AUTO,
+            llama_fp8_precision fp8_precision = LLAMA_FP8_PRECISION_AUTO);
 
     ~llama_model_loader();
 

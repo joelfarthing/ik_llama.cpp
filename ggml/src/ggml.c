@@ -6056,7 +6056,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT);
     GGML_ASSERT(n_dims >= 1 && n_dims <= GGML_MAX_DIMS);
 
-    const float input_scale = type == GGML_TYPE_NVFP4_KS && view_src ? ggml_get_input_scale(view_src) : 0.0f;
+    const float input_scale = (type == GGML_TYPE_NVFP4_KS || type == GGML_TYPE_F8_E4M3_KS || type == GGML_TYPE_F8_E4M3_B128) && view_src ? ggml_get_input_scale(view_src) : 0.0f;
 
     // find the base tensor and absolute offset
     if (view_src != NULL && view_src->view_src != NULL) {
@@ -6132,7 +6132,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     #pragma clang diagnostic pop
 #endif
 
-    if (type == GGML_TYPE_NVFP4_KS && view_src) {
+    if ((type == GGML_TYPE_NVFP4_KS || type == GGML_TYPE_F8_E4M3_KS || type == GGML_TYPE_F8_E4M3_B128) && view_src) {
         ggml_set_input_scale(result, input_scale);
     }
 
@@ -6235,7 +6235,7 @@ float ggml_get_input_scale(const struct ggml_tensor * tensor) {
 
 struct ggml_tensor * ggml_dup_tensor(struct ggml_context * ctx, const struct ggml_tensor * src) {
     struct ggml_tensor * result = ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
-    if (src->type == GGML_TYPE_NVFP4_KS) {
+    if ((src->type == GGML_TYPE_NVFP4_KS || src->type == GGML_TYPE_F8_E4M3_KS || src->type == GGML_TYPE_F8_E4M3_B128)) {
         ggml_set_input_scale(result, ggml_get_input_scale(src));
     }
     return result;

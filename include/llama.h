@@ -399,6 +399,12 @@ extern "C" {
         LLAMA_NVFP4_PRECISION_INT8 = 2,
     };
 
+    enum llama_fp8_precision {
+        LLAMA_FP8_PRECISION_AUTO = 0,
+        LLAMA_FP8_PRECISION_W8A16 = 1,
+        LLAMA_FP8_PRECISION_W8A8 = 2,
+    };
+
     struct llama_model_params {
         // comma separated list of devices to use for offloading
         const char* devices;
@@ -460,6 +466,7 @@ extern "C" {
         // separate GGUF with the n-gram tables (per-layer token embedding, Engram), NULL if none
         const char * ngram_file;
         enum llama_nvfp4_precision nvfp4_precision;
+        enum llama_fp8_precision fp8_precision;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;    // only load the vocabulary, no weights

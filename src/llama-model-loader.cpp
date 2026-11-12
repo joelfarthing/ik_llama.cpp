@@ -306,7 +306,7 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         bool repack_tensors, bool use_thp, bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
-        const std::string & ngram_fname, llama_nvfp4_precision nvfp4_precision) {
+        const std::string & ngram_fname, llama_nvfp4_precision nvfp4_precision, llama_fp8_precision fp8_precision) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -491,6 +491,13 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     }
 
     if (import_f8_e4m3()) use_mmap = false;
+    if (fp8_precision == LLAMA_FP8_PRECISION_W8A8) {
+        for (auto & w : weights) {
+            if (w.tensor->type == GGML_TYPE_F8_E4M3_KS || w.tensor->type == GGML_TYPE_F8_E4M3_B128) {
+                ggml_set_input_scale(w.tensor, -1.0f);
+            }
+        }
+    }
 
     n_kv      = gguf_get_n_kv(meta);
     n_tensors = weights.size();
