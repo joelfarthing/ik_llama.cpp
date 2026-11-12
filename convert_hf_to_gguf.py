@@ -2600,11 +2600,11 @@ class ModelOptModel(Model):
         d_ue = scale.view(torch.uint8).numpy().reshape(out_features, n_blocks) & 0x7F
         qs = (vals[:, :, :8] | (vals[:, :, 8:] << 4)).to(torch.uint8).numpy()
         n_super = n_blocks // 4
-        raw = np.concatenate([d_ue.reshape(out_features, n_super, 4),
-                              qs.reshape(out_features, n_super, 32)], axis=-1).reshape(out_features, n_super * 36)
-        rows = np.empty((out_features, raw.shape[1] + 4), dtype=np.uint8)
+        rows = np.empty((out_features, n_super * 36 + 4), dtype=np.uint8)
         rows[:, :4] = scale2.float().reshape(1).numpy().astype('>f4' if big_endian else '<f4').view(np.uint8)
-        rows[:, 4:] = raw
+        payload = rows[:, 4:].reshape(out_features, n_super, 36)
+        payload[:, :, :4] = d_ue.reshape(out_features, n_super, 4)
+        payload[:, :, 4:] = qs.reshape(out_features, n_super, 32)
         return rows
 
     def _pack_nvfp4(self, name, weight, scale, scale2):
@@ -2707,9 +2707,8 @@ class ModelOptModel(Model):
                         consumed.update((name, scale_name, base + ".weight_scale_2", base + ".input_scale"))
                         continue
                     blocks = tuple(parts[i][0] for i in range(self.hparams["num_experts"]))
-                    raw = gguf.LazyNumpyTensor(
-                        meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(np.uint8, (len(blocks), *blocks[0].shape)),
-                        args=(blocks,), func=lambda blocks: np.stack(blocks))
+                    chunks = [lambda block=block: gguf.LazyNumpyTensor.to_eager(block) for block in blocks]
+                    raw = gguf.LazyChunkedTensor(chunks, (len(blocks), *blocks[0].shape), np.uint8)
                     input_scale = torch.cat([parts[i][1].float().reshape(-1) for i in range(self.hparams["num_experts"])])
                     del expert_parts[merged_name]
                     new_name = self.map_tensor_name(merged_name)
@@ -2915,17 +2914,6 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         head_v_dim = self.hparams["linear_value_head_dim"]
         num_v_per_k = num_v_heads // num_k_heads
 
-        def unpack_nibbles(qs: Tensor) -> Tensor:
-            lo = torch.bitwise_and(qs, 0x0F)
-            hi = torch.bitwise_right_shift(qs, 4)
-            return torch.stack((lo, hi), dim=-1).reshape(*qs.shape[:-1], qs.shape[-1] * 2)
-
-        def pack_nibbles(codes: Tensor) -> Tensor:
-            codes = codes.reshape(*codes.shape[:-1], codes.shape[-1] // 2, 2)
-            lo = torch.bitwise_and(codes[..., 0], 0x0F)
-            hi = torch.bitwise_left_shift(torch.bitwise_and(codes[..., 1], 0x0F), 4)
-            return torch.bitwise_or(lo, hi).contiguous()
-
         def apply_col_perm(qs: Tensor, scales: Tensor, col_perm: Tensor) -> tuple[Tensor, Tensor]:
             k = qs.shape[-1] * 2
             assert col_perm.numel() == k
@@ -2939,9 +2927,8 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 
             group_perm = (group_starts // 16).to(dtype=torch.long)
 
-            codes = unpack_nibbles(qs)
-            codes = codes.index_select(-1, col_perm.to(device=qs.device, dtype=torch.long))
-            qs = pack_nibbles(codes)
+            groups = qs.reshape(*qs.shape[:-1], k // 16, 8)
+            qs = groups.index_select(-2, group_perm.to(device=qs.device)).reshape(qs.shape)
             scales = scales.index_select(-1, group_perm.to(device=scales.device))
             return qs, scales
 
