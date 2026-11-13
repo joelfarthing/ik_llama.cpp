@@ -4469,6 +4469,14 @@ static void llama_init_sampler_from_model(const llama_model * model, common_para
     get_float("general.sampling.mirostat_eta",     sparams.mirostat_eta,    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+void fp8_auto_warning(const llama_model * model, llama_fp8_precision precision) {
+    char scheme[16];
+    if (precision == LLAMA_FP8_PRECISION_AUTO && llama_model_meta_val_str(model, "general.fp8.activations", scheme, sizeof(scheme)) > 0 &&
+            (strcmp(scheme, "dynamic") == 0 || strcmp(scheme, "static") == 0)) {
+        fprintf(stderr, "warning: --fp8-precision auto: this file declares 8-bit activations, so its FP8 tensors use W8A8 where a fast path exists. Use --fp8-precision w8a16 for exact-mode results\n");
+    }
+}
+
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
 

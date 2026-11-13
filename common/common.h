@@ -755,6 +755,7 @@ struct llama_init_result {
 };
 
 struct llama_init_result    llama_init_from_gpt_params(gpt_params & params);
+void fp8_auto_warning(const llama_model * model, llama_fp8_precision precision);
 
 struct llama_model_params   common_model_params_to_llama  (const gpt_params & params);
 struct llama_context_params common_context_params_to_llama(const gpt_params & params);
