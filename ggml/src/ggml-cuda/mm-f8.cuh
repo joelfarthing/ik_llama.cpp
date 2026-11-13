@@ -132,14 +132,15 @@ static bool f8_w8a8(const ggml_tensor * weight, int cc) {
 }
 
 template <int G>
-static __device__ void f8_quantize_group(const float * input, uint8_t * output, float * scales, int n, int group) {
+static __device__ void f8_quantize_group(const float * input, uint8_t * output, float * scales, int n, int group,
+        const float * gate = nullptr) {
 #if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080 && __CUDA_ARCH__ >= 890
     const int lane = threadIdx.x%32;
     float values[G/32], amax = 0;
 #pragma unroll
     for (int j = 0; j < G/32; ++j) {
         const int k = group*G + lane + 32*j;
-        values[j] = k < n ? input[k] : 0;
+        values[j] = k < n ? (gate ? gate[k] * input[k] / (1.0f + expf(-gate[k])) : input[k]) : 0;
         amax = fmaxf(amax, fabsf(values[j]));
     }
     amax = warp_reduce_max(amax);
@@ -151,7 +152,7 @@ static __device__ void f8_quantize_group(const float * input, uint8_t * output, 
         if (k < n) output[k] = scale == 0 ? 0 : __nv_cvt_float_to_fp8(__fdiv_rn(values[j], scale), __NV_SATFINITE, __NV_E4M3);
     }
 #else
-    GGML_UNUSED(input); GGML_UNUSED(output); GGML_UNUSED(scales); GGML_UNUSED(n); GGML_UNUSED(group);
+    GGML_UNUSED(input); GGML_UNUSED(output); GGML_UNUSED(scales); GGML_UNUSED(n); GGML_UNUSED(group); GGML_UNUSED(gate);
     NO_DEVICE_CODE;
 #endif
 }
@@ -162,6 +163,15 @@ static __global__ void f8_quantize(const float * input, uint8_t * output, float 
     if (group < (n+G-1)/G) {
         f8_quantize_group<G>(input + blockIdx.y*stride, output + size_t(blockIdx.y)*n,
                 scales + size_t(blockIdx.y)*((n+G-1)/G), n, group);
+    }
+}
+
+template <int G>
+static __global__ void f8_silu_quantize(const float * gate, const float * up, uint8_t * output, float * scales, int n, size_t stride) {
+    const int group = blockIdx.x*4 + threadIdx.x/32;
+    if (group < (n+G-1)/G) {
+        f8_quantize_group<G>(up + blockIdx.y*stride, output + size_t(blockIdx.y)*n,
+                scales + size_t(blockIdx.y)*((n+G-1)/G), n, group, gate + blockIdx.y*stride);
     }
 }
 

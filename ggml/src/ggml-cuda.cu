@@ -3085,6 +3085,36 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         }
     }
 #endif
+    if (!use_lt && cgraph && dst->src[0]->type == GGML_TYPE_F8_E4M3_B128 && cc < 1200) {
+        auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
+        const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
+        if (id < cgraph->n_nodes) {
+            ggml_tensor * second = cgraph->nodes[ig], * unary = cgraph->nodes[iu], * down = cgraph->nodes[id];
+            const bool swapped = unary->src[0] == dst && unary->src[1] == second;
+            ggml_tensor * up = swapped ? second : dst, * gate = swapped ? dst : second;
+            const int m = dst->ne[0], limit = ggml_cuda_info().devices[ctx.device].smpbo;
+            if (compatible(second, src1) && second->src[0]->type == GGML_TYPE_F8_E4M3_B128 && second->ne[0] == m &&
+                unary->op == GGML_OP_FUSED_MUL_UNARY && unary->src[0] == gate && unary->src[1] == up &&
+                (ggml_unary_op)unary->op_params[0] == GGML_UNARY_OP_SILU && *(const float *)(unary->op_params + 1) < 1e-6f &&
+                compatible(down, unary) && down->src[0]->type == GGML_TYPE_F8_E4M3_B128 &&
+                f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
+                f8_readers(cgraph, iu + 1, unary) == 1 &&
+                launch_f8_w8a8(ctx, up->src[0], limit, n, m, cols, m, (const char *)up->src[0]->data, activations.get(),
+                        (float *)up->data, scales.get(), stream) &&
+                launch_f8_w8a8(ctx, gate->src[0], limit, n, m, cols, m, (const char *)gate->src[0]->data, activations.get(),
+                        (float *)gate->data, scales.get(), stream)) {
+                ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
+                ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*((m+G-1)/G));
+                f8_silu_quantize<G><<<dim3((m+4*G-1)/(4*G), cols), 128, 0, stream>>>((const float *)gate->data, (const float *)up->data,
+                        codes.get(), out_scales.get(), m, m);
+                if (launch_f8_w8a8(ctx, down->src[0], limit, m, down->ne[0], cols, down->ne[0], (const char *)down->src[0]->data,
+                            codes.get(), (float *)down->data, out_scales.get(), stream)) {
+                    CUDA_CHECK(cudaGetLastError());
+                    return id;
+                }
+            }
+        }
+    }
     for (;;) {
         const auto * weight = dst->src[0];
         bool done = false;
