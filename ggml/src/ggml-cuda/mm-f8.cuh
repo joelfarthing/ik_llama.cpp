@@ -165,6 +165,78 @@ static __global__ void f8_quantize(const float * input, uint8_t * output, float 
     }
 }
 
+template <int G>
+static __global__ void f8_norm_quantize(const float * x, const float * w, uint8_t * output, float * scales,
+        int k, size_t stride, float eps) {
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080 && __CUDA_ARCH__ >= 890
+    __shared__ float shared[G ? 512 : 32];
+    const float * xr = x + size_t(blockIdx.x)*stride;
+    const int lane = threadIdx.x%32, warp = threadIdx.x/32;
+    float values[16];
+    float tmp = 0;
+    int count = 0;
+    for (int col = threadIdx.x; col < k; col += 1024) {
+        const float xi = xr[col];
+        values[count++] = xi;
+        tmp += xi * xi;
+    }
+    tmp = warp_reduce_sum(tmp);
+    if (lane == 0) shared[warp] = tmp;
+    __syncthreads();
+    tmp = shared[lane];
+    tmp = warp_reduce_sum(tmp);
+    const float mean = tmp / k;
+    const float scale = rsqrtf(mean + eps);
+    if constexpr (G == 0) {
+        __shared__ float qscale;
+        float amax = 0;
+        count = 0;
+        for (int col = threadIdx.x; col < k; col += 1024) {
+            const float v = scale * w[col] * values[count];
+            values[count++] = v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+        __syncthreads();
+        amax = warp_reduce_max(amax);
+        if (lane == 0) shared[warp] = amax;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            amax = warp_reduce_max(shared[threadIdx.x]);
+            if (threadIdx.x == 0) {
+                qscale = __fdiv_rn(amax, 448.0f);
+                scales[blockIdx.x] = qscale == 0 ? 1.0f : qscale;
+            }
+        }
+        __syncthreads();
+        count = 0;
+        for (int col = threadIdx.x; col < k; col += 1024) {
+            output[size_t(blockIdx.x)*k+col] = qscale == 0 ? 0 :
+                __nv_cvt_float_to_fp8(__fdiv_rn(values[count++], qscale), __NV_SATFINITE, __NV_E4M3);
+        }
+    } else {
+        __syncthreads();
+        for (int i = 0; 1024*i < k; ++i) {
+            const int col = threadIdx.x + 1024*i;
+            values[i] = col < k ? scale * w[col] * values[i] : 0;
+            const float amax = warp_reduce_max(fabsf(values[i]));
+            if (lane == 0) shared[32*i + warp] = amax;
+        }
+        __syncthreads();
+        for (int i = 0, col = threadIdx.x; col < k; ++i, col += 1024) {
+            float amax = 0;
+            for (int j = 0; j < G/32; ++j) amax = fmaxf(amax, shared[32*i + warp/(G/32)*(G/32) + j]);
+            const float qscale = __fdiv_rn(amax, 448.0f);
+            if (threadIdx.x%G == 0) scales[size_t(blockIdx.x)*((k+G-1)/G) + col/G] = qscale == 0 ? 1.0f : qscale;
+            output[size_t(blockIdx.x)*k + col] = qscale == 0 ? 0 :
+                __nv_cvt_float_to_fp8(__fdiv_rn(values[i], qscale), __NV_SATFINITE, __NV_E4M3);
+        }
+    }
+#else
+    GGML_UNUSED(x); GGML_UNUSED(w); GGML_UNUSED(output); GGML_UNUSED(scales); GGML_UNUSED(k); GGML_UNUSED(stride); GGML_UNUSED(eps);
+    NO_DEVICE_CODE;
+#endif
+}
+
 template <typename layout, int BN, int NW, int stages, bool tail = true, int BK = 64, bool indexed = false, int G = 0>
 static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
         int n, int rows, int cols, int ldc, const char * __restrict__ x, const f8_activation<G> * __restrict__ y, float * __restrict__ z,

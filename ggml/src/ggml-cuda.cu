@@ -2943,12 +2943,10 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
     constexpr int G = f8_activation_group;
     const int n = src1->ne[0], cols = src1->ne[1];
     const bool use_lt = f8_lt_supported(ctx, dst);
-    if (norm && !use_lt) return -1;
-#ifdef GGML_CUDA_F8_LT
     int chain = 0;
     if (norm) {
         int last = node_n;
-        for (int j = node_n; j < cgraph->n_nodes && compatible(cgraph->nodes[j], src1) && f8_lt_supported(ctx, cgraph->nodes[j]);) {
+        for (int j = node_n; j < cgraph->n_nodes && compatible(cgraph->nodes[j], src1) && f8_lt_supported(ctx, cgraph->nodes[j]) == use_lt;) {
             ++chain;
             last = j;
             do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j]));
@@ -2963,17 +2961,18 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         }
         if (!live || f8_readers(cgraph, node_n, norm) != chain) return -1;
     }
-#endif
     ggml_cuda_pool_alloc<uint8_t> activations(ctx.pool(), size_t(cols)*n);
     ggml_cuda_pool_alloc<float> scales(ctx.pool(), size_t(cols)*(use_lt ? 1 : (n+G-1)/G));
     auto stream = ctx.stream();
-#ifdef GGML_CUDA_F8_LT
     if (norm) {
         float eps;
         memcpy(&eps, norm->op_params, sizeof(float));
-        f8_lt_norm_quantize<<<cols,1024,0,stream>>>((const float *)norm->src[0]->data, (const float *)norm->src[1]->data,
+        auto kernel = use_lt ? f8_norm_quantize<0> : f8_norm_quantize<G>;
+        kernel<<<cols,1024,0,stream>>>((const float *)norm->src[0]->data, (const float *)norm->src[1]->data,
                 activations.get(), scales.get(), n, norm->src[0]->nb[1]/sizeof(float), eps);
-    } else if (use_lt) f8_lt_quantize<<<cols,256,0,stream>>>((const float *)src1->data, activations.get(), scales.get(), n, src1->nb[1]/sizeof(float));
+    } else
+#ifdef GGML_CUDA_F8_LT
+    if (use_lt) f8_lt_quantize<<<cols,256,0,stream>>>((const float *)src1->data, activations.get(), scales.get(), n, src1->nb[1]/sizeof(float));
     else
 #endif
     f8_quantize<G><<<dim3((n+4*G-1)/(4*G),cols),128,0,stream>>>(

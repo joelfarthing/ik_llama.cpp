@@ -56,53 +56,6 @@ static __global__ void f8_lt_scale(const char * weight, const float * scales, fl
 static __device__ __forceinline__ float f8_lt_value(float x) { return x; }
 static __device__ __forceinline__ float f8_lt_value(nv_bfloat16 x) { return __bfloat162float(x); }
 
-static __global__ void f8_lt_norm_quantize(const float * x, const float * w, uint8_t * output, float * scales,
-        int k, size_t stride, float eps) {
-    __shared__ float shared[32];
-    __shared__ float qscale;
-    const float * xr = x + size_t(blockIdx.x)*stride;
-    const int lane = threadIdx.x%32, warp = threadIdx.x/32;
-    float values[16];
-    float tmp = 0;
-    int count = 0;
-    for (int col = threadIdx.x; col < k; col += 1024) {
-        const float xi = xr[col];
-        values[count++] = xi;
-        tmp += xi * xi;
-    }
-    tmp = warp_reduce_sum(tmp);
-    if (lane == 0) shared[warp] = tmp;
-    __syncthreads();
-    tmp = shared[lane];
-    tmp = warp_reduce_sum(tmp);
-    const float mean = tmp / k;
-    const float scale = rsqrtf(mean + eps);
-    float amax = 0;
-    count = 0;
-    for (int col = threadIdx.x; col < k; col += 1024) {
-        const float v = scale * w[col] * values[count];
-        values[count++] = v;
-        amax = fmaxf(amax, fabsf(v));
-    }
-    __syncthreads();
-    amax = warp_reduce_max(amax);
-    if (lane == 0) shared[warp] = amax;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        amax = warp_reduce_max(shared[threadIdx.x]);
-        if (threadIdx.x == 0) {
-            qscale = __fdiv_rn(amax, 448.0f);
-            scales[blockIdx.x] = qscale == 0 ? 1.0f : qscale;
-        }
-    }
-    __syncthreads();
-    count = 0;
-    for (int col = threadIdx.x; col < k; col += 1024) {
-        output[size_t(blockIdx.x)*k+col] = qscale == 0 ? 0 :
-            __nv_cvt_float_to_fp8(__fdiv_rn(values[count++], qscale), __NV_SATFINITE, __NV_E4M3);
-    }
-}
-
 template <typename T>
 static __global__ void f8_lt_scale_add(const char * weight, const float * scales, const T * product, const float * other,
         float * output, int m, int n, int k, int ldc) {
