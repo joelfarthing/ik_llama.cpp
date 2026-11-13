@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <unordered_map>
 #include <array>
 #include <chrono>
 #include <barrier>
@@ -1780,6 +1781,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
+        std::unordered_map<const ggml_tensor *, int> node_split;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -1848,11 +1850,18 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                 cur_backend_id = node_backend_id;
             }
 
+            node_split[node] = i_split;
+
             // find inputs that are not on the same backend
             for (int j = 0; j < GGML_MAX_SRC; j++) {
                 struct ggml_tensor * src = node->src[j];
                 if (src == NULL) {
                     continue;
+                }
+
+                struct ggml_tensor * root = src->view_src ? src->view_src : src;
+                if (auto it = node_split.find(root); it != node_split.end() && it->second != i_split) {
+                    root->flags |= GGML_TENSOR_FLAG_CROSS_SPLIT;
                 }
 
                 size_t src_id = hash_id(src);
