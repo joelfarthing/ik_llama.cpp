@@ -2859,8 +2859,7 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
                     src0_dd_i, activations.get(), dst_dd_i, scales.get(), stream)) return;
         }
     }
-    const bool ks_cublas = src0->type == GGML_TYPE_F8_E4M3_KS && cc == CC_ADA_LOVELACE && src1_ncols >= 1024;
-    if (src1_ncols > 8 && dst->op_params[0] == GGML_PREC_DEFAULT && new_mma_available(cc) && !ks_cublas) {
+    if (src1_ncols > 8 && dst->op_params[0] == GGML_PREC_DEFAULT && new_mma_available(cc)) {
         const int nrows = row_high - row_low;
         const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
         ggml_cuda_pool_alloc<half> activations(ctx.pool(ggml_cuda_get_device()), src1_ncols*src1->ne[0]);
@@ -3159,7 +3158,6 @@ static int ggml_cuda_mul_mat_f8_ks_exact(ggml_backend_cuda_context & ctx, const 
         if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 || node->op_params[0] != GGML_PREC_DEFAULT ||
                 w->type != GGML_TYPE_F8_E4M3_KS ||
                 (ggml_get_input_scale(w) == -1.0f && f8_mma_available(cc)) ||
-                (cc == CC_ADA_LOVELACE && src1->ne[1] >= 1024) ||
                 !ggml_is_contiguous(w) || !ggml_is_contiguous(node) || w->ne[2]*w->ne[3] != 1) return false;
         for (auto t : {w, src1, node}) {
             if (!ggml_backend_buffer_is_cuda(t->buffer) ||
