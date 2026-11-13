@@ -2879,11 +2879,27 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
     }
 }
 
+static int f8_readers(const ggml_cgraph * graph, int first, const ggml_tensor * t) {
+    if (t->view_src || (t->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_CROSS_SPLIT))) return -1;
+    int readers = 0;
+    for (int j = first; j < graph->n_nodes; ++j) {
+        const ggml_tensor * node = graph->nodes[j];
+        if (node->view_src == t) return -1;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (node->src[k] && (node->src[k] == t || node->src[k]->view_src == t)) {
+                ++readers;
+                break;
+            }
+        }
+    }
+    return readers;
+}
+
 static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
         ggml_tensor * dst, const ggml_cgraph * cgraph, int node_n) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    auto compatible = [&](const ggml_tensor * node) {
-        if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 ||
+    auto compatible = [&](const ggml_tensor * node, const ggml_tensor * input) {
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] != input ||
                 node->op_params[0] != GGML_PREC_DEFAULT || !f8_w8a8(node->src[0], cc) ||
                 !ggml_is_contiguous(node->src[0]) || !ggml_is_contiguous(node) ||
                 node->src[0]->ne[2]*node->src[0]->ne[3] != 1) return false;
@@ -2894,7 +2910,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         return true;
     };
     if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) || src1->ne[1] <= 8 ||
-            src1->ne[2]*src1->ne[3] != 1 || !compatible(dst)) return -1;
+            src1->ne[2]*src1->ne[3] != 1 || !compatible(dst, src1)) return -1;
     constexpr int G = f8_activation_group;
     const int n = src1->ne[0], cols = src1->ne[1];
     const bool use_lt = f8_lt_supported(ctx, dst);
@@ -2907,6 +2923,38 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
 #endif
     f8_quantize<G><<<dim3((n+4*G-1)/(4*G),cols),128,0,stream>>>(
             (const float *)src1->data, activations.get(), scales.get(), n, src1->nb[1]/sizeof(float));
+#ifdef GGML_CUDA_F8_LT
+    if (use_lt && cgraph) {
+        auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
+        const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
+        if (id < cgraph->n_nodes) {
+            ggml_tensor * second = cgraph->nodes[ig], * unary = cgraph->nodes[iu], * down = cgraph->nodes[id];
+            const bool swapped = unary->src[0] == dst && unary->src[1] == second;
+            ggml_tensor * up = swapped ? second : dst, * gate = swapped ? dst : second;
+            const int m = dst->ne[0];
+            if (compatible(second, src1) && f8_lt_supported(ctx, second) && second->ne[0] == m &&
+                unary->op == GGML_OP_FUSED_MUL_UNARY && unary->src[0] == gate && unary->src[1] == up &&
+                (ggml_unary_op)unary->op_params[0] == GGML_UNARY_OP_SILU && *(const float *)(unary->op_params + 1) < 1e-6f &&
+                compatible(down, unary) && f8_lt_supported(ctx, down) &&
+                f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
+                f8_readers(cgraph, iu + 1, unary) == 1 &&
+                m*sizeof(float) + 64 <= (size_t)ggml_cuda_info().devices[ctx.device].smpbo) {
+                auto & lt = f8_lt_context(ctx);
+                ggml_cuda_pool_alloc<float> row_scales(ctx.pool(), 2*m);
+                ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
+                ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), cols);
+                if (lt.up_gate(m, n, cols, m, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
+                            activations.get(), scales.get(), (float *)up->data, (float *)gate->data,
+                            row_scales.get(), codes.get(), out_scales.get(), stream) &&
+                    lt.launch(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
+                            codes.get(), out_scales.get(), (float *)down->data, stream)) {
+                    CUDA_CHECK(cudaGetLastError());
+                    return id;
+                }
+            }
+        }
+    }
+#endif
     for (;;) {
         const auto * weight = dst->src[0];
         bool done = false;
@@ -2926,7 +2974,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         if (!cgraph) break;
         int next = node_n+1;
         while (next < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[next])) ++next;
-        if (next == cgraph->n_nodes || !compatible(cgraph->nodes[next]) || f8_lt_supported(ctx, cgraph->nodes[next]) != use_lt) break;
+        if (next == cgraph->n_nodes || !compatible(cgraph->nodes[next], src1) || f8_lt_supported(ctx, cgraph->nodes[next]) != use_lt) break;
         node_n = next;
         dst = cgraph->nodes[node_n];
     }
@@ -3601,17 +3649,9 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
             ggml_backend_buffer_is_cuda(next->src[0]->buffer) && ggml_backend_buffer_is_cuda(next->buffer) &&
             ((ggml_backend_cuda_buffer_context *)next->src[0]->buffer->context)->device == ctx.device &&
             ((ggml_backend_cuda_buffer_context *)next->buffer->context)->device == ctx.device &&
-            ggml_is_contiguous(next) && !(dst->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-            const ggml_tensor * out = next->src[1];
-            bool sole = out->view_src == nullptr;
-            for (int j = i + 1; j < graph->n_nodes && sole; ++j) {
-                const ggml_tensor * node = graph->nodes[j];
-                if (node->view_src == out) sole = false;
-                for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                    if (node->src[k] && (node->src[k] == out || node->src[k]->view_src == out) && !(node == next && k == 1)) sole = false;
-                }
-            }
-            if (sole) fused = next;
+            ggml_is_contiguous(next) && !(dst->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            f8_readers(graph, i + 1, next->src[1]) == 1) {
+            fused = next;
         }
         if (fused && ggml_cuda_mul_mat_f8_id(ctx, src0_1, src1, ids, dst, src0_2, dst->src[4], dst->src[5], up.get(), fused)) {
             CUDA_CHECK(cudaGetLastError());

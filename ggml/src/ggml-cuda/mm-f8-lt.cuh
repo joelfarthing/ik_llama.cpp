@@ -53,6 +53,38 @@ static __global__ void f8_lt_scale(const char * weight, const float * scales, fl
     }
 }
 
+static __global__ void f8_lt_row_scales(const char * weight, float * output, int m, int k) {
+    const int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row < m) output[row] = ggml_cuda_f8_row::scale(weight + size_t(row)*ggml_cuda_f8_row::row_size(k));
+}
+
+static __global__ void f8_lt_up_gate(const float * up, const float * gate, const float * ws_up, const float * ws_gate,
+        const float * scales, uint8_t * output, float * out_scales, int m, int ldc) {
+    extern __shared__ float values[];
+    __shared__ float maxima[8];
+    __shared__ float scale;
+    const size_t offset = size_t(blockIdx.x)*ldc;
+    const float as = scales[blockIdx.x];
+    float amax = 0;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) {
+        const float g = gate[offset+i] * __fmul_rn(ws_gate[i], as);
+        const float u = up[offset+i] * __fmul_rn(ws_up[i], as);
+        const float v = g * u / (1.0f + expf(-g));
+        values[i] = v;
+        amax = fmaxf(amax, fabsf(v));
+    }
+    amax = block_reduce_max(amax, maxima);
+    if (threadIdx.x == 0) {
+        scale = __fdiv_rn(amax, 448.0f);
+        out_scales[blockIdx.x] = scale == 0 ? 1.0f : scale;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < m; i += blockDim.x) {
+        output[size_t(blockIdx.x)*m+i] = scale == 0 ? 0 :
+            __nv_cvt_float_to_fp8(__fdiv_rn(values[i], scale), __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
 struct ggml_cuda_f8_lt_context {
     struct plan {
         cublasLtMatmulDesc_t op;
@@ -68,6 +100,7 @@ struct ggml_cuda_f8_lt_context {
     };
     static constexpr size_t workspace_size = 32*1024*1024;
     int device;
+    int shared_limit = 0;
     cublasLtHandle_t handle;
     void * workspace;
     std::map<std::array<int,4>, std::unique_ptr<plan>> plans;
@@ -140,8 +173,7 @@ struct ggml_cuda_f8_lt_context {
         CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
         return *plans.emplace(shape, std::move(p)).first->second;
     }
-    bool launch(int m, int k, int n, int ldc, const char * weight, const uint8_t * activation,
-            const float * scales, float * output, cudaStream_t stream) {
+    bool matmul(int m, int k, int n, int ldc, const char * weight, const uint8_t * activation, float * output, cudaStream_t stream) {
         auto & p = get(m,k,n,ldc);
         if (!p.supported) return false;
         const float alpha = 1.0f, beta = 0;
@@ -152,7 +184,26 @@ struct ggml_cuda_f8_lt_context {
             return false;
         }
         CUBLAS_CHECK(status);
+        return true;
+    }
+    bool launch(int m, int k, int n, int ldc, const char * weight, const uint8_t * activation,
+            const float * scales, float * output, cudaStream_t stream) {
+        if (!matmul(m,k,n,ldc,weight,activation,output,stream)) return false;
         f8_lt_scale<<<dim3((m+1023)/1024,(n+15)/16),256,0,stream>>>(weight,scales,output,m,n,k,ldc);
+        return true;
+    }
+    bool up_gate(int m, int k, int n, int ldc, const char * up, const char * gate, const uint8_t * activation,
+            const float * scales, float * up_out, float * gate_out, float * row_scales, uint8_t * codes, float * out_scales,
+            cudaStream_t stream) {
+        if (!matmul(m,k,n,ldc,up,activation,up_out,stream) || !matmul(m,k,n,ldc,gate,activation,gate_out,stream)) return false;
+        const int bytes = m*sizeof(float);
+        if (bytes > shared_limit) {
+            CUDA_CHECK(cudaFuncSetAttribute(f8_lt_up_gate, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+            shared_limit = bytes;
+        }
+        f8_lt_row_scales<<<(m+255)/256,256,0,stream>>>(up,row_scales,m,k);
+        f8_lt_row_scales<<<(m+255)/256,256,0,stream>>>(gate,row_scales+m,m,k);
+        f8_lt_up_gate<<<n,256,bytes,stream>>>(up_out,gate_out,row_scales,row_scales+m,scales,codes,out_scales,m,ldc);
         return true;
     }
 };
