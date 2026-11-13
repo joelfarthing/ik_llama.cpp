@@ -263,7 +263,8 @@ class Model:
             if block_cols != 128 or weight.shape[-1] % 128:
                 reason = "block layout is not representable as F8_E4M3_B128"
         if not transforms_done and type(self).modify_tensors not in (Model.modify_tensors, LlamaModel.modify_tensors,
-                                           Qwen2MoeModel.modify_tensors, DeepseekV2Model.modify_tensors):
+                                           Qwen2MoeModel.modify_tensors, DeepseekV2Model.modify_tensors,
+                                           LFM2MoeModel.modify_tensors):
             reason = f"{type(self).__name__} tensor transforms require dequantization"
         if type(self).modify_tensors is DeepseekV2Model.modify_tensors and name.endswith("kv_b_proj.weight"):
             reason = "kv_b_proj column transpose requires dequantization"
@@ -8330,16 +8331,22 @@ class LFM2MoeModel(LFM2Model):
                 return []
 
             tensors: list[tuple[str, Tensor]] = []
-            for w_name in ("w1", "w2", "w3"):
+            proj = {"gate_proj": gguf.MODEL_TENSOR.FFN_GATE_EXP, "down_proj": gguf.MODEL_TENSOR.FFN_DOWN_EXP,
+                    "up_proj": gguf.MODEL_TENSOR.FFN_UP_EXP}
+            split = f"model.layers.{bid}.feed_forward.experts.0.gate_proj.weight" in self._experts[bid]
+            for w_name in (proj if split else ("w1", "w2", "w3")):
                 datas: list[Tensor] = []
                 for xid in range(n_expert):
                     ename = f"model.layers.{bid}.feed_forward.experts.{xid}.{w_name}.weight"
                     datas.append(self._experts[bid][ename])
                     del self._experts[bid][ename]
 
-                merged = torch.stack(datas, dim=0)
-                merged_name = f"layers.{bid}.feed_forward.experts.{w_name}.weight"
-                tensors.append((self.map_tensor_name(merged_name), merged))
+                merged = FP8Tensor.stack(datas)
+                if split:
+                    tensors.append((self.format_tensor_name(proj[w_name], bid), merged))
+                else:
+                    merged_name = f"layers.{bid}.feed_forward.experts.{w_name}.weight"
+                    tensors.append((self.map_tensor_name(merged_name), merged))
             return tensors
 
         return super().modify_tensors(data_torch, name, bid)
