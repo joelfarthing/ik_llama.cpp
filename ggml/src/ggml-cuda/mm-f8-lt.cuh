@@ -314,5 +314,6 @@ static void f8_lt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * g
     for (int i = 0; i < graph->n_nodes; ++i) f8_lt_supported(ctx, graph->nodes[i]);
 }
 #else
+struct ggml_cuda_f8_lt_context {};
 static bool f8_lt_supported(ggml_backend_cuda_context &, const ggml_tensor *) { return false; }
 #endif
