@@ -53,6 +53,9 @@ static __global__ void f8_lt_scale(const char * weight, const float * scales, fl
     }
 }
 
+static __device__ __forceinline__ float f8_lt_value(float x) { return x; }
+static __device__ __forceinline__ float f8_lt_value(nv_bfloat16 x) { return __bfloat162float(x); }
+
 static __global__ void f8_lt_norm_quantize(const float * x, const float * w, uint8_t * output, float * scales,
         int k, size_t stride, float eps) {
     __shared__ float shared[32];
@@ -125,7 +128,8 @@ static __global__ void f8_lt_row_scales(const char * weight, float * output, int
     if (row < m) output[row] = ggml_cuda_f8_row::scale(weight + size_t(row)*ggml_cuda_f8_row::row_size(k));
 }
 
-static __global__ void f8_lt_up_gate(const float * up, const float * gate, const float * ws_up, const float * ws_gate,
+template <typename T>
+static __global__ void f8_lt_up_gate(const T * up, const T * gate, const float * ws_up, const float * ws_gate,
         const float * scales, uint8_t * output, float * out_scales, int m, int ldc) {
     extern __shared__ float values[];
     __shared__ float maxima[8];
@@ -134,8 +138,8 @@ static __global__ void f8_lt_up_gate(const float * up, const float * gate, const
     const float as = scales[blockIdx.x];
     float amax = 0;
     for (int i = threadIdx.x; i < m; i += blockDim.x) {
-        const float g = gate[offset+i] * __fmul_rn(ws_gate[i], as);
-        const float u = up[offset+i] * __fmul_rn(ws_up[i], as);
+        const float g = f8_lt_value(gate[offset+i]) * __fmul_rn(ws_gate[i], as);
+        const float u = f8_lt_value(up[offset+i]) * __fmul_rn(ws_up[i], as);
         const float v = g * u / (1.0f + expf(-g));
         values[i] = v;
         amax = fmaxf(amax, fabsf(v));
@@ -167,10 +171,10 @@ struct ggml_cuda_f8_lt_context {
     };
     static constexpr size_t workspace_size = 32*1024*1024;
     int device;
-    int shared_limit = 0;
+    int shared_limit[2] = {};
     cublasLtHandle_t handle;
     void * workspace;
-    std::map<std::array<int,4>, std::unique_ptr<plan>> plans;
+    std::map<std::array<int,5>, std::unique_ptr<plan>> plans;
 
     explicit ggml_cuda_f8_lt_context(int device) : device(device) {
         ggml_cuda_set_device(device);
@@ -183,8 +187,8 @@ struct ggml_cuda_f8_lt_context {
         CUDA_CHECK(cudaFree(workspace));
         CUBLAS_CHECK(cublasLtDestroy(handle));
     }
-    plan & get(int m, int k, int n, int ldc) {
-        const std::array<int,4> shape{m,k,n,ldc};
+    plan & get(int m, int k, int n, int ldc, bool bf16 = false) {
+        const std::array<int,5> shape{m,k,n,ldc,bf16};
         auto found = plans.find(shape);
         if (found != plans.end()) return *found->second;
         auto p = std::make_unique<plan>();
@@ -195,7 +199,7 @@ struct ggml_cuda_f8_lt_context {
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fast, sizeof(fast)));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p->a, CUDA_R_8F_E4M3, k, m, ggml_cuda_f8_row::row_size(k)));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p->b, CUDA_R_8F_E4M3, k, n, k));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p->d, CUDA_R_32F, m, n, ldc));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p->d, bf16 ? CUDA_R_16BF : CUDA_R_32F, m, n, ldc));
         cublasLtMatmulPreference_t preference;
         CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
         CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -240,8 +244,9 @@ struct ggml_cuda_f8_lt_context {
         CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
         return *plans.emplace(shape, std::move(p)).first->second;
     }
-    bool matmul(int m, int k, int n, int ldc, const char * weight, const uint8_t * activation, float * output, cudaStream_t stream) {
-        auto & p = get(m,k,n,ldc);
+    bool matmul(int m, int k, int n, int ldc, const char * weight, const uint8_t * activation, void * output, cudaStream_t stream,
+            bool bf16 = false) {
+        auto & p = get(m,k,n,ldc,bf16);
         if (!p.supported) return false;
         const float alpha = 1.0f, beta = 0;
         auto status = cublasLtMatmul(handle, p.op, &alpha, weight + ggml_cuda_f8_row::row_meta_size, p.a,
@@ -268,15 +273,19 @@ struct ggml_cuda_f8_lt_context {
     bool up_gate(int m, int k, int n, int ldc, const char * up, const char * gate, const uint8_t * activation,
             const float * scales, float * up_out, float * gate_out, float * row_scales, uint8_t * codes, float * out_scales,
             cudaStream_t stream) {
-        if (!matmul(m,k,n,ldc,up,activation,up_out,stream) || !matmul(m,k,n,ldc,gate,activation,gate_out,stream)) return false;
+        const bool bf16 = get(m,k,n,ldc,true).supported;
+        if (!matmul(m,k,n,ldc,up,activation,up_out,stream,bf16) || !matmul(m,k,n,ldc,gate,activation,gate_out,stream,bf16)) return false;
         const int bytes = m*sizeof(float);
-        if (bytes > shared_limit) {
-            CUDA_CHECK(cudaFuncSetAttribute(f8_lt_up_gate, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-            shared_limit = bytes;
+        if (bytes > shared_limit[bf16]) {
+            if (bf16) CUDA_CHECK(cudaFuncSetAttribute(f8_lt_up_gate<nv_bfloat16>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+            else CUDA_CHECK(cudaFuncSetAttribute(f8_lt_up_gate<float>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+            shared_limit[bf16] = bytes;
         }
         f8_lt_row_scales<<<(m+255)/256,256,0,stream>>>(up,row_scales,m,k);
         f8_lt_row_scales<<<(m+255)/256,256,0,stream>>>(gate,row_scales+m,m,k);
-        f8_lt_up_gate<<<n,256,bytes,stream>>>(up_out,gate_out,row_scales,row_scales+m,scales,codes,out_scales,m,ldc);
+        if (bf16) f8_lt_up_gate<nv_bfloat16><<<n,256,bytes,stream>>>((const nv_bfloat16 *)up_out,(const nv_bfloat16 *)gate_out,
+                row_scales,row_scales+m,scales,codes,out_scales,m,ldc);
+        else f8_lt_up_gate<float><<<n,256,bytes,stream>>>(up_out,gate_out,row_scales,row_scales+m,scales,codes,out_scales,m,ldc);
         return true;
     }
 };
