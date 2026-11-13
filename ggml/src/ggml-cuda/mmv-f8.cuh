@@ -111,11 +111,34 @@ static __global__ void mul_mat_vec_f8_e4m3_wide(int n, int ldc, const void * vx,
     if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + row] = sum;
 }
 
+template <bool wide = false, bool warp = false>
 static __device__ __forceinline__ float dot_f8_e4m3_b128(int n, const void * row, const float * y) {
     const int lane = threadIdx.x % 32;
-    const int warp = threadIdx.x / 32;
+    const int first = warp ? 0 : threadIdx.x / 32;
+    const int step = warp ? 1 : blockDim.x / 32;
     float sum = 0;
-    for (int b = warp; b < n/128; b += blockDim.x/32) {
+    if constexpr (wide) {
+        const int skip = lane/8 + 1;
+        for (int p = first; p < n/512; p += step) {
+            const uint4 * x = (const uint4 *)row + 33*p + lane;
+            const uint4 lo = x[0], hi = x[1];
+            const uint32_t words[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+            const float scale = __shfl_sync(0xffffffff, __uint_as_float(words[skip - 1]), lane & ~7);
+            const float4 * a = (const float4 *)(y + 512*p + 16*lane);
+            float partial[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float2 w0 = ggml_cuda_f8_e4m3x2_to_float2(words[skip + k]);
+                const float2 w1 = ggml_cuda_f8_e4m3x2_to_float2(words[skip + k] >> 16);
+                partial[k] = w0.x*a[k].x;
+                partial[k] = fmaf(w0.y, a[k].y, partial[k]);
+                partial[k] = fmaf(w1.x, a[k].z, partial[k]);
+                partial[k] = fmaf(w1.y, a[k].w, partial[k]);
+            }
+            sum = fmaf(partial[0] + partial[1] + partial[2] + partial[3], scale, sum);
+        }
+        sum = warp_reduce_sum(sum);
+    } else for (int b = first; b < n/128; b += step) {
         const void * block = (const char *)row + size_t(b)*132;
         const auto * x = ggml_cuda_f8_block::codes(block);
         uint32_t codes;
@@ -131,17 +154,19 @@ static __device__ __forceinline__ float dot_f8_e4m3_b128(int n, const void * row
         partial = warp_reduce_sum(partial);
         if (lane == 0) sum = fmaf(partial, ggml_cuda_f8_row::scale(block), sum);
     }
+    if constexpr (warp) return sum;
     __shared__ float tmp[8];
-    if (lane == 0) tmp[warp] = sum;
+    if (lane == 0) tmp[first] = sum;
     __syncthreads();
     sum = lane < blockDim.x/32 ? tmp[lane] : 0;
     return warp_reduce_sum(sum);
 }
 
+template <bool wide>
 static __global__ void mul_mat_vec_f8_e4m3_b128(int n, int ldc, const void * x,
         const float * y, float * z, size_t nb11) {
     const void * row = (const char *)x + size_t(blockIdx.x)*ggml_cuda_f8_block::row_size(n);
-    const float sum = dot_f8_e4m3_b128(n, row, y + size_t(blockIdx.y)*nb11);
+    const float sum = dot_f8_e4m3_b128<wide>(n, row, y + size_t(blockIdx.y)*nb11);
     if (threadIdx.x == 0) z[size_t(blockIdx.y)*ldc + blockIdx.x] = sum;
 }
 
@@ -160,7 +185,7 @@ static __global__ void mul_mat_vec_f8_e4m3_id(int n, int experts, int channels,
     const void * row = x + size_t(expert)*nb02 + size_t(r)*nb01;
     const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
     float sum;
-    if constexpr (blocked) sum = dot_f8_e4m3_b128(n, row, a);
+    if constexpr (blocked) sum = dot_f8_e4m3_b128<aligned, aligned>(n, row, a);
     else if constexpr (aligned) sum = dot_f8_e4m3_wide<16, true, true>(n, row, a);
     else sum = dot_f8_e4m3<ggml_cuda_f8_row>(n, row, a);
     if (aligned ? threadIdx.x % 32 == 0 : threadIdx.x == 0) *(float *)(z + size_t(token)*nb2 + size_t(slot)*nb1 + r*sizeof(float)) = sum;
@@ -188,11 +213,11 @@ static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int exper
     const void * ur = up + size_t(expert)*nbu2 + size_t(row)*nbu1;
     const void * gr = gate + size_t(expert)*nbg2 + size_t(row)*nbg1;
     float su, sg;
-    if constexpr (blocked) su = dot_f8_e4m3_b128(n, ur, a);
+    if constexpr (blocked) su = dot_f8_e4m3_b128<aligned, aligned>(n, ur, a);
     else if constexpr (aligned) su = dot_f8_e4m3_wide<16, true, true>(n, ur, a);
     else su = dot_f8_e4m3<ggml_cuda_f8_row>(n, ur, a);
     if constexpr (!aligned) __syncthreads();
-    if constexpr (blocked) sg = dot_f8_e4m3_b128(n, gr, a);
+    if constexpr (blocked) sg = dot_f8_e4m3_b128<aligned, aligned>(n, gr, a);
     else if constexpr (aligned) sg = dot_f8_e4m3_wide<16, true, true>(n, gr, a);
     else sg = dot_f8_e4m3<ggml_cuda_f8_row>(n, gr, a);
     if (aligned ? threadIdx.x % 32 == 0 : threadIdx.x == 0) {

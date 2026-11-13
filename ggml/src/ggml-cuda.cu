@@ -2874,8 +2874,14 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
     } else if (src0->type == GGML_TYPE_F8_E4M3_B128) {
         const int nrows = row_high - row_low;
         const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
-        mul_mat_vec_f8_e4m3_b128<<<dim3(nrows, src1_ncols), 256, 0, stream>>>(src0->ne[0], ldc,
-                src0_dd_i, src1_ddf_i, dst_dd_i, src1->ne[0]);
+        auto launch = [&](auto kernel) {
+            kernel<<<dim3(nrows, src1_ncols), 256, 0, stream>>>(src0->ne[0], ldc, src0_dd_i, src1_ddf_i, dst_dd_i, src1->ne[0]);
+        };
+        if (src0->ne[0] % 512 == 0 && uintptr_t(src0_dd_i) % 16 == 0 && uintptr_t(src1_ddf_i) % 16 == 0) {
+            launch(mul_mat_vec_f8_e4m3_b128<true>);
+        } else {
+            launch(mul_mat_vec_f8_e4m3_b128<false>);
+        }
     } else if (src1_ncols <= 8) {
         const int nrows = row_high - row_low;
         const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
@@ -3364,7 +3370,7 @@ static inline bool prepare_row_mappigs(ggml_backend_cuda_context& ctx, int64_t n
 }
 
 static bool ggml_cuda_f8_aligned(const ggml_tensor * weight, const ggml_tensor * src) {
-    return weight->type == GGML_TYPE_F8_E4M3_KS && weight->ne[0] % 16 == 0 &&
+    return weight->ne[0] % 16 == 0 &&
         uintptr_t(weight->data) % 16 == 0 && weight->nb[1] % 16 == 0 && weight->nb[2] % 16 == 0 &&
         uintptr_t(src->data) % 16 == 0 && src->nb[1] % 16 == 0 && src->nb[2] % 16 == 0;
 }
@@ -3556,7 +3562,8 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 (const char *)ids->data, (char *)dst->data, src0->nb[1], src0->nb[2], src1->nb[1], src1->nb[2],
                 ids->nb[0], ids->nb[1], dst->nb[1], dst->nb[2], src0->ne[1]);
         };
-        if (src0->type == GGML_TYPE_F8_E4M3_B128) launch(mul_mat_vec_f8_e4m3_id<true>);
+        if (src0->type == GGML_TYPE_F8_E4M3_B128 && aligned) launch(mul_mat_vec_f8_e4m3_id<true, true>);
+        else if (src0->type == GGML_TYPE_F8_E4M3_B128) launch(mul_mat_vec_f8_e4m3_id<true>);
         else if (aligned) launch(mul_mat_vec_f8_e4m3_id<false, true>);
         else launch(mul_mat_vec_f8_e4m3_id<false>);
         CUDA_CHECK(cudaGetLastError());
@@ -3881,7 +3888,8 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
                         (float *)dst->data, unary, *(const float *)(dst->op_params + 1), src0_1->nb[1], src0_1->nb[2], src0_2->nb[1], src0_2->nb[2],
                         src1->nb[1], src1->nb[2], ids->nb[0], ids->nb[1], bu ? bu->nb[1] : 0, bg ? bg->nb[1] : 0);
             };
-            if (src0_1->type == GGML_TYPE_F8_E4M3_B128) launch(mul_mat_vec_f8_e4m3_up_gate_id<true>);
+            if (src0_1->type == GGML_TYPE_F8_E4M3_B128 && aligned) launch(mul_mat_vec_f8_e4m3_up_gate_id<true, true>);
+            else if (src0_1->type == GGML_TYPE_F8_E4M3_B128) launch(mul_mat_vec_f8_e4m3_up_gate_id<true>);
             else if (aligned) launch(mul_mat_vec_f8_e4m3_up_gate_id<false, true>);
             else launch(mul_mat_vec_f8_e4m3_up_gate_id<false>);
             CUDA_CHECK(cudaGetLastError());
