@@ -717,6 +717,9 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
         const __grid_constant__ CUtensorMap ms, int SG, int CG) {
 #if __CUDA_ARCH__ >= 900
     constexpr int RM = 2, WMB = 4, WNB = 2, BM = WMB*16*RM, BN = WNB*8*RN, BK = 128, NA = UG ? 2 : 1, NW = WMB*WNB, PA = BLK ? 144 : BK;
+    const int J = BLK ? (routing.row_stride%16 == 0 ? 1 : routing.row_stride%8 == 0 ? 2 : 4) : 1, JR = BM/J;
+    GGML_UNUSED(J);
+    GGML_UNUSED(JR);
     int bx = blockIdx.x, by = blockIdx.y;
     if constexpr (BLK) {
         if (CG > 0) {
@@ -752,10 +755,17 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
     };
     auto load = [&](int k0, int s) {
         if (k0 < K && tid == 0) {
-            const int kx = BLK ? k0/BK*132 - k0/BK%4*4 : k0;
             asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(bar0+8*s), "r"(NA*BM*PA+BN*BK));
-            tile(&ma, sA + s*NA*BM*PA, bar0+8*s, kx, expert*expert_rows+row0);
-            if constexpr (UG) tile(&mg, sA + (s*NA+1)*BM*PA, bar0+8*s, kx, expert*expert_rows+row0);
+            if constexpr (BLK) {
+                for (int j = 0; j < J; ++j) {
+                    const int origin = j*int(routing.row_stride) + k0/BK*132;
+                    tile(&ma, sA + (s*NA*BM + j*JR)*PA, bar0+8*s, origin - origin%16, (expert*expert_rows+row0)/J);
+                    if constexpr (UG) tile(&mg, sA + ((s*NA+1)*BM + j*JR)*PA, bar0+8*s, origin - origin%16, (expert*expert_rows+row0)/J);
+                }
+            } else {
+                tile(&ma, sA + s*NA*BM*PA, bar0+8*s, k0, expert*expert_rows+row0);
+                if constexpr (UG) tile(&mg, sA + (s*NA+1)*BM*PA, bar0+8*s, k0, expert*expert_rows+row0);
+            }
             tile(&mb, sB + s*BN*BK, bar0+8*s, k0, first_col);
         }
     };
@@ -795,7 +805,7 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
         for (int t = 0; t < NA; ++t) {
             if constexpr (BLK) {
                 const uint8_t * pa = sA + ((s*NA+t)*BM + wm*16*RM)*PA;
-                const int ph = k0/BK%4;
+                const int ph = (wm*16*RM/JR*int(routing.row_stride) + k0/BK*132)%16/4;
 #pragma unroll
                 for (int i = 0; i < RM; ++i) {
 #pragma unroll
@@ -870,7 +880,7 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
     for (int i = 0; i < RM; ++i) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int rl = wm*16*RM + 16*i + g + 8*h, r = row0 + rl;
+            const int rl = wm*16*RM + 16*i + g + 8*h, rp = BLK ? rl%JR*J + rl/JR : rl, r = row0 + rp;
             const size_t offset = size_t(expert)*routing.expert_stride + size_t(r)*routing.row_stride;
             const float scale = BLK ? 1.0f : ggml_cuda_f8_row::scale(x + offset);
             const float bias = routing.bias ? ((const float *)(routing.bias + size_t(expert)*routing.bias_stride))[r] : 0.0f;
@@ -890,7 +900,7 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
                         if constexpr (UG) {
                             float gate = total[NA-1][i][j][2*h+l]*scale_g;
                             if (bias_gate) gate += bias_g;
-                            hs[c*BM + rl] = gate * value / (1.0f + expf(-gate));
+                            hs[c*BM + rp] = gate * value / (1.0f + expf(-gate));
                         } else {
                             const size_t o = size_t(routing.rows[first_col+c])*M + r;
                             if (zb) zb[o] = __float2bfloat16(value);
@@ -925,9 +935,10 @@ static bool launch_f8_tma(int K, int M, int cols, const char * x, const char * x
     alignas(64) CUtensorMap ma, mg, mb, ms;
     const auto meta = ggml_cuda_f8_row::row_meta_size;
     if constexpr (BLK) {
-        const uint64_t total = uint64_t(routing.experts)*expert_rows;
-        if (!f8_tma_map(ma, CU_TENSOR_MAP_DATA_TYPE_UINT8, x, routing.row_stride, total, routing.row_stride, 144, 128) ||
-            !f8_tma_map(mg, CU_TENSOR_MAP_DATA_TYPE_UINT8, UG ? xg : x, routing.row_stride, total, routing.row_stride, 144, 128) ||
+        const int J = routing.row_stride%16 == 0 ? 1 : routing.row_stride%8 == 0 ? 2 : 4;
+        const uint64_t width = J*routing.row_stride, total = uint64_t(routing.experts)*expert_rows/J;
+        if (!f8_tma_map(ma, CU_TENSOR_MAP_DATA_TYPE_UINT8, x, width, total, width, 144, 128/J) ||
+            !f8_tma_map(mg, CU_TENSOR_MAP_DATA_TYPE_UINT8, UG ? xg : x, width, total, width, 144, 128/J) ||
             !f8_tma_map(mb, CU_TENSOR_MAP_DATA_TYPE_UINT8, y, K, cols, K, 128, BN) ||
             !f8_tma_map(ms, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, scales, SG, cols, SG*4, SG, BN)) return false;
     } else if (!f8_tma_map(ma, CU_TENSOR_MAP_DATA_TYPE_UINT8, x+meta, K, uint64_t(routing.experts)*expert_rows, routing.row_stride, 128, 128) ||

@@ -3378,12 +3378,13 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
         const int n = src->ne[0], m = dst->ne[0];
         if (next && cc >= 1200 && f8_tma_encoder() && n%128 == 0 && (n/128)%4 == 0 && n/128 <= 256 && m%128 == 0 &&
             m/128 <= 252 && next->ne[0]%128 == 0 && uintptr_t(activations.get())%16 == 0 &&
-            size_t(std::max(f8_tma_shared<6, true>(n/128), f8_tma_shared<8, false>((m/128+3)/4*4))) <= ggml_cuda_info().devices[ctx.device].smpbo) {
+            size_t(blocked ? std::max(f8_tma_shared<4, true, true>(n/128), f8_tma_shared<8, false, true>((m/128+3)/4*4)) :
+                std::max(f8_tma_shared<6, true>(n/128), f8_tma_shared<8, false>((m/128+3)/4*4))) <= ggml_cuda_info().devices[ctx.device].smpbo) {
             tma = true;
             for (auto w : {weight, gate, (const ggml_tensor *)next->src[0]}) {
-                if (w->type != GGML_TYPE_F8_E4M3_KS || uintptr_t(w->data)%16 != 0 || w->nb[1]%16 != 0 || w->nb[2]%w->nb[1] != 0) tma = false;
+                if (w->type != weight->type || uintptr_t(w->data)%16 != 0 || (!blocked && w->nb[1]%16 != 0) || w->nb[2]%w->nb[1] != 0) tma = false;
             }
-            if (tma) f8_moe_tiles_all<<<1,1,0,stream>>>(bounds, tiles_ug, tiles_dn, experts, 96, 128);
+            if (tma) f8_moe_tiles_all<<<1,1,0,stream>>>(bounds, tiles_ug, tiles_dn, experts, blocked ? 64 : 96, 128);
         }
     }
 #endif
@@ -3439,7 +3440,13 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
                         f8_moe_zero_invalid<<<std::min(cols, 128),256,0,stream>>>((const char *)ids->data, bounds, (uint16_t *)*narrow,
                                 nullptr, next->ne[0], ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
                     }
-                    if (launch_f8_tma<6, true>(n, m, cols, (const char *)weight->data, (const char *)gate->data, activations.get(), scales, n/128,
+                    if (blocked) {
+                        if (launch_f8_tma<4, true, true>(n, m, cols, (const char *)weight->data, (const char *)gate->data, activations.get(), scales, n/128,
+                                    nullptr, nullptr, codes.get(), out_scales.get(), out_stride, ug,
+                                    bias_gate ? (const char *)bias_gate->data : nullptr, stream) &&
+                            launch_f8_tma<8, false, true>(m, next->ne[0], cols, (const char *)down->data, nullptr, codes.get(), out_scales.get(), out_stride,
+                                    (float *)next->data, narrow ? *narrow : nullptr, nullptr, nullptr, 0, dn, nullptr, stream)) return;
+                    } else if (launch_f8_tma<6, true>(n, m, cols, (const char *)weight->data, (const char *)gate->data, activations.get(), scales, n/128,
                                 nullptr, nullptr, codes.get(), out_scales.get(), out_stride, ug,
                                 bias_gate ? (const char *)bias_gate->data : nullptr, stream) &&
                         launch_f8_tma<8, false>(m, next->ne[0], cols, (const char *)down->data, nullptr, codes.get(), out_scales.get(), out_stride,
