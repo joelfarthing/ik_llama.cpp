@@ -803,7 +803,7 @@ extern "C" {
         GGML_TENSOR_FLAG_OUTPUT = 2,
         GGML_TENSOR_FLAG_PARAM  = 4,
         GGML_TENSOR_FLAG_LOSS   = 8, // ...defines loss for numerical optimization (multiple loss tensors add up)
-        GGML_TENSOR_FLAG_CROSS_SPLIT = 16, // ...is read by a node in another split of the scheduler
+        GGML_TENSOR_FLAG_CROSS_SPLIT = 16, // ...has a reader outside the graph that the backend receives
     };
 
     enum ggml_tri_type {

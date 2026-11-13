@@ -2257,6 +2257,9 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
         }
     } else {
         // similar to ggml_backend_compare_graph_backend
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            split->graph.nodes[j]->flags |= GGML_TENSOR_FLAG_CROSS_SPLIT;
+        }
         for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
             struct ggml_tensor * t = split->graph.nodes[j0];
 
