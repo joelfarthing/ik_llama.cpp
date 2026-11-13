@@ -3145,6 +3145,43 @@ static int ggml_cuda_f8_norm_chain(ggml_backend_cuda_context & ctx, ggml_tensor 
     return ggml_cuda_mul_mat_f8_reuse(ctx, norm, cgraph->nodes[j], cgraph, j, norm);
 }
 
+static int ggml_cuda_mul_mat_f8_ks_exact(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_cgraph * cgraph, int node_n) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    auto compatible = [&](const ggml_tensor * node) {
+        const ggml_tensor * w = node->src[0];
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 || node->op_params[0] != GGML_PREC_DEFAULT ||
+                w->type != GGML_TYPE_F8_E4M3_KS ||
+                (ggml_get_input_scale(w) == -1.0f && f8_mma_available(cc)) ||
+                (cc == CC_ADA_LOVELACE && src1->ne[1] >= 1024) ||
+                !ggml_is_contiguous(w) || !ggml_is_contiguous(node) || w->ne[2]*w->ne[3] != 1) return false;
+        for (auto t : {w, src1, node}) {
+            if (!ggml_backend_buffer_is_cuda(t->buffer) ||
+                    ((ggml_backend_cuda_buffer_context *)t->buffer->context)->device != ctx.device) return false;
+        }
+        return true;
+    };
+    auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
+    if (!cgraph || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[1] <= 8 || src1->ne[2]*src1->ne[3] != 1 ||
+            !new_mma_available(cc) || !compatible(dst)) return -1;
+    if (const int next = step(node_n); next >= cgraph->n_nodes || !compatible(cgraph->nodes[next])) return -1;
+    const int n = src1->ne[0], cols = src1->ne[1], limit = ggml_cuda_info().devices[ctx.device].smpbo;
+    auto stream = ctx.stream();
+    ggml_cuda_pool_alloc<half> activations(ctx.pool(), size_t(cols)*n);
+    ggml_get_to_fp16_cuda(GGML_TYPE_F32)(src1->data, activations.get(), cols, n, stream);
+    for (;;) {
+        const ggml_tensor * w = dst->src[0];
+        if (!launch_f8_pp<ggml_cuda_f8_row>(cc, limit, n, w->ne[1], cols, dst->ne[0], (const char *)w->data, activations.get(),
+                (float *)dst->data, stream)) ggml_cuda_op_mul_mat(ctx, w, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3<>, nullptr);
+        CUDA_CHECK(cudaGetLastError());
+        const int next = step(node_n);
+        if (next >= cgraph->n_nodes || !compatible(cgraph->nodes[next])) break;
+        node_n = next;
+        dst = cgraph->nodes[node_n];
+    }
+    return node_n;
+}
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
 
@@ -3154,6 +3191,8 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
             if (last >= 0) return last;
             ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3<true>, nullptr);
         } else {
+            const int last = ggml_cuda_mul_mat_f8_ks_exact(ctx, src1, dst, cgraph, node_n);
+            if (last >= 0) return last;
             ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3<>, nullptr);
         }
         return node_n;
