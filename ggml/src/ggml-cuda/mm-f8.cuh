@@ -693,17 +693,13 @@ static __global__ void f8_moe_zero_invalid(const char * ids, const int32_t * bou
     }
 }
 
-static __global__ void f8_moe_tiles(const int32_t * bounds, int32_t * tiles, int32_t * small, int experts, int width) {
-    int count = 0, nsmall = 0;
+static __global__ void f8_moe_tiles(const int32_t * bounds, int32_t * tiles, int experts, int width) {
+    int count = 0;
     for (int e = 0; e < experts; ++e) {
         tiles[e] = count;
-        small[e] = nsmall;
-        const int size = bounds[e+1]-bounds[e];
-        if (size <= 8) nsmall += size > 0;
-        else count += (size+width-1)/width;
+        count += (bounds[e+1]-bounds[e]+width-1)/width;
     }
     tiles[experts] = count;
-    small[experts] = nsmall;
 }
 
 template <int G = 0>
@@ -1058,7 +1054,7 @@ static bool launch_f8_tma(int K, int M, int cols, const char * x, const char * x
 
 template <typename layout, int BN, int NW, int stages, int BK, int G = 0>
 static void launch_f8_moe(int n, int rows, int cols, const char * x, const f8_activation<G> * y, float * z,
-        const f8_moe_routing & routing, cudaStream_t stream, const float * activation_scales = nullptr, bool small = false) {
+        const f8_moe_routing & routing, cudaStream_t stream, const float * activation_scales = nullptr) {
     constexpr int limit = std::max(f8_pp_shared<BN, stages, BK, G>(), G != 0 ? BN*128*4 : 0);
     const int bytes = routing.codes ? limit : f8_pp_shared<BN, stages, BK, G>();
     const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0 || routing.expert_stride%16 != 0;
@@ -1068,6 +1064,6 @@ static void launch_f8_moe(int n, int rows, int cols, const char * x, const f8_ac
     } else {
         CUDA_SET_SHARED_MEMORY_LIMIT(kernel, limit);
     }
-    kernel<<<dim3((rows+127)/128, small ? routing.experts : (cols+BN-1)/BN+routing.experts), dim3(32,NW), bytes, stream>>>(
+    kernel<<<dim3((rows+127)/128, (cols+BN-1)/BN+routing.experts), dim3(32,NW), bytes, stream>>>(
             n, rows, cols, rows, x, y, z, routing, activation_scales);
 }
