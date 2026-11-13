@@ -2988,13 +2988,15 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                 ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
                 ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), cols);
                 const int ia = add_after(id);
+                ggml_cuda_pool_alloc<nv_bfloat16> narrow(ctx.pool());
+                if (ia >= 0 && lt.get(down->src[0]->ne[1], m, cols, down->ne[0], true).supported) narrow.alloc(size_t(cols)*down->ne[0]);
                 if (lt.up_gate(m, n, cols, m, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
                             activations.get(), scales.get(), (float *)up->data, (float *)gate->data,
                             row_scales.get(), codes.get(), out_scales.get(), stream) &&
                     (ia >= 0 ?
                      lt.launch_add(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
                             codes.get(), out_scales.get(), (float *)down->data, (const float *)other_of(cgraph->nodes[ia], down)->data,
-                            (float *)cgraph->nodes[ia]->data, stream) :
+                            (float *)cgraph->nodes[ia]->data, stream, narrow.get()) :
                      lt.launch(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
                             codes.get(), out_scales.get(), (float *)down->data, stream))) {
                     CUDA_CHECK(cudaGetLastError());
@@ -3011,11 +3013,15 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         if (use_lt) {
             auto & lt = f8_lt_context(ctx);
             const int ia = add_after(node_n);
-            if (ia >= 0 && lt.launch_add(weight->ne[1], n, cols, dst->ne[0], (const char *)weight->data,
+            if (ia >= 0) {
+                ggml_cuda_pool_alloc<nv_bfloat16> narrow(ctx.pool());
+                if (lt.get(weight->ne[1], n, cols, dst->ne[0], true).supported) narrow.alloc(size_t(cols)*dst->ne[0]);
+                if (lt.launch_add(weight->ne[1], n, cols, dst->ne[0], (const char *)weight->data,
                         activations.get(), scales.get(), (float *)dst->data, (const float *)other_of(cgraph->nodes[ia], dst)->data,
-                        (float *)cgraph->nodes[ia]->data, stream)) {
-                CUDA_CHECK(cudaGetLastError());
-                return ia;
+                        (float *)cgraph->nodes[ia]->data, stream, narrow.get())) {
+                    CUDA_CHECK(cudaGetLastError());
+                    return ia;
+                }
             }
             done = lt.launch(weight->ne[1], n, cols, dst->ne[0], (const char *)weight->data,
                     activations.get(), scales.get(), (float *)dst->data, stream);
