@@ -781,12 +781,12 @@ static __global__ void f8_dense_routing(int32_t * rows, int32_t * bounds, int32_
     }
 }
 
-template <int RN, bool UG, bool BLK = false>
+template <int RN, bool UG, bool BLK = false, bool ADD = false>
 static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, int expert_rows,
         const char * __restrict__ x, const char * __restrict__ xg, float * __restrict__ z, nv_bfloat16 * __restrict__ zb,
         uint8_t * __restrict__ codes, float * __restrict__ out_scales, int out_stride, f8_moe_routing routing, const char * bias_gate,
         const __grid_constant__ CUtensorMap ma, const __grid_constant__ CUtensorMap mg, const __grid_constant__ CUtensorMap mb,
-        const __grid_constant__ CUtensorMap ms, int SG, int CG) {
+        const __grid_constant__ CUtensorMap ms, int SG, int CG, const float * other) {
 #if __CUDA_ARCH__ >= 900
     constexpr int RM = 2, WMB = 4, WNB = 2, BM = WMB*16*RM, BN = WNB*8*RN, BK = 128, NA = UG ? 2 : 1, NW = WMB*WNB, PA = BLK ? 144 : BK;
     const int J = BLK ? (routing.row_stride%16 == 0 ? 1 : routing.row_stride%8 == 0 ? 2 : 4) : 1, JR = BM/J;
@@ -853,6 +853,25 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
         tile(&ms, sS, bar0+16, 0, first_col);
     }
     load(0, 0);
+    float res[ADD ? RM : 1][ADD ? RN : 1][4];
+    GGML_UNUSED(res);
+    if constexpr (ADD) {
+#pragma unroll
+        for (int i = 0; i < RM; ++i) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int rl = wm*16*RM + 16*i + g + 8*h, rp = BLK ? rl%JR*J + rl/JR : rl;
+#pragma unroll
+                for (int j = 0; j < RN; ++j) {
+#pragma unroll
+                    for (int l = 0; l < 2; ++l) {
+                        const int c = wn*8*RN + 8*j + 2*t4 + l;
+                        res[i][j][2*h+l] = c < ncols ? other[size_t(routing.rows[first_col+c])*M + row0 + rp] : 0.0f;
+                    }
+                }
+            }
+        }
+    }
     wait(2, 0);
     float total[NA][RM][RN][4];
 #pragma unroll
@@ -975,6 +994,7 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
                             hs[c*BM + rp] = gate * value / (1.0f + expf(-gate));
                         } else {
                             const size_t o = size_t(routing.rows[first_col+c])*M + r;
+                            if constexpr (ADD) value = __fadd_rn(value, res[i][j][2*h+l]);
                             if (zb) zb[o] = __float2bfloat16(value);
                             else z[o] = value;
                         }
@@ -993,15 +1013,15 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
     }
 #else
     GGML_UNUSED(K); GGML_UNUSED(M); GGML_UNUSED(expert_rows); GGML_UNUSED(x); GGML_UNUSED(xg); GGML_UNUSED(z); GGML_UNUSED(zb); GGML_UNUSED(codes);
-    GGML_UNUSED(out_scales); GGML_UNUSED(out_stride); GGML_UNUSED(routing); GGML_UNUSED(bias_gate); GGML_UNUSED(SG); GGML_UNUSED(CG);
+    GGML_UNUSED(out_scales); GGML_UNUSED(out_stride); GGML_UNUSED(routing); GGML_UNUSED(bias_gate); GGML_UNUSED(SG); GGML_UNUSED(CG); GGML_UNUSED(other);
     NO_DEVICE_CODE;
 #endif
 }
 
-template <int RN, bool UG, bool BLK = false>
+template <int RN, bool UG, bool BLK = false, bool ADD = false>
 static bool launch_f8_tma(int K, int M, int cols, const char * x, const char * xg, const uint8_t * y, const float * scales, int SG,
         float * z, nv_bfloat16 * zb, uint8_t * codes, float * out_scales, int out_stride, const f8_moe_routing & routing,
-        const char * bias_gate, cudaStream_t stream, int cg = 0) {
+        const char * bias_gate, cudaStream_t stream, int cg = 0, const float * other = nullptr) {
     constexpr int BN = 16*RN;
     const int expert_rows = routing.expert_stride/routing.row_stride;
     alignas(64) CUtensorMap ma, mg, mb, ms;
@@ -1021,11 +1041,11 @@ static bool launch_f8_tma(int K, int M, int cols, const char * x, const char * x
     static int limit[GGML_CUDA_MAX_DEVICES] = {};
     const int id = ggml_cuda_get_device();
     if (bytes > limit[id]) {
-        CUDA_CHECK(cudaFuncSetAttribute((mul_mat_f8_tma<RN, UG, BLK>), cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        CUDA_CHECK(cudaFuncSetAttribute((mul_mat_f8_tma<RN, UG, BLK, ADD>), cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         limit[id] = bytes;
     }
-    mul_mat_f8_tma<RN, UG, BLK><<<cg > 0 ? dim3(cg, (M/128)*(((cols+BN-1)/BN+cg-1)/cg)) : dim3(M/128, (cols+BN-1)/BN+routing.experts), 256, bytes, stream>>>(K, M, expert_rows, x, xg, z, zb,
-            codes, out_scales, out_stride, routing, bias_gate, ma, mg, mb, ms, SG, cg);
+    mul_mat_f8_tma<RN, UG, BLK, ADD><<<cg > 0 ? dim3(cg, (M/128)*(((cols+BN-1)/BN+cg-1)/cg)) : dim3(M/128, (cols+BN-1)/BN+routing.experts), 256, bytes, stream>>>(K, M, expert_rows, x, xg, z, zb,
+            codes, out_scales, out_stride, routing, bias_gate, ma, mg, mb, ms, SG, cg, other);
     return true;
 }
 #endif

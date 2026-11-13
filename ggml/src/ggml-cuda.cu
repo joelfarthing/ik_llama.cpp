@@ -2801,28 +2801,32 @@ static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const flo
 #ifdef F8_TMA_AVAILABLE
 template <int RN>
 static bool launch_f8_tma_dense(ggml_backend_cuda_context & ctx, int n, int rows, int cols, const char * x, const uint8_t * y,
-        const float * scales, float * z, cudaStream_t stream) {
+        const float * scales, float * z, cudaStream_t stream, const float * other = nullptr) {
     if (f8_tma_shared<RN, false, true>(n/128) > (int)ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) return false;
     ggml_cuda_pool_alloc<int32_t> route(ctx.pool(ggml_cuda_get_device()), cols + 4);
     f8_dense_routing<<<(cols+255)/256, 256, 0, stream>>>(route.get(), route.get() + cols, route.get() + cols + 2, cols, 16*RN);
     const size_t stride = ggml_cuda_f8_block::row_size(n);
     const f8_moe_routing routing{route.get(), route.get() + cols, route.get() + cols + 2, 1, stride, stride*rows, nullptr, 0,
             nullptr, nullptr, nullptr, false};
-    return launch_f8_tma<RN, false, true>(n, rows, cols, x, nullptr, y, scales, n/128, z, nullptr, nullptr, nullptr, 0, routing,
+    return other ?
+        launch_f8_tma<RN, false, true, true>(n, rows, cols, x, nullptr, y, scales, n/128, z, nullptr, nullptr, nullptr, 0, routing,
+            nullptr, stream, 8, other) :
+        launch_f8_tma<RN, false, true>(n, rows, cols, x, nullptr, y, scales, n/128, z, nullptr, nullptr, nullptr, 0, routing,
             nullptr, stream, 8);
 }
 #endif
 
 static bool launch_f8_w8a8(ggml_backend_cuda_context & ctx, const ggml_tensor * weight, int shared_limit, int n, int rows, int cols, int ldc,
-        const char * x, const uint8_t * y, float * z, const float * scales, cudaStream_t stream) {
+        const char * x, const uint8_t * y, float * z, const float * scales, cudaStream_t stream, const float * other = nullptr) {
 #ifdef F8_TMA_AVAILABLE
     if (weight->type == GGML_TYPE_F8_E4M3_B128 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= 1200 && f8_tma_encoder() &&
         n%128 == 0 && n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && rows%128 == 0 && ldc == rows &&
-        (launch_f8_tma_dense<8>(ctx, n, rows, cols, x, y, scales, z, stream) ||
-         launch_f8_tma_dense<6>(ctx, n, rows, cols, x, y, scales, z, stream))) return true;
+        (launch_f8_tma_dense<8>(ctx, n, rows, cols, x, y, scales, z, stream, other) ||
+         launch_f8_tma_dense<6>(ctx, n, rows, cols, x, y, scales, z, stream, other))) return true;
 #else
     GGML_UNUSED(ctx);
 #endif
+    if (other) return false;
     if (weight->type == GGML_TYPE_F8_E4M3_KS) {
         return launch_f8_pp<ggml_cuda_f8_row,128,8,2,64,f8_activation_group>(shared_limit, n, rows, cols, ldc, x, y, z, stream, scales);
     }
@@ -2977,9 +2981,8 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
 #endif
     f8_quantize<G><<<dim3((n+4*G-1)/(4*G),cols),128,0,stream>>>(
             (const float *)src1->data, activations.get(), scales.get(), n, src1->nb[1]/sizeof(float));
-#ifdef GGML_CUDA_F8_LT
     auto add_after = [&](int j) {
-        if (!use_lt || !cgraph) return -1;
+        if (!cgraph) return -1;
         const ggml_tensor * mm = cgraph->nodes[j];
         int ia = j;
         do ++ia; while (ia < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[ia]));
@@ -2996,6 +2999,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         return f8_readers(cgraph, j + 1, mm) == 1 ? ia : -1;
     };
     auto other_of = [&](const ggml_tensor * add, const ggml_tensor * mm) { return add->src[0] == mm ? add->src[1] : add->src[0]; };
+#ifdef GGML_CUDA_F8_LT
     if (use_lt && cgraph && (!norm || chain == 2)) {
         auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
         const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
@@ -3059,15 +3063,18 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                 const size_t stride = ggml_cuda_f8_block::row_size(n);
                 const f8_moe_routing routing{route.get(), route.get() + cols, route.get() + cols + 2, 1, stride, stride*m, nullptr, 0,
                         nullptr, nullptr, nullptr, false};
+                const int ia = add_after(id);
+                const float * other = ia >= 0 ? (const float *)other_of(cgraph->nodes[ia], down)->data : nullptr;
+                float * out = (float *)(ia >= 0 ? cgraph->nodes[ia] : down)->data;
                 if (launch_f8_tma<4, true, true>(n, m, cols, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
                             activations.get(), scales.get(), n/128, nullptr, nullptr, codes.get(), out_scales.get(), m/128, routing,
                             nullptr, stream, 8) &&
                     (launch_f8_tma_dense<8>(ctx, m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
-                            (float *)down->data, stream) ||
+                            out, stream, other) ||
                      launch_f8_tma_dense<6>(ctx, m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
-                            (float *)down->data, stream))) {
+                            out, stream, other))) {
                     CUDA_CHECK(cudaGetLastError());
-                    return id;
+                    return ia >= 0 ? ia : id;
                 }
             }
         }
@@ -3094,8 +3101,17 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                     activations.get(), scales.get(), (float *)dst->data, stream);
         } else
 #endif
-        done = launch_f8_w8a8(ctx, weight, ggml_cuda_info().devices[ctx.device].smpbo, n, weight->ne[1], cols, dst->ne[0],
-                (const char *)weight->data, activations.get(), (float *)dst->data, scales.get(), stream);
+        {
+            const int ia = add_after(node_n);
+            if (ia >= 0 && launch_f8_w8a8(ctx, weight, ggml_cuda_info().devices[ctx.device].smpbo, n, weight->ne[1], cols, dst->ne[0],
+                        (const char *)weight->data, activations.get(), (float *)cgraph->nodes[ia]->data, scales.get(), stream,
+                        (const float *)other_of(cgraph->nodes[ia], dst)->data)) {
+                CUDA_CHECK(cudaGetLastError());
+                return ia;
+            }
+            done = launch_f8_w8a8(ctx, weight, ggml_cuda_info().devices[ctx.device].smpbo, n, weight->ne[1], cols, dst->ne[0],
+                    (const char *)weight->data, activations.get(), (float *)dst->data, scales.get(), stream);
+        }
         if (!done) {
             if (norm) {
                 ggml_cuda_op_fused_rms_norm(ctx, norm);
