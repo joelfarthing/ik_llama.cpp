@@ -3199,13 +3199,15 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
     if (bytes > ggml_cuda_info().devices[ctx.device].smpbo) return false;
     auto stream = ctx.stream();
     const int chunks = (cols+255)/256;
-    ggml_cuda_pool_alloc<int32_t> routing_data(ctx.pool(), size_t(2*cols + 3*(experts+1)) + size_t(chunks)*experts);
+    ggml_cuda_pool_alloc<int32_t> routing_data(ctx.pool(), size_t(2*cols + 5*(experts+1)) + size_t(chunks)*experts);
     auto rows = routing_data.get();
     auto bounds = rows + cols;
     auto tiles = bounds + experts + 1;
     auto small = tiles + experts + 1;
     auto counts = small + experts + 1;
     auto ranks = counts + size_t(chunks)*experts;
+    auto tiles_ug = ranks + cols;
+    auto tiles_dn = tiles_ug + experts + 1;
     f8_moe_histogram<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks,
             ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     f8_moe_prefix<<<1,256,0,stream>>>(counts, bounds, experts, chunks);
@@ -3216,6 +3218,21 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
             (float *)(next ? next->data : dst->data), gate && !next ? up : nullptr, (next ? next : dst)->ne[0],
             ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     ggml_cuda_pool_alloc<f8_activation<G>> activations(ctx.pool(), size_t(cols)*src->ne[0]);
+    bool tma = false;
+#ifdef F8_TMA_AVAILABLE
+    if constexpr (G != 0) {
+        const int n = src->ne[0], m = dst->ne[0];
+        if (next && cc >= 1200 && f8_tma_encoder() && n%128 == 0 && (n/128)%4 == 0 && n/128 <= 256 && m%128 == 0 &&
+            m/128 <= 252 && next->ne[0]%128 == 0 && uintptr_t(activations.get())%16 == 0 &&
+            size_t(std::max(f8_tma_shared<6, true>(n/128), f8_tma_shared<8, false>((m/128+3)/4*4))) <= ggml_cuda_info().devices[ctx.device].smpbo) {
+            tma = true;
+            for (auto w : {weight, gate, (const ggml_tensor *)next->src[0]}) {
+                if (w->type != GGML_TYPE_F8_E4M3_KS || uintptr_t(w->data)%16 != 0 || w->nb[1]%16 != 0 || w->nb[2]%w->nb[1] != 0) tma = false;
+            }
+            if (tma) f8_moe_tiles_all<<<1,1,0,stream>>>(bounds, tiles_ug, tiles_dn, experts, 96, 128);
+        }
+    }
+#endif
     auto run = [&](const float * scales) {
         auto multiply = [&](const ggml_tensor * w, const ggml_tensor * bias, float * output, int n, int m,
                 const f8_activation<G> * acts, const float * act_scales, int mode = 0, uint8_t * codes = nullptr, float * out_scales = nullptr) {
@@ -3254,6 +3271,23 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
         };
         const int n = src->ne[0], m = dst->ne[0];
         if (next) {
+#ifdef F8_TMA_AVAILABLE
+            if constexpr (G != 0) {
+                if (tma) {
+                    const int out_stride = (m/128+3)/4*4;
+                    ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
+                    ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*out_stride);
+                    f8_moe_routing ug{rows, bounds, tiles_ug, experts, weight->nb[1], weight->nb[2],
+                            bias_up ? (const char *)bias_up->data : nullptr, bias_up ? bias_up->nb[1] : 0, nullptr, nullptr, nullptr, false};
+                    const ggml_tensor * down = next->src[0];
+                    f8_moe_routing dn{rows, bounds, tiles_dn, experts, down->nb[1], down->nb[2], nullptr, 0, nullptr, nullptr, nullptr, false};
+                    if (launch_f8_tma<6, true>(n, m, cols, (const char *)weight->data, (const char *)gate->data, activations.get(), scales, n/128,
+                                nullptr, codes.get(), out_scales.get(), out_stride, ug, bias_gate ? (const char *)bias_gate->data : nullptr, stream) &&
+                        launch_f8_tma<8, false>(m, next->ne[0], cols, (const char *)down->data, nullptr, codes.get(), out_scales.get(), out_stride,
+                                (float *)next->data, nullptr, nullptr, 0, dn, nullptr, stream)) return;
+                }
+            }
+#endif
             if constexpr (G != 0) {
                 ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
                 ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*(m/128));
