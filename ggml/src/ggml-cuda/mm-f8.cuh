@@ -106,6 +106,10 @@ struct f8_moe_routing {
     size_t expert_stride;
     const char * bias;
     size_t bias_stride;
+    const float * up;
+    uint8_t * codes;
+    float * out_scales;
+    bool sorted;
 };
 
 static constexpr int f8_activation_group = 128;
@@ -490,7 +494,12 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     if constexpr (!blocked) value *= layout::scale(x + size_t(row)*row_bytes);
                     if constexpr (indexed) {
                         if (routing.bias) value += ((const float *)(routing.bias + size_t(expert)*routing.bias_stride))[row];
-                        z[size_t(routing.rows[col])*ldc+row] = value;
+                        if (G != 0 && routing.codes) {
+                            const float u = routing.up[size_t(col)*ldc+row];
+                            ((float *)storage)[(col-first_col)*BM+row-first_row] = value * u / (1.0f + expf(-value));
+                        } else {
+                            z[size_t(routing.sorted ? col : routing.rows[col])*ldc+row] = value;
+                        }
                     } else {
                         z[size_t(col)*ldc+row] = value;
                     }
@@ -501,6 +510,16 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
 #if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 0;");
 #endif
+    if constexpr (indexed && G != 0) {
+        if (routing.codes) {
+            __syncthreads();
+            const int group = first_row/BM;
+            for (int c = threadIdx.y; c < BN && first_col+c < cols; c += NW) {
+                f8_quantize_group<128>((const float *)storage + c*BM - group*128, routing.codes + size_t(first_col+c)*rows,
+                        routing.out_scales + size_t(first_col+c)*((rows+127)/128), rows, group);
+            }
+        }
+    }
 #else
     GGML_UNUSED(n); GGML_UNUSED(rows); GGML_UNUSED(cols); GGML_UNUSED(ldc);
     GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(z); GGML_UNUSED(routing); GGML_UNUSED(activation_scales);
@@ -627,13 +646,14 @@ static __global__ void f8_moe_convert(const char * src, f8_activation<G> * dst, 
 template <typename layout, int BN, int NW, int stages, int BK, int G = 0>
 static void launch_f8_moe(int n, int rows, int cols, const char * x, const f8_activation<G> * y, float * z,
         const f8_moe_routing & routing, cudaStream_t stream, const float * activation_scales = nullptr, bool small = false) {
-    constexpr int bytes = f8_pp_shared<BN, stages, BK, G>();
+    constexpr int limit = std::max(f8_pp_shared<BN, stages, BK, G>(), G != 0 ? BN*128*4 : 0);
+    const int bytes = routing.codes ? limit : f8_pp_shared<BN, stages, BK, G>();
     const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0 || routing.expert_stride%16 != 0;
     auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, true, G> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, true, G>;
     if (tail) {
-        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, limit);
     } else {
-        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, limit);
     }
     kernel<<<dim3((rows+127)/128, small ? routing.experts : (cols+BN-1)/BN+routing.experts), dim3(32,NW), bytes, stream>>>(
             n, rows, cols, rows, x, y, z, routing, activation_scales);

@@ -3181,7 +3181,8 @@ static bool ggml_cuda_f8_aligned(const ggml_tensor * weight, const ggml_tensor *
 template <int G>
 static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         const ggml_tensor * src, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * gate = nullptr,
-        const ggml_tensor * bias_up = nullptr, const ggml_tensor * bias_gate = nullptr, float * up = nullptr) {
+        const ggml_tensor * bias_up = nullptr, const ggml_tensor * bias_gate = nullptr, float * up = nullptr,
+        ggml_tensor * next = nullptr) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (src->ne[2] <= 8 || !new_mma_available(cc) || (!gate && dst->op_params[0] != GGML_PREC_DEFAULT)) return false;
     if (!ggml_is_contiguous(dst) || src->nb[0] != sizeof(float)) return false;
@@ -3212,39 +3213,58 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
             ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     f8_moe_tiles<<<1,1,0,stream>>>(bounds, tiles, small, experts, G ? 128 : wide ? 64 : 32);
     f8_moe_zero_invalid<<<std::min(cols, 128),256,0,stream>>>((const char *)ids->data, bounds,
-            (float *)dst->data, gate ? up : nullptr, dst->ne[0], ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
+            (float *)(next ? next->data : dst->data), gate && !next ? up : nullptr, (next ? next : dst)->ne[0],
+            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     ggml_cuda_pool_alloc<f8_activation<G>> activations(ctx.pool(), size_t(cols)*src->ne[0]);
     auto run = [&](const float * scales) {
-        auto multiply = [&](const ggml_tensor * w, const ggml_tensor * bias, float * output) {
+        auto multiply = [&](const ggml_tensor * w, const ggml_tensor * bias, float * output, int n, int m,
+                const f8_activation<G> * acts, const float * act_scales, int mode = 0, uint8_t * codes = nullptr, float * out_scales = nullptr) {
             f8_moe_routing routing{rows, bounds, tiles, experts, w->nb[1], w->nb[2],
-                    bias ? (const char *)bias->data : nullptr, bias ? bias->nb[1] : 0};
+                    bias ? (const char *)bias->data : nullptr, bias ? bias->nb[1] : 0, nullptr, nullptr, nullptr, false};
+            routing.sorted = mode == 1;
+            if (mode == 2) {
+                routing.up = up;
+                routing.codes = codes;
+                routing.out_scales = out_scales;
+            }
             auto launch = [&](auto layout) {
                 using L = decltype(layout);
                 auto small_routing = routing;
                 small_routing.tiles = small;
-                launch_f8_moe<L,8,4,1,128,G>(src->ne[0], dst->ne[0], cols,
-                        (const char *)w->data, activations.get(), output, small_routing, stream, scales, true);
+                launch_f8_moe<L,8,4,1,128,G>(n, m, cols,
+                        (const char *)w->data, acts, output, small_routing, stream, act_scales, true);
                 if constexpr (G != 0) {
-                    if (cc >= 1200) launch_f8_moe<L,128,8,2,128,G>(src->ne[0], dst->ne[0], cols,
-                            (const char *)w->data, activations.get(), output, routing, stream, scales);
-                    else launch_f8_moe<L,128,8,1,128,G>(src->ne[0], dst->ne[0], cols,
-                            (const char *)w->data, activations.get(), output, routing, stream, scales);
+                    if (cc >= 1200) launch_f8_moe<L,128,8,2,128,G>(n, m, cols,
+                            (const char *)w->data, acts, output, routing, stream, act_scales);
+                    else launch_f8_moe<L,128,8,1,128,G>(n, m, cols,
+                            (const char *)w->data, acts, output, routing, stream, act_scales);
                 } else if (wide) {
-                    launch_f8_moe<L,64,4,1,128>(src->ne[0], dst->ne[0], cols,
-                            (const char *)w->data, activations.get(), output, routing, stream);
+                    launch_f8_moe<L,64,4,1,128>(n, m, cols,
+                            (const char *)w->data, acts, output, routing, stream);
                 } else if (single) {
-                    launch_f8_moe<L,32,4,1,128>(src->ne[0], dst->ne[0], cols,
-                            (const char *)w->data, activations.get(), output, routing, stream);
+                    launch_f8_moe<L,32,4,1,128>(n, m, cols,
+                            (const char *)w->data, acts, output, routing, stream);
                 } else {
-                    launch_f8_moe<L,32,4,2,64>(src->ne[0], dst->ne[0], cols,
-                            (const char *)w->data, activations.get(), output, routing, stream);
+                    launch_f8_moe<L,32,4,2,64>(n, m, cols,
+                            (const char *)w->data, acts, output, routing, stream);
                 }
             };
-            if (blocked) launch(ggml_cuda_f8_block{});
+            if (w->type == GGML_TYPE_F8_E4M3_B128) launch(ggml_cuda_f8_block{});
             else launch(ggml_cuda_f8_row{});
         };
-        multiply(weight, bias_up, gate ? up : (float *)dst->data);
-        if (gate) multiply(gate, bias_gate, (float *)dst->data);
+        const int n = src->ne[0], m = dst->ne[0];
+        if (next) {
+            if constexpr (G != 0) {
+                ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
+                ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*(m/128));
+                multiply(weight, bias_up, up, n, m, activations.get(), scales, 1);
+                multiply(gate, bias_gate, nullptr, n, m, activations.get(), scales, 2, codes.get(), out_scales.get());
+                multiply(next->src[0], nullptr, (float *)next->data, m, next->ne[0], codes.get(), out_scales.get());
+            }
+            return;
+        }
+        multiply(weight, bias_up, gate ? up : (float *)dst->data, n, m, activations.get(), scales);
+        if (gate) multiply(gate, bias_gate, (float *)dst->data, n, m, activations.get(), scales);
     };
     if constexpr (G != 0) {
         ggml_cuda_pool_alloc<float> scales(ctx.pool(), size_t(cols)*((src->ne[0]+G-1)/G));
@@ -3262,11 +3282,13 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
 
 static bool ggml_cuda_mul_mat_f8_id(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
         const ggml_tensor * src, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * gate = nullptr,
-        const ggml_tensor * bias_up = nullptr, const ggml_tensor * bias_gate = nullptr, float * up = nullptr) {
+        const ggml_tensor * bias_up = nullptr, const ggml_tensor * bias_gate = nullptr, float * up = nullptr,
+        ggml_tensor * next = nullptr) {
     if (ggml_get_input_scale(weight) == -1.0f && f8_mma_available(ggml_cuda_info().devices[ctx.device].cc) &&
             (!gate || ggml_get_input_scale(gate) == -1.0f)) {
-        return ggml_cuda_mul_mat_f8_id_impl<f8_activation_group>(ctx, weight, src, ids, dst, gate, bias_up, bias_gate, up);
+        return ggml_cuda_mul_mat_f8_id_impl<f8_activation_group>(ctx, weight, src, ids, dst, gate, bias_up, bias_gate, up, next);
     }
+    if (next) return false;
     return ggml_cuda_mul_mat_f8_id_impl<0>(ctx, weight, src, ids, dst, gate, bias_up, bias_gate, up);
 }
 
@@ -3536,8 +3558,32 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     }
     if (f8 && src1->ne[2] > 8) {
         ggml_cuda_pool_alloc<float> up(ctx.pool(), ggml_nelements(dst));
+        const auto unary = (ggml_unary_op)dst->op_params[0];
+        ggml_tensor * fused = nullptr;
+        if (!hada && next && next->op == GGML_OP_MUL_MAT_ID && next->src[1]->data == dst->data && next->src[2] == ids &&
+            unary == GGML_UNARY_OP_SILU && *(const float *)(dst->op_params + 1) < 1e-6f && dst->ne[0]%128 == 0 &&
+            (next->src[0]->type == GGML_TYPE_F8_E4M3_KS || next->src[0]->type == GGML_TYPE_F8_E4M3_B128) &&
+            f8_w8a8(src0_1, cc) && f8_w8a8(src0_2, cc) && f8_w8a8(next->src[0], cc) &&
+            ggml_backend_buffer_is_cuda(next->src[0]->buffer) && ggml_backend_buffer_is_cuda(next->buffer) &&
+            ((ggml_backend_cuda_buffer_context *)next->src[0]->buffer->context)->device == ctx.device &&
+            ((ggml_backend_cuda_buffer_context *)next->buffer->context)->device == ctx.device &&
+            ggml_is_contiguous(next) && !(dst->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const ggml_tensor * out = next->src[1];
+            bool sole = out->view_src == nullptr;
+            for (int j = i + 1; j < graph->n_nodes && sole; ++j) {
+                const ggml_tensor * node = graph->nodes[j];
+                if (node->view_src == out) sole = false;
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (node->src[k] && (node->src[k] == out || node->src[k]->view_src == out) && !(node == next && k == 1)) sole = false;
+                }
+            }
+            if (sole) fused = next;
+        }
+        if (fused && ggml_cuda_mul_mat_f8_id(ctx, src0_1, src1, ids, dst, src0_2, dst->src[4], dst->src[5], up.get(), fused)) {
+            CUDA_CHECK(cudaGetLastError());
+            return i + 1;
+        }
         if (ggml_cuda_mul_mat_f8_id(ctx, src0_1, src1, ids, dst, src0_2, dst->src[4], dst->src[5], up.get())) {
-            const auto unary = (ggml_unary_op)dst->op_params[0];
             if (unary == GGML_UNARY_OP_SWIGLU_OAI) {
                 ggml_swiglu_oai_cuda_f32((const float *)dst->data, up.get(), (float *)dst->data,
                         ggml_nelements(dst), dst->ne[0], dst->ne[0], dst->ne[0], 1.702f, 7.0f, ctx.stream());
