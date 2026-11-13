@@ -53,6 +53,26 @@ static __global__ void f8_lt_scale(const char * weight, const float * scales, fl
     }
 }
 
+static __global__ void f8_lt_scale_add(const char * weight, const float * scales, const float * product, const float * other,
+        float * output, int m, int n, int k, int ldc) {
+    const int row = 4*(blockIdx.x*blockDim.x + threadIdx.x);
+    if (row >= m) return;
+    float ws[4];
+    for (int j = 0; j < 4; ++j) ws[j] = ggml_cuda_f8_row::scale(weight + size_t(row+j)*ggml_cuda_f8_row::row_size(k));
+    for (int col = blockIdx.y*16; col < min(n, int(blockIdx.y+1)*16); ++col) {
+        const size_t offset = size_t(col)*ldc + row;
+        const float4 p = *(const float4 *)(product + offset);
+        const float4 o = *(const float4 *)(other + offset);
+        const float as = scales[col];
+        float4 r;
+        r.x = __fadd_rn(__fmul_rn(p.x, __fmul_rn(ws[0], as)), o.x);
+        r.y = __fadd_rn(__fmul_rn(p.y, __fmul_rn(ws[1], as)), o.y);
+        r.z = __fadd_rn(__fmul_rn(p.z, __fmul_rn(ws[2], as)), o.z);
+        r.w = __fadd_rn(__fmul_rn(p.w, __fmul_rn(ws[3], as)), o.w);
+        *(float4 *)(output + offset) = r;
+    }
+}
+
 static __global__ void f8_lt_row_scales(const char * weight, float * output, int m, int k) {
     const int row = blockIdx.x*blockDim.x + threadIdx.x;
     if (row < m) output[row] = ggml_cuda_f8_row::scale(weight + size_t(row)*ggml_cuda_f8_row::row_size(k));
@@ -190,6 +210,12 @@ struct ggml_cuda_f8_lt_context {
             const float * scales, float * output, cudaStream_t stream) {
         if (!matmul(m,k,n,ldc,weight,activation,output,stream)) return false;
         f8_lt_scale<<<dim3((m+1023)/1024,(n+15)/16),256,0,stream>>>(weight,scales,output,m,n,k,ldc);
+        return true;
+    }
+    bool launch_add(int m, int k, int n, int ldc, const char * weight, const uint8_t * activation,
+            const float * scales, float * product, const float * other, float * output, cudaStream_t stream) {
+        if (!matmul(m,k,n,ldc,weight,activation,product,stream)) return false;
+        f8_lt_scale_add<<<dim3((m+1023)/1024,(n+15)/16),256,0,stream>>>(weight,scales,product,other,output,m,n,k,ldc);
         return true;
     }
     bool up_gate(int m, int k, int n, int ldc, const char * up, const char * gate, const uint8_t * activation,

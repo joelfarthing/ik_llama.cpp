@@ -2924,6 +2924,24 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
     f8_quantize<G><<<dim3((n+4*G-1)/(4*G),cols),128,0,stream>>>(
             (const float *)src1->data, activations.get(), scales.get(), n, src1->nb[1]/sizeof(float));
 #ifdef GGML_CUDA_F8_LT
+    auto add_after = [&](int j) {
+        if (!use_lt || !cgraph) return -1;
+        const ggml_tensor * mm = cgraph->nodes[j];
+        int ia = j;
+        do ++ia; while (ia < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[ia]));
+        if (ia >= cgraph->n_nodes) return -1;
+        const ggml_tensor * add = cgraph->nodes[ia];
+        if (add->op != GGML_OP_ADD || (add->src[0] != mm && add->src[1] != mm) || add->src[0] == add->src[1]) return -1;
+        const ggml_tensor * other = add->src[0] == mm ? add->src[1] : add->src[0];
+        if (other->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || !ggml_are_same_shape(mm, other) || !ggml_are_same_shape(mm, add) ||
+                !ggml_is_contiguous(other) || !ggml_is_contiguous(add) || uintptr_t(other->data)%16 != 0 || uintptr_t(add->data)%16 != 0) return -1;
+        for (auto t : {other, add}) {
+            if (!ggml_backend_buffer_is_cuda(t->buffer) ||
+                    ((ggml_backend_cuda_buffer_context *)t->buffer->context)->device != ctx.device) return -1;
+        }
+        return f8_readers(cgraph, j + 1, mm) == 1 ? ia : -1;
+    };
+    auto other_of = [&](const ggml_tensor * add, const ggml_tensor * mm) { return add->src[0] == mm ? add->src[1] : add->src[0]; };
     if (use_lt && cgraph) {
         auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
         const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
@@ -2943,13 +2961,18 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                 ggml_cuda_pool_alloc<float> row_scales(ctx.pool(), 2*m);
                 ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
                 ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), cols);
+                const int ia = add_after(id);
                 if (lt.up_gate(m, n, cols, m, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
                             activations.get(), scales.get(), (float *)up->data, (float *)gate->data,
                             row_scales.get(), codes.get(), out_scales.get(), stream) &&
-                    lt.launch(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
-                            codes.get(), out_scales.get(), (float *)down->data, stream)) {
+                    (ia >= 0 ?
+                     lt.launch_add(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
+                            codes.get(), out_scales.get(), (float *)down->data, (const float *)other_of(cgraph->nodes[ia], down)->data,
+                            (float *)cgraph->nodes[ia]->data, stream) :
+                     lt.launch(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
+                            codes.get(), out_scales.get(), (float *)down->data, stream))) {
                     CUDA_CHECK(cudaGetLastError());
-                    return id;
+                    return ia >= 0 ? ia : id;
                 }
             }
         }
@@ -2961,6 +2984,13 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
 #ifdef GGML_CUDA_F8_LT
         if (use_lt) {
             auto & lt = f8_lt_context(ctx);
+            const int ia = add_after(node_n);
+            if (ia >= 0 && lt.launch_add(weight->ne[1], n, cols, dst->ne[0], (const char *)weight->data,
+                        activations.get(), scales.get(), (float *)dst->data, (const float *)other_of(cgraph->nodes[ia], dst)->data,
+                        (float *)cgraph->nodes[ia]->data, stream)) {
+                CUDA_CHECK(cudaGetLastError());
+                return ia;
+            }
             done = lt.launch(weight->ne[1], n, cols, dst->ne[0], (const char *)weight->data,
                     activations.get(), scales.get(), (float *)dst->data, stream);
         } else
