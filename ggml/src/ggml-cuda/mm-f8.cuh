@@ -334,7 +334,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     const int c = i/(BK/8), k = k0 + 8*(i%(BK/8));
                     half * dst = (half *)(b + (s*BN+c)*stride + (k-k0)/2);
                     const bool valid = (!tail && !indexed) || (first_col+c < cols && k+7 < n);
-                    const half * src = valid ? y + size_t(first_col+c)*n + k : y;
+                    const half * src = valid ? y + size_t(!tail && !indexed ? min(first_col+c, cols-1) : first_col+c)*n + k : y;
                     if (valid && (!tail || uintptr_t(src)%16 == 0)) {
                         f8_pp_copy<16>(dst, src, 16);
                     } else {
@@ -608,7 +608,7 @@ template <typename layout, int BN, int NW, int stages, int BK, int G = 0>
 static bool launch_f8_pp(int shared_limit, int n, int rows, int cols, int ldc, const char * x, const f8_activation<G> * y, float * z, cudaStream_t stream, const float * activation_scales = nullptr) {
     constexpr int bytes = f8_pp_shared<BN, stages, BK, G>();
     if (bytes > shared_limit) return false;
-    const bool tail = n%BK != 0 || rows%128 != 0 || cols%BN != 0 || uintptr_t(x)%16 != 0 || uintptr_t(y)%16 != 0;
+    const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0 || uintptr_t(y)%16 != 0;
     auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, false, G> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, false, G>;
     if (tail) {
         CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);
