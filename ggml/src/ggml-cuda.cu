@@ -3335,8 +3335,10 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
     auto small = tiles + experts + 1;
     auto counts = small + experts + 1;
     auto ranks = counts + size_t(chunks)*experts;
+#ifdef F8_TMA_AVAILABLE
     auto tiles_ug = ranks + cols;
     auto tiles_dn = tiles_ug + experts + 1;
+#endif
     f8_moe_histogram<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks,
             ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     f8_moe_prefix<<<1,256,0,stream>>>(counts, bounds, experts, chunks);
@@ -3347,8 +3349,8 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
             (float *)(next ? next->data : dst->data), gate && !next ? up : nullptr, (next ? next : dst)->ne[0],
             ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     ggml_cuda_pool_alloc<f8_activation<G>> activations(ctx.pool(), size_t(cols)*src->ne[0]);
-    bool tma = false;
 #ifdef F8_TMA_AVAILABLE
+    bool tma = false;
     if constexpr (G != 0) {
         const int n = src->ne[0], m = dst->ne[0];
         if (next && cc >= 1200 && f8_tma_encoder() && n%128 == 0 && (n/128)%4 == 0 && n/128 <= 256 && m%128 == 0 &&
