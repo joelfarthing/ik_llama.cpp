@@ -2830,6 +2830,12 @@ static bool launch_f8_w8a8(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (weight->type == GGML_TYPE_F8_E4M3_KS) {
         return launch_f8_pp<ggml_cuda_f8_row,128,8,2,64,f8_activation_group>(shared_limit, n, rows, cols, ldc, x, y, z, stream, scales);
     }
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc < 1200) {
+        if (cols <= 64) {
+            return launch_f8_pp<ggml_cuda_f8_block,32,4,1,128,f8_activation_group>(shared_limit, n, rows, cols, ldc, x, y, z, stream, scales);
+        }
+        return launch_f8_pp<ggml_cuda_f8_block,64,4,1,128,f8_activation_group>(shared_limit, n, rows, cols, ldc, x, y, z, stream, scales);
+    }
     return launch_f8_pp<ggml_cuda_f8_block,128,8,1,128,f8_activation_group>(shared_limit, n, rows, cols, ldc, x, y, z, stream, scales);
 }
 
