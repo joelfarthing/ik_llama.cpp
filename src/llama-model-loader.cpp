@@ -491,11 +491,25 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
     }
 
     if (import_f8_e4m3()) use_mmap = false;
-    if (fp8_precision == LLAMA_FP8_PRECISION_W8A8) {
+    {
+        const int kid = gguf_find_key(meta, "general.fp8.activations");
+        const std::string scheme = kid >= 0 && gguf_get_kv_type(meta, kid) == GGUF_TYPE_STRING ? gguf_get_val_str(meta, kid) : "";
+        const bool declared = scheme == "dynamic" || scheme == "static";
+        const bool w8a8 = fp8_precision == LLAMA_FP8_PRECISION_W8A8 || (fp8_precision == LLAMA_FP8_PRECISION_AUTO && declared);
+        int n_fp8 = 0;
         for (auto & w : weights) {
             if (w.tensor->type == GGML_TYPE_F8_E4M3_KS || w.tensor->type == GGML_TYPE_F8_E4M3_B128) {
-                ggml_set_input_scale(w.tensor, -1.0f);
+                if (w8a8) ggml_set_input_scale(w.tensor, -1.0f);
+                ++n_fp8;
             }
+        }
+        if (n_fp8) {
+            if (kid >= 0 && !declared && fp8_precision == LLAMA_FP8_PRECISION_AUTO) {
+                LLAMA_LOG_WARN("%s: general.fp8.activations has the unknown value '%s'; --fp8-precision auto uses W8A16\n", __func__, scheme.c_str());
+            }
+            LLAMA_LOG_INFO("%s: FP8 precision %s: %s requested for %d tensors%s\n", __func__,
+                    fp8_precision == LLAMA_FP8_PRECISION_AUTO ? "auto" : w8a8 ? "w8a8" : "w8a16", w8a8 ? "W8A8" : "W8A16", n_fp8,
+                    fp8_precision != LLAMA_FP8_PRECISION_AUTO ? "" : declared ? " (the file declares 8-bit activations)" : " (the file declares no 8-bit activations)");
         }
     }
 

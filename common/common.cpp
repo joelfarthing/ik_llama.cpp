@@ -3422,7 +3422,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ub,   --ubatch-size N",        "physical maximum batch size (default: %d)", params.n_ubatch });
     options.push_back({ "*",           "       --keep N",               "number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep });
     options.push_back({ "*",           "       --chunks N",             "max number of chunks to process (default: %d, -1 = all)", params.n_chunks });
-    options.push_back({ "*", "--fp8-precision (auto|w8a16|w8a8)", "FP8 prefill precision (default: auto = w8a16). w8a8: dynamic E4M3 activations on CUDA Ada and Blackwell, lower accuracy." });
+    options.push_back({ "*", "--fp8-precision (auto|w8a16|w8a8)", "FP8 prefill precision (default: auto = w8a8 if the file declares 8-bit activations, else w8a16). w8a8: dynamic E4M3 activations on CUDA Ada and Blackwell, lower accuracy." });
     options.push_back({ "*", "--nvfp4-precision (auto|w4a4|int8)", "NVFP4 matmul precision on Blackwell (default: auto). w4a4: 4-bit activations, fastest, lower accuracy. int8: 8-bit activations, more accurate. auto: w4a4 when the model has input scales, unless it is marked W4A16 or has imatrix data; older ggml-org/llama.cpp W4A16 conversions may need int8." });
     options.push_back({ "*",           "-no-fa, --no-flash-attn",       "disable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fa, --flash-attn (auto|on|off|0|1)", "set Flash Attention (default: %s)", params.flash_attn ? "on" : "off" });
