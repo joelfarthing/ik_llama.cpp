@@ -529,6 +529,14 @@ class Model:
         if self._fp8_types:
             self.ftype = (gguf.LlamaFileType.MOSTLY_F8_E4M3_B128 if gguf.GGMLQuantizationType.F8_E4M3_B128 in self._fp8_types
                           else gguf.LlamaFileType.MOSTLY_F8_E4M3_KS)
+            quant = self.hparams.get("quantization_config") or {}
+            acts = [group.get("input_activations") or {} for group in [quant, *(quant.get("config_groups") or {}).values()]]
+            acts = [act for act in acts if act.get("type") == "float" and act.get("num_bits") == 8]
+            scheme = quant.get("activation_scheme") if quant.get("quant_method") == "fp8" else None
+            if acts:
+                scheme = "static" if all(act.get("dynamic") is False for act in acts) else "dynamic"
+            if scheme in ("dynamic", "static"):
+                self.gguf_writer.add_string(gguf.Keys.General.FP8_ACTIVATIONS, scheme)
 
         total_params, shared_params, expert_params, expert_count = self.gguf_writer.get_total_parameter_count()
 
