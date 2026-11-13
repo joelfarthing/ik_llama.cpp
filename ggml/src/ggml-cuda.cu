@@ -2798,8 +2798,31 @@ static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const flo
     }
 }
 
-static bool launch_f8_w8a8(const ggml_tensor * weight, int shared_limit, int n, int rows, int cols, int ldc,
+#ifdef F8_TMA_AVAILABLE
+template <int RN>
+static bool launch_f8_tma_dense(ggml_backend_cuda_context & ctx, int n, int rows, int cols, const char * x, const uint8_t * y,
+        const float * scales, float * z, cudaStream_t stream) {
+    if (f8_tma_shared<RN, false, true>(n/128) > (int)ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) return false;
+    ggml_cuda_pool_alloc<int32_t> route(ctx.pool(ggml_cuda_get_device()), cols + 4);
+    f8_dense_routing<<<(cols+255)/256, 256, 0, stream>>>(route.get(), route.get() + cols, route.get() + cols + 2, cols, 16*RN);
+    const size_t stride = ggml_cuda_f8_block::row_size(n);
+    const f8_moe_routing routing{route.get(), route.get() + cols, route.get() + cols + 2, 1, stride, stride*rows, nullptr, 0,
+            nullptr, nullptr, nullptr, false};
+    return launch_f8_tma<RN, false, true>(n, rows, cols, x, nullptr, y, scales, n/128, z, nullptr, nullptr, nullptr, 0, routing,
+            nullptr, stream, 8);
+}
+#endif
+
+static bool launch_f8_w8a8(ggml_backend_cuda_context & ctx, const ggml_tensor * weight, int shared_limit, int n, int rows, int cols, int ldc,
         const char * x, const uint8_t * y, float * z, const float * scales, cudaStream_t stream) {
+#ifdef F8_TMA_AVAILABLE
+    if (weight->type == GGML_TYPE_F8_E4M3_B128 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= 1200 && f8_tma_encoder() &&
+        n%128 == 0 && n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && rows%128 == 0 && ldc == rows &&
+        (launch_f8_tma_dense<8>(ctx, n, rows, cols, x, y, scales, z, stream) ||
+         launch_f8_tma_dense<6>(ctx, n, rows, cols, x, y, scales, z, stream))) return true;
+#else
+    GGML_UNUSED(ctx);
+#endif
     if (weight->type == GGML_TYPE_F8_E4M3_KS) {
         return launch_f8_pp<ggml_cuda_f8_row,128,8,2,64,f8_activation_group>(shared_limit, n, rows, cols, ldc, x, y, z, stream, scales);
     }
@@ -2822,7 +2845,7 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
             ggml_cuda_pool_alloc<uint8_t> activations(ctx.pool(ggml_cuda_get_device()), size_t(src1_ncols)*n);
             ggml_cuda_pool_alloc<float> scales(ctx.pool(ggml_cuda_get_device()), size_t(src1_ncols)*((n+G-1)/G));
             f8_quantize<G><<<dim3((n+4*G-1)/(4*G),src1_ncols),128,0,stream>>>(src1_ddf_i, activations.get(), scales.get(), n, src1->ne[0]);
-            if (launch_f8_w8a8(src0, shared_limit, n, nrows, src1_ncols, ldc,
+            if (launch_f8_w8a8(ctx, src0, shared_limit, n, nrows, src1_ncols, ldc,
                     src0_dd_i, activations.get(), dst_dd_i, scales.get(), stream)) return;
         }
     }
@@ -3027,7 +3050,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                     activations.get(), scales.get(), (float *)dst->data, stream);
         } else
 #endif
-        done = launch_f8_w8a8(weight, ggml_cuda_info().devices[ctx.device].smpbo, n, weight->ne[1], cols, dst->ne[0],
+        done = launch_f8_w8a8(ctx, weight, ggml_cuda_info().devices[ctx.device].smpbo, n, weight->ne[1], cols, dst->ne[0],
                 (const char *)weight->data, activations.get(), (float *)dst->data, scales.get(), stream);
         if (!done) {
             if (norm) {
