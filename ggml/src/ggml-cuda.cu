@@ -3029,6 +3029,45 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         }
     }
 #endif
+#ifdef F8_TMA_AVAILABLE
+    if (!use_lt && cgraph && dst->src[0]->type == GGML_TYPE_F8_E4M3_B128 && cc >= 1200 && f8_tma_encoder() &&
+        n%128 == 0 && n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0) {
+        auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
+        const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
+        if (id < cgraph->n_nodes) {
+            ggml_tensor * second = cgraph->nodes[ig], * unary = cgraph->nodes[iu], * down = cgraph->nodes[id];
+            const bool swapped = unary->src[0] == dst && unary->src[1] == second;
+            ggml_tensor * up = swapped ? second : dst, * gate = swapped ? dst : second;
+            const int m = dst->ne[0], limit = ggml_cuda_info().devices[ctx.device].smpbo;
+            if (compatible(second, src1) && second->src[0]->type == GGML_TYPE_F8_E4M3_B128 && second->ne[0] == m &&
+                m%128 == 0 && m/128 <= 252 && ggml_cuda_f8_block::row_size(m)%16 == 0 &&
+                unary->op == GGML_OP_FUSED_MUL_UNARY && unary->src[0] == gate && unary->src[1] == up &&
+                (ggml_unary_op)unary->op_params[0] == GGML_UNARY_OP_SILU && *(const float *)(unary->op_params + 1) < 1e-6f &&
+                compatible(down, unary) && down->src[0]->type == GGML_TYPE_F8_E4M3_B128 && down->ne[0]%128 == 0 &&
+                f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
+                f8_readers(cgraph, iu + 1, unary) == 1 && f8_tma_shared<4, true, true>(n/128) <= limit &&
+                f8_tma_shared<6, false, true>(m/128) <= limit) {
+                ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
+                ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*(m/128));
+                ggml_cuda_pool_alloc<int32_t> route(ctx.pool(), cols + 4);
+                f8_dense_routing<<<(cols+255)/256, 256, 0, stream>>>(route.get(), route.get() + cols, route.get() + cols + 2, cols, 64);
+                const size_t stride = ggml_cuda_f8_block::row_size(n);
+                const f8_moe_routing routing{route.get(), route.get() + cols, route.get() + cols + 2, 1, stride, stride*m, nullptr, 0,
+                        nullptr, nullptr, nullptr, false};
+                if (launch_f8_tma<4, true, true>(n, m, cols, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
+                            activations.get(), scales.get(), n/128, nullptr, nullptr, codes.get(), out_scales.get(), m/128, routing,
+                            nullptr, stream, 8) &&
+                    (launch_f8_tma_dense<8>(ctx, m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
+                            (float *)down->data, stream) ||
+                     launch_f8_tma_dense<6>(ctx, m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
+                            (float *)down->data, stream))) {
+                    CUDA_CHECK(cudaGetLastError());
+                    return id;
+                }
+            }
+        }
+    }
+#endif
     for (;;) {
         const auto * weight = dst->src[0];
         bool done = false;
