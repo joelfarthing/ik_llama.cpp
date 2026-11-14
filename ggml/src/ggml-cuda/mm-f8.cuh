@@ -922,17 +922,14 @@ static bool launch_f8_tma(int K, int M, int cols, const char * x, const char * x
         const char * bias_gate, cudaStream_t stream, int cg = 0, const float * other = nullptr) {
     constexpr int BN = 16*RN;
     const int expert_rows = routing.expert_stride/routing.row_stride;
-    alignas(64) CUtensorMap ma, mg, mb, ms;
-    const auto meta = ggml_cuda_f8_row::row_meta_size;
-    if constexpr (BLK) {
-        const int J = routing.row_stride%16 == 0 ? 1 : routing.row_stride%8 == 0 ? 2 : 4;
-        const uint64_t width = J*routing.row_stride, total = uint64_t(routing.experts)*expert_rows/J;
-        if (!f8_tma_map(ma, CU_TENSOR_MAP_DATA_TYPE_UINT8, x, width, total, width, 144, 128/J) ||
-            !f8_tma_map(mg, CU_TENSOR_MAP_DATA_TYPE_UINT8, UG ? xg : x, width, total, width, 144, 128/J) ||
-            !f8_tma_map(mb, CU_TENSOR_MAP_DATA_TYPE_UINT8, y, K, cols, K, 128, BN) ||
-            !f8_tma_map(ms, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, scales, SG, cols, SG*4, SG, BN)) return false;
-    } else if (!f8_tma_map(ma, CU_TENSOR_MAP_DATA_TYPE_UINT8, x+meta, K, uint64_t(routing.experts)*expert_rows, routing.row_stride, 128, 128) ||
-        !f8_tma_map(mg, CU_TENSOR_MAP_DATA_TYPE_UINT8, (UG ? xg : x)+meta, K, uint64_t(routing.experts)*expert_rows, routing.row_stride, 128, 128) ||
+    alignas(64) CUtensorMap ma, mg{}, mb, ms;
+    const int J = BLK ? (routing.row_stride%16 == 0 ? 1 : routing.row_stride%8 == 0 ? 2 : 4) : 1;
+    auto weights = [&](CUtensorMap & map, const char * w) {
+        const uint64_t rows = uint64_t(routing.experts)*expert_rows/J;
+        return BLK ? f8_tma_map(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, w, J*routing.row_stride, rows, J*routing.row_stride, 144, 128/J) :
+            f8_tma_map(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, w + ggml_cuda_f8_row::row_meta_size, K, rows, routing.row_stride, 128, 128);
+    };
+    if (!weights(ma, x) || (UG && !weights(mg, xg)) ||
         !f8_tma_map(mb, CU_TENSOR_MAP_DATA_TYPE_UINT8, y, K, cols, K, 128, BN) ||
         !f8_tma_map(ms, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, scales, SG, cols, SG*4, SG, BN)) return false;
     const int bytes = f8_tma_shared<RN, UG, BLK>(SG);
