@@ -2,6 +2,7 @@
 
 #include "mmv-f8.cuh"
 #include "mma_new.cuh"
+#include "quantize.cuh"
 
 template <int bytes>
 static __device__ __forceinline__ void f8_pp_copy(void * dst, const void * src, int count) {
@@ -49,6 +50,12 @@ static bool f8_w8a8(const ggml_tensor * weight, int cc) {
         ggml_get_input_scale(weight) == -1.0f && f8_mma_available(cc);
 }
 
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
+static __device__ __forceinline__ uint8_t f8_encode(float value, float scale) {
+    return scale == 0 ? 0 : __nv_cvt_float_to_fp8(__fdiv_rn(value, scale), __NV_SATFINITE, __NV_E4M3);
+}
+#endif
+
 template <int G>
 static __device__ void f8_quantize_group(const float * input, uint8_t * output, float * scales, int n, int group,
         const float * gate = nullptr) {
@@ -67,7 +74,7 @@ static __device__ void f8_quantize_group(const float * input, uint8_t * output, 
 #pragma unroll
     for (int j = 0; j < G/32; ++j) {
         const int k = group*G + lane + 32*j;
-        if (k < n) output[k] = scale == 0 ? 0 : __nv_cvt_float_to_fp8(__fdiv_rn(values[j], scale), __NV_SATFINITE, __NV_E4M3);
+        if (k < n) output[k] = f8_encode(values[j], scale);
     }
 #else
     GGML_UNUSED(input); GGML_UNUSED(output); GGML_UNUSED(scales); GGML_UNUSED(n); GGML_UNUSED(group); GGML_UNUSED(gate);
@@ -125,21 +132,15 @@ static __global__ void f8_norm_quantize(const float * x, const float * w, uint8_
             amax = fmaxf(amax, fabsf(v));
         }
         __syncthreads();
-        amax = warp_reduce_max(amax);
-        if (lane == 0) shared[warp] = amax;
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            amax = warp_reduce_max(shared[threadIdx.x]);
-            if (threadIdx.x == 0) {
-                qscale = __fdiv_rn(amax, 448.0f);
-                scales[blockIdx.x] = qscale == 0 ? 1.0f : qscale;
-            }
+        amax = block_reduce_max(amax, shared);
+        if (threadIdx.x == 0) {
+            qscale = __fdiv_rn(amax, 448.0f);
+            scales[blockIdx.x] = qscale == 0 ? 1.0f : qscale;
         }
         __syncthreads();
         count = 0;
         for (int col = threadIdx.x; col < k; col += 1024) {
-            output[size_t(blockIdx.x)*k+col] = qscale == 0 ? 0 :
-                __nv_cvt_float_to_fp8(__fdiv_rn(values[count++], qscale), __NV_SATFINITE, __NV_E4M3);
+            output[size_t(blockIdx.x)*k+col] = f8_encode(values[count++], qscale);
         }
     } else {
         __syncthreads();
@@ -155,8 +156,7 @@ static __global__ void f8_norm_quantize(const float * x, const float * w, uint8_
             for (int j = 0; j < G/32; ++j) amax = fmaxf(amax, shared[32*i + warp/(G/32)*(G/32) + j]);
             const float qscale = __fdiv_rn(amax, 448.0f);
             if (threadIdx.x%G == 0) scales[size_t(blockIdx.x)*((k+G-1)/G) + col/G] = qscale == 0 ? 1.0f : qscale;
-            output[size_t(blockIdx.x)*k + col] = qscale == 0 ? 0 :
-                __nv_cvt_float_to_fp8(__fdiv_rn(values[i], qscale), __NV_SATFINITE, __NV_E4M3);
+            output[size_t(blockIdx.x)*k + col] = f8_encode(values[i], qscale);
         }
     }
 #else

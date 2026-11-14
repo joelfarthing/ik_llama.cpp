@@ -33,8 +33,7 @@ static __global__ void f8_lt_quantize(const float * input, uint8_t * output, flo
     }
     __syncthreads();
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        output[size_t(blockIdx.x)*k+i] = scale == 0 ? 0 :
-            __nv_cvt_float_to_fp8(__fdiv_rn(x[i], scale), __NV_SATFINITE, __NV_E4M3);
+        output[size_t(blockIdx.x)*k+i] = f8_encode(x[i], scale);
     }
 }
 
@@ -112,8 +111,7 @@ static __global__ void f8_lt_up_gate(const T * up, const T * gate, const float *
     }
     __syncthreads();
     for (int i = threadIdx.x; i < m; i += blockDim.x) {
-        output[size_t(blockIdx.x)*m+i] = scale == 0 ? 0 :
-            __nv_cvt_float_to_fp8(__fdiv_rn(values[i], scale), __NV_SATFINITE, __NV_E4M3);
+        output[size_t(blockIdx.x)*m+i] = f8_encode(values[i], scale);
     }
 }
 
