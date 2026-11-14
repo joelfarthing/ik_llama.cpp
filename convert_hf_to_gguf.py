@@ -2616,10 +2616,16 @@ class ModelOptModel(Model):
         return gguf.LazyNumpyTensor(meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(np.uint8, shape),
                                    args=(weight, scale, scale2), func=pack)
 
+    _mtp_fc_halves = (".nextn_fc_embedding.weight", ".nextn_fc_hidden.weight")
+
     def _write_fp8_projection(self, name, weight, scale):
         bid = next((int(p) for p in name.split('.') if p.isdecimal()), None)
-        for new_name, data in self.modify_tensors(weight.view(torch.uint8), name, bid):
-            packed = self._convert_fp8(new_name, data.view(torch.float8_e4m3fn), scale, None, transforms_done=True)
+        data = weight.view(torch.uint8)
+        if self._expert_part(name)[0]:
+            data = self._convert_fp8(name, weight, scale, None, transforms_done=True)
+        for new_name, data in self.modify_tensors(data, name, bid):
+            packed = data if isinstance(data, FP8Tensor) else self._convert_fp8(
+                new_name, data.view(torch.float8_e4m3fn), scale, None, transforms_done=True)
             self.gguf_writer.add_tensor(new_name, packed.numpy(self.is_big_endian), raw_dtype=packed.qtype)
 
     def _write_fp8_ple(self, shards, scale):
@@ -2687,7 +2693,7 @@ class ModelOptModel(Model):
             if weight.dtype == torch.float8_e4m3fn:
                 if math.prod(scale.shape) != 1:
                     raise ValueError(f"Expected per-tensor FP8 scale for {name}: {tuple(scale.shape)}")
-                if self.fp8_dequant:
+                if self.fp8_dequant or name.endswith(self._mtp_fc_halves):
                     self.model_tensors[name] = lambda gen=gen, scale=scale: gen().float() * scale.float()
                     consumed.update((scale_name, base + ".input_scale"))
                     continue
@@ -3049,7 +3055,7 @@ class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
         if name.endswith("ple_embedding.ngram_heads_vocab_sizes"):
             return
 
-        if name.endswith((".nextn_fc_embedding.weight", ".nextn_fc_hidden.weight")):
+        if name.endswith(self._mtp_fc_halves):
             self._mtp_fc[name.rsplit(".", 2)[1]] = data_torch
             if len(self._mtp_fc) < 2:
                 return
@@ -3077,7 +3083,7 @@ class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
 
     def _merge_shared_input(self, new_name: str, data: Tensor, bid: int | None) -> Iterable[tuple[str, Tensor]]:
 
-        if bid is None or self._is_nvfp4 or self.hparams.get("quantization_config"):
+        if bid is None or self._is_nvfp4 or self._nvfp4_global_algo or self.hparams.get("quantization_config"):
             yield (new_name, data)
             return
 
