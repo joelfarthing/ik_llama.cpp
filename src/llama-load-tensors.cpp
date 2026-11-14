@@ -5974,6 +5974,9 @@ static void prepare_split_tensors(int split_dim, ggml_context * ctx, ggml_tensor
     GGML_ASSERT(mem_used.size() >= splits.size());
     for (int i = 0; i < split_tensor.ggml.n_device; ++i) {
         if (split_tensor.ggml.splits[i]) {
+            if (tensor->type == GGML_TYPE_F8_E4M3_KS || tensor->type == GGML_TYPE_F8_E4M3_B128) {
+                ggml_set_input_scale(split_tensor.ggml.splits[i], ggml_get_input_scale(tensor));
+            }
             //auto nbytes = ggml_nbytes(split_tensor.ggml.splits[i]);
             //printf("mem_used(%s): %8.2f, total: %8.2f\n", split_tensor.ggml.splits[i]->name, nbytes/1024./1024., (mem_used[i] + nbytes)/1024./1024.);
             mem_used[i] += ggml_nbytes(split_tensor.ggml.splits[i]);
