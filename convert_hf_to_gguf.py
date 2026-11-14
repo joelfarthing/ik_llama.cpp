@@ -3121,10 +3121,6 @@ class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
         (gguf.MODEL_TENSOR.SSM_BETA_ALPHA_CAT,  (gguf.MODEL_TENSOR.SSM_BETA,     gguf.MODEL_TENSOR.SSM_ALPHA),      True),
     )
 
-    def map_tensor_name(self, name, try_suffixes=(".weight", ".bias")):
-        mapped = super().map_tensor_name(name, try_suffixes)
-        return mapped.replace(".attn_indexer_k_norm", ".indexer.k_norm")
-
 
 @Model.register("FlintForCausalLM")
 class FlintModel(Qwen2MoeModel):

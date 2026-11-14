@@ -866,7 +866,7 @@ class TensorNameMap:
             MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: ('model.layers.{bid}.nextn_hc_head.input_mix_weight_down',),
             MODEL_TENSOR.NEXTN_HC_HEAD_UP: ('model.layers.{bid}.nextn_hc_head.input_mix_weight_up',),
             MODEL_TENSOR.INDEXER_Q_NORM: ('model.layers.{bid}.self_attn.indexer.q_layernorm',),
-            MODEL_TENSOR.INDEXER_K_NORM: ('model.layers.{bid}.self_attn.indexer.k_layernorm',),
+            MODEL_TENSOR.INDEX_K_NORM: ('model.layers.{bid}.self_attn.indexer.k_layernorm',),
             MODEL_TENSOR.PLE_KEY: ('model.layers.{bid}.ple.key_proj',),
             MODEL_TENSOR.PLE_VALUE: ('model.layers.{bid}.ple.value_proj',),
             MODEL_TENSOR.PLE_NORM_KEY: ('model.layers.{bid}.ple.norm_key',),
