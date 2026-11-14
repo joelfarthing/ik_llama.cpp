@@ -65,6 +65,20 @@ class FP8Tensor:
     def swapaxes(self, axis0, axis1):
         return FP8Tensor(self.data.swapaxes(axis0, axis1), self.qtype)
 
+    def numpy(self, big_endian=False):
+        data = self.data.numpy()
+        if big_endian:
+            def swap_scales(data, qtype=self.qtype):
+                data = data.copy()
+                blocks = data.reshape(-1, 132) if qtype == gguf.GGMLQuantizationType.F8_E4M3_B128 else data
+                blocks[..., :4] = blocks[..., :4][..., ::-1]
+                return data
+            if isinstance(data, gguf.LazyNumpyTensor):
+                data = gguf.LazyNumpyTensor._wrap_fn(swap_scales, meta_noop=True)(data)
+            else:
+                data = swap_scales(data)
+        return data
+
     @classmethod
     def stack(cls, tensors):
         if not isinstance(tensors[0], cls):
@@ -408,17 +422,7 @@ class Model:
 
             for new_name, d in self.modify_tensors(data_torch, name, bid):
                 if isinstance(d, FP8Tensor):
-                    data = d.data.numpy()
-                    if self.is_big_endian:
-                        def swap_scales(data, qtype=d.qtype):
-                            data = data.copy()
-                            blocks = data.reshape(-1, 132) if qtype == gguf.GGMLQuantizationType.F8_E4M3_B128 else data
-                            blocks[..., :4] = blocks[..., :4][..., ::-1]
-                            return data
-                        if isinstance(data, gguf.LazyNumpyTensor):
-                            data = gguf.LazyNumpyTensor._wrap_fn(swap_scales, meta_noop=True)(data)
-                        else:
-                            data = swap_scales(data)
+                    data = d.numpy(self.is_big_endian)
                     self.gguf_writer.add_tensor(new_name, data, raw_dtype=d.qtype)
                     self._fp8_types.add(d.qtype)
                     logger.info("%s, %s --> %s, shape = %s", new_name, old_dtype, d.qtype.name, d.shape[::-1])
