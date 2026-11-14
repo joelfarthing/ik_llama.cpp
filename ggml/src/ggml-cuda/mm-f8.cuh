@@ -563,7 +563,7 @@ static __global__ void f8_moe_histogram(const char * ids, int32_t * counts, int3
     local_ids[tid] = id;
     for (int e = tid; e < experts; e += blockDim.x) counts[blockIdx.x*experts+e] = 0;
     __syncthreads();
-    if (id < 0 || id >= experts) return;
+    if (id < 0) return;
     int rank = 0;
     for (int j = 0; j < tid; ++j) rank += local_ids[j] == id;
     ranks[col] = rank;
@@ -600,7 +600,7 @@ static __global__ void f8_moe_scatter(const char * ids, const int32_t * counts, 
     const int col = 256*blockIdx.x + threadIdx.x;
     if (col >= slots*tokens) return;
     const int id = *(const int32_t *)(ids + size_t(col/slots)*nb1 + size_t(col%slots)*nb0);
-    if (id >= 0 && id < experts) rows[bounds[id]+counts[blockIdx.x*experts+id]+ranks[col]] = col;
+    rows[bounds[id]+counts[blockIdx.x*experts+id]+ranks[col]] = col;
 }
 
 template <int G = 0>

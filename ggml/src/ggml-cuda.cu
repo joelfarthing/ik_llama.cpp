@@ -3542,7 +3542,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const dim3 grid(aligned ? (src0->ne[1] + 7)/8 : src0->ne[1], ids->ne[0], ids->ne[1]);
         auto launch = [&](auto kernel) {
             kernel<<<grid, 256, 0, ctx.stream()>>>(
-                src0->ne[0], src0->ne[2], src1->ne[1], (const char *)src0->data, (const char *)src1->data,
+                src0->ne[0], src1->ne[1], (const char *)src0->data, (const char *)src1->data,
                 (const char *)ids->data, (char *)dst->data, src0->nb[1], src0->nb[2], src1->nb[1], src1->nb[2],
                 ids->nb[0], ids->nb[1], dst->nb[1], dst->nb[2], src0->ne[1]);
         };
@@ -3862,7 +3862,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
             const bool aligned = ggml_cuda_f8_aligned(src0_1, src1) && ggml_cuda_f8_aligned(src0_2, src1);
             const dim3 grid(aligned ? (dst->ne[0] + 7)/8 : dst->ne[0], ids->ne[0], ids->ne[1]);
             auto launch = [&](auto kernel) {
-                kernel<<<grid, 256, 0, ctx.stream()>>>(src1->ne[0], dst->ne[0], src0_1->ne[2], src1->ne[1],
+                kernel<<<grid, 256, 0, ctx.stream()>>>(src1->ne[0], dst->ne[0], src1->ne[1],
                         (const char *)src0_1->data, (const char *)src0_2->data, (const char *)src1->data,
                         (const char *)ids->data, bu ? (const char *)bu->data : nullptr, bg ? (const char *)bg->data : nullptr,
                         (float *)dst->data, unary, *(const float *)(dst->op_params + 1), src0_1->nb[1], src0_1->nb[2], src0_2->nb[1], src0_2->nb[2],

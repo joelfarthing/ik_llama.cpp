@@ -170,7 +170,7 @@ static __global__ void mul_mat_vec_f8_e4m3_b128(int n, int ldc, const void * x,
 }
 
 template <bool blocked, bool aligned = false>
-static __global__ void mul_mat_vec_f8_e4m3_id(int n, int experts, int channels,
+static __global__ void mul_mat_vec_f8_e4m3_id(int n, int channels,
         const char * x, const char * y, const char * ids, char * z,
         size_t nb01, size_t nb02, size_t nb11, size_t nb12, size_t nbi0, size_t nbi1, size_t nb1, size_t nb2, int rows = 0) {
     const int r = aligned ? blockIdx.x*(blockDim.x/32) + threadIdx.x/32 : blockIdx.x;
@@ -180,7 +180,6 @@ static __global__ void mul_mat_vec_f8_e4m3_id(int n, int experts, int channels,
     const int slot = blockIdx.y;
     const int token = blockIdx.z;
     const int expert = *(const int *)(ids + size_t(token)*nbi1 + size_t(slot)*nbi0);
-    if (expert < 0 || expert >= experts) return;
     const void * row = x + size_t(expert)*nb02 + size_t(r)*nb01;
     const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
     float sum;
@@ -191,7 +190,7 @@ static __global__ void mul_mat_vec_f8_e4m3_id(int n, int experts, int channels,
 }
 
 template <bool blocked, bool aligned = false>
-static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int experts, int channels,
+static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int channels,
         const char * up, const char * gate, const char * y, const char * ids,
         const char * bias_up, const char * bias_gate, float * dst, ggml_unary_op unary, float limit,
         size_t nbu1, size_t nbu2, size_t nbg1, size_t nbg2, size_t nb11, size_t nb12,
@@ -204,10 +203,6 @@ static __global__ void mul_mat_vec_f8_e4m3_up_gate_id(int n, int rows, int exper
     }
     const int expert = *(const int *)(ids + size_t(token)*nbi1 + size_t(slot)*nbi0);
     const size_t out = (size_t(token)*gridDim.y + slot)*rows + row;
-    if (expert < 0 || expert >= experts) {
-        if (aligned ? threadIdx.x % 32 == 0 : threadIdx.x == 0) dst[out] = 0;
-        return;
-    }
     const auto * a = (const float *)(y + size_t(slot%channels)*nb11 + size_t(token)*nb12);
     const void * ur = up + size_t(expert)*nbu2 + size_t(row)*nbu1;
     const void * gr = gate + size_t(expert)*nbg2 + size_t(row)*nbg1;
