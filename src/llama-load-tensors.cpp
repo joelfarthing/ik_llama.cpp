@@ -3645,6 +3645,9 @@ bool create_tensors_helper::create_deepseek2_tensors(const LLM_TN & tn) {
             if (wq->type == wk->type) {
                 GGML_ASSERT(wq->ne[0] == wk->ne[0]);
                 layer.wkq_a_mqa = ggml_new_tensor_2d(ctx_split, wq->type, wq->ne[0], wq->ne[1] + wk->ne[1]);
+                if (wq->type == GGML_TYPE_F8_E4M3_KS || wq->type == GGML_TYPE_F8_E4M3_B128) {
+                    ggml_set_input_scale(layer.wkq_a_mqa, ggml_get_input_scale(wq));
+                }
                 snprintf(layer.wkq_a_mqa->name, GGML_MAX_NAME, "blk.%d.attn_qk_a_mqa.weight", i);
                 if (is_lite) {
                     layer.wq = ml.create_tensor_as_view(ctx_split, layer.wkq_a_mqa, q_name.c_str(), { wq->ne[0], wq->ne[1] }, 0);
@@ -3966,6 +3969,9 @@ bool create_tensors_helper::create_glm_dsa_tensors(const LLM_TN & tn) {
             if (wq->type == wk->type) {
                 GGML_ASSERT(wq->ne[0] == wk->ne[0]);
                 layer.wkq_a_mqa = ggml_new_tensor_2d(ctx_split, wq->type, wq->ne[0], wq->ne[1] + wk->ne[1]);
+                if (wq->type == GGML_TYPE_F8_E4M3_KS || wq->type == GGML_TYPE_F8_E4M3_B128) {
+                    ggml_set_input_scale(layer.wkq_a_mqa, ggml_get_input_scale(wq));
+                }
                 snprintf(layer.wkq_a_mqa->name, GGML_MAX_NAME, "blk.%d.attn_qk_a_mqa.weight", i);
                 layer.wq_a = ml.create_tensor_as_view(ctx_split, layer.wkq_a_mqa, q_name.c_str(), { wq->ne[0], wq->ne[1] }, 0, flags);
                 layer.wkv_a_mqa = ml.create_tensor_as_view(ctx_split, layer.wkq_a_mqa, k_name.c_str(), { wk->ne[0], wk->ne[1] }, wq->ne[1]*wq->nb[1], flags);
