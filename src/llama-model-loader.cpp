@@ -1292,6 +1292,21 @@ static bool valid_scale_shape(const ggml_tensor * scale, const ggml_tensor * wei
     return ggml_nelements(scale) == scale->ne[0] && (scale->ne[0] == 1 || scale->ne[0] == weight->ne[2]);
 }
 
+void llama_model_loader::read_scale(const llama_tensor_weight & scale, float * dst) {
+    const auto to_float = ggml_internal_get_type_traits(scale.tensor->type).to_float;
+    if (scale.tensor->type != GGML_TYPE_F32 && !to_float) {
+        throw std::runtime_error(format("%s: tensor '%s' has type %s, which cannot be read as a scale", __func__, ggml_get_name(scale.tensor), ggml_type_name(scale.tensor->type)));
+    }
+    std::vector<uint8_t> raw(ggml_nbytes(scale.tensor));
+    files.at(scale.idx)->seek(scale.offs, SEEK_SET);
+    files.at(scale.idx)->read_raw(raw.data(), raw.size());
+    if (to_float) {
+        to_float(raw.data(), dst, ggml_nelements(scale.tensor));
+    } else {
+        memcpy(dst, raw.data(), raw.size());
+    }
+}
+
 bool llama_model_loader::import_f8_e4m3() {
     int n_import = 0;
     for (const auto & w : weights) n_import += w.tensor->type == GGML_TYPE_F8_E4M3;
@@ -1307,20 +1322,11 @@ bool llama_model_loader::import_f8_e4m3() {
         const auto * s = get_weight((base + ".scale").c_str());
         w.f8_scale = { 1.0f };
         if (s) {
-            const int count = s->tensor->ne[0];
-            if (!valid_scale_shape(s->tensor, w.tensor) ||
-                    (s->tensor->type != GGML_TYPE_F32 && s->tensor->type != GGML_TYPE_BF16)) {
-                throw std::runtime_error(format("tensor '%s': F8_E4M3 scale '%s' must be F32 or BF16 with shape [1] or [n_expert]", name.c_str(), s->tensor->name));
+            if (!valid_scale_shape(s->tensor, w.tensor)) {
+                throw std::runtime_error(format("tensor '%s': F8_E4M3 scale '%s' must have shape [1] or [n_expert]", name.c_str(), s->tensor->name));
             }
-            w.f8_scale.resize(count);
-            files.at(s->idx)->seek(s->offs, SEEK_SET);
-            if (s->tensor->type == GGML_TYPE_F32) {
-                files.at(s->idx)->read_raw(w.f8_scale.data(), count*sizeof(float));
-            } else {
-                std::vector<ggml_bf16_t> values(count);
-                files.at(s->idx)->read_raw(values.data(), count*sizeof(ggml_bf16_t));
-                ggml_bf16_to_fp32_row(values.data(), w.f8_scale.data(), count);
-            }
+            w.f8_scale.resize(s->tensor->ne[0]);
+            read_scale(*s, w.f8_scale.data());
             for (float scale : w.f8_scale) {
                 if (!std::isfinite(scale)) throw std::runtime_error(format("tensor '%s': F8_E4M3 scale is not finite", name.c_str()));
             }
@@ -1391,21 +1397,6 @@ bool llama_model_loader::import_nvfp4(llama_nvfp4_precision precision) {
             prec_a4[gguf_get_arr_str(meta, names, i)] = values[i];
         }
     }
-
-    auto read_scale = [&](const llama_tensor_weight & scale, float * dst) {
-        const auto to_float = ggml_internal_get_type_traits(scale.tensor->type).to_float;
-        if (scale.tensor->type != GGML_TYPE_F32 && !to_float) {
-            throw std::runtime_error(format("%s: tensor '%s' has type %s, which cannot be read as a scale", __func__, ggml_get_name(scale.tensor), ggml_type_name(scale.tensor->type)));
-        }
-        std::vector<uint8_t> raw(ggml_nbytes(scale.tensor));
-        files.at(scale.idx)->seek(scale.offs, SEEK_SET);
-        files.at(scale.idx)->read_raw(raw.data(), raw.size());
-        if (to_float) {
-            to_float(raw.data(), dst, ggml_nelements(scale.tensor));
-        } else {
-            memcpy(dst, raw.data(), raw.size());
-        }
-    };
 
     std::set<const ggml_tensor *> consumed;
     int n_scale = 0;

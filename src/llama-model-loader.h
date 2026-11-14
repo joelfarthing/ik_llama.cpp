@@ -124,6 +124,7 @@ struct llama_model_loader {
 
     ~llama_model_loader();
 
+    void read_scale(const llama_tensor_weight & scale, float * dst);
     bool import_nvfp4(llama_nvfp4_precision precision);
     bool import_f8_e4m3();
 
