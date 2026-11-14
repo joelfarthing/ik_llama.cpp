@@ -2886,58 +2886,19 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         head_v_dim = self.hparams["linear_value_head_dim"]
         num_v_per_k = num_v_heads // num_k_heads
 
-        def apply_col_perm(qs: Tensor, scales: Tensor, col_perm: Tensor) -> tuple[Tensor, Tensor]:
-            k = qs.shape[-1] * 2
-            assert col_perm.numel() == k
-            assert k % 16 == 0
-
-            group_cols = col_perm.reshape(-1, 16)
-            group_starts = group_cols[:, 0]
-            expected = group_starts.unsqueeze(1) + torch.arange(16, dtype=col_perm.dtype)
-            assert torch.equal(group_cols, expected)
-            assert torch.all(group_starts % 16 == 0)
-
-            group_perm = (group_starts // 16).to(dtype=torch.long)
-
-            groups = qs.reshape(*qs.shape[:-1], k // 16, 8)
-            qs = groups.index_select(-2, group_perm.to(device=qs.device)).reshape(qs.shape)
-            scales = scales.index_select(-1, group_perm.to(device=scales.device))
-            return qs, scales
-
-        def reorder_rows(qs: Tensor, scales: Tensor, head_dim: int) -> tuple[Tensor, Tensor]:
-            row_perm = self._reorder_v_heads(
-                torch.arange(num_v_heads * head_dim, dtype=torch.long).unsqueeze(-1),
-                0, num_k_heads, num_v_per_k, head_dim,
-            ).squeeze(-1)
-            return (
-                qs.index_select(0, row_perm.to(device=qs.device)),
-                scales.index_select(0, row_perm.to(device=scales.device)),
-            )
+        def reorder(tensor: Tensor, dim: int, head_dim: int) -> Tensor:
+            return self._reorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim)
 
         if name.endswith(".linear_attn.in_proj_qkv.weight"):
-            q_dim = head_k_dim * num_k_heads
-            k_dim = head_k_dim * num_k_heads
-            q = weight[:q_dim]
-            k = weight[q_dim:q_dim + k_dim]
-            v = weight[q_dim + k_dim:]
-            q_scale = scale[:q_dim]
-            k_scale = scale[q_dim:q_dim + k_dim]
-            v_scale = scale[q_dim + k_dim:]
-            v, v_scale = reorder_rows(v, v_scale, head_v_dim)
-            return torch.cat([q, k, v], dim=0), torch.cat([q_scale, k_scale, v_scale], dim=0)
-
+            qk_dim = 2 * head_k_dim * num_k_heads
+            return (torch.cat([weight[:qk_dim], reorder(weight[qk_dim:], 0, head_v_dim)], dim=0),
+                    torch.cat([scale[:qk_dim], reorder(scale[qk_dim:], 0, head_v_dim)], dim=0))
         if name.endswith(".linear_attn.in_proj_z.weight"):
-            weight, scale = reorder_rows(weight, scale, head_v_dim)
-        elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
-            weight, scale = reorder_rows(weight, scale, 1)
-        elif name.endswith(".linear_attn.out_proj.weight"):
-            col_perm = self._reorder_v_heads(
-                torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
-                1, num_k_heads, num_v_per_k, head_v_dim,
-            ).squeeze(0)
-            weight, scale = apply_col_perm(weight, scale, col_perm)
-
-        return weight, scale
+            return reorder(weight, 0, head_v_dim), reorder(scale, 0, head_v_dim)
+        if name.endswith(".linear_attn.out_proj.weight"):
+            groups = weight.reshape(*weight.shape[:-1], -1, 8)
+            return reorder(groups, -2, head_v_dim // 16).reshape(weight.shape), reorder(scale, -1, head_v_dim // 16)
+        return reorder(weight, 0, 1), reorder(scale, 0, 1)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
