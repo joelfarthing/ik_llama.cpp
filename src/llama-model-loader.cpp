@@ -1322,10 +1322,11 @@ bool llama_model_loader::import_f8_e4m3() {
         const auto * s = get_weight((base + ".scale").c_str());
         w.f8_scale = { 1.0f };
         if (s) {
-            if (!valid_scale_shape(s->tensor, w.tensor)) {
-                throw std::runtime_error(format("tensor '%s': F8_E4M3 scale '%s' must have shape [1] or [n_expert]", name.c_str(), s->tensor->name));
+            const int64_t n_values = ggml_nelements(s->tensor);
+            if (!valid_scale_shape(s->tensor, w.tensor) && n_values != ggml_nrows(w.tensor)) {
+                throw std::runtime_error(format("tensor '%s': F8_E4M3 scale '%s' must have shape [1] or [n_expert], or one value for each row", name.c_str(), s->tensor->name));
             }
-            w.f8_scale.resize(s->tensor->ne[0]);
+            w.f8_scale.resize(n_values);
             read_scale(*s, w.f8_scale.data());
             for (float scale : w.f8_scale) {
                 if (!std::isfinite(scale)) throw std::runtime_error(format("tensor '%s': F8_E4M3 scale is not finite", name.c_str()));
@@ -1527,7 +1528,7 @@ static void read_nvfp4_rows(const llama_model_loader::llama_tensor_weight & w, c
     for (int r = 0; r < nrows; ++r) {
         memmove(dst + r*row_out + row_meta, src + r*row_in, row_in);
         memset(dst + r*row_out + sizeof(float), 0, row_meta - sizeof(float));
-        memcpy(dst + r*row_out, &scales[((r0 + r)/ne1) % n_scale], sizeof(float));
+        memcpy(dst + r*row_out, &scales[n_scale == ggml_nrows(cur) ? r0 + r : ((r0 + r)/ne1) % n_scale], sizeof(float));
     }
 }
 
