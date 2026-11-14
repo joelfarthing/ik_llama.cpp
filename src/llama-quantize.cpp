@@ -1485,7 +1485,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     }
     llama_model_loader ml(fname_inp, 0, use_mmap, /*check_tensors*/ true, /* repack_tensors */ false,
             /* use_thp */ false, /* merge_qkv */ false, /* merge_up_gate_exps */ false,
-            /* defer_experts */ false, kv_overrides, nullptr, std::string(), LLAMA_NVFP4_PRECISION_AUTO);
+            /* defer_experts */ false, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
 
     llama_model model;
@@ -2227,7 +2227,7 @@ static void estimate_imatrix_internal(const std::string & fname_inp,
 
     llama_model_loader ml(fname_inp, 0, use_mmap, /*check_tensors*/ true, /* repack_tensors */ false,
             /* use_thp */ false, /* merge_qkv */ false, /* merge_up_gate_exps */ false,
-            /* defer_experts */ false, nullptr, nullptr, std::string(), LLAMA_NVFP4_PRECISION_AUTO);
+            /* defer_experts */ false, nullptr, nullptr);
     ml.init_mappings(false); // no prefetching
 
     llama_model model;
