@@ -92,16 +92,6 @@ def np_roundf(n: np.ndarray) -> np.ndarray:
     return np.sign(n) * b
 
 
-def fp8_e4m3_to_fp32(codes: np.ndarray) -> np.ndarray:
-    magnitude = codes & 0x7F
-    exponent = magnitude >> 3
-    mantissa = magnitude & 7
-    values = np.ldexp(np.where(exponent == 0, mantissa, mantissa + 8).astype(np.float32),
-                      np.maximum(exponent.astype(np.int32), 1) - 10)
-    values = np.where(magnitude == 0x7F, np.uint32(0x7FF00000).view(np.float32), values)
-    return np.copysign(values, np.where(codes & 0x80, np.float32(-1), np.float32(1)))
-
-
 class QuantError(Exception): ...
 
 
@@ -124,14 +114,6 @@ def dequantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
         return data.view(np.float32)
     elif qtype == GGMLQuantizationType.F16:
         return data.view(np.float16).astype(np.float32)
-    elif qtype == GGMLQuantizationType.F8_E4M3:
-        return fp8_e4m3_to_fp32(data)
-    elif qtype == GGMLQuantizationType.F8_E4M3_KS:
-        return fp8_e4m3_to_fp32(data[..., GGML_ROW_META_SIZES[qtype]:]) * data[..., :4].copy().view(np.float32)
-    elif qtype == GGMLQuantizationType.F8_E4M3_B128:
-        blocks = data.reshape((*data.shape[:-1], -1, 132))
-        values = fp8_e4m3_to_fp32(blocks[..., 4:]) * blocks[..., :4].copy().view(np.float32)
-        return values.reshape(quant_shape_from_byte_shape(data.shape, qtype))
     elif (q := _type_traits.get(qtype)) is not None:
         return q.dequantize(data)
     else:
