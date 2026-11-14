@@ -635,15 +635,15 @@ static __global__ void f8_moe_convert(const char * src, f8_activation<G> * dst, 
     }
 }
 
-static __global__ void f8_moe_sum(int used, int m, int64_t n, const nv_bfloat16 * __restrict__ x, const float * __restrict__ w,
+static __global__ void f8_moe_sum(int used, int m, int n, const nv_bfloat16 * __restrict__ x, const float * __restrict__ w,
         const float * residual, float * dst) {
-    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
     if (i >= n) return;
-    const int64_t col = i/m;
+    const int col = i/m;
     x += col*used*m + i%m;
     w += col*used;
     float sum = 0;
-    for (int j = 0; j < used; ++j) sum += __bfloat162float(x[int64_t(j)*m]) * w[j];
+    for (int j = 0; j < used; ++j) sum += __bfloat162float(x[j*m]) * w[j];
     dst[i] = residual ? sum + residual[i] : sum;
 }
 

@@ -1777,9 +1777,6 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     const int64_t i1_diff = i1_high - i1_low;
 
     const char * x = src_ptr + i1_low*nb1 + i2*nb2 + i3*nb3;
-    if (type == GGML_TYPE_F8_E4M3_KS && nb0 == ts) {
-        return cudaMemcpy2DAsync(dst_ptr, rs, x, nb1, rs, i1_diff, cudaMemcpyDeviceToDevice, stream);
-    }
     if (nb0 == ts && nb1 == rs) {
         return cudaMemcpyAsync(dst_ptr, x, i1_diff*nb1, cudaMemcpyDeviceToDevice, stream);
     } else if (nb0 == ts) {
@@ -2789,7 +2786,7 @@ static bool launch_f8_w8a8(const ggml_tensor * weight, int n, int rows, int cols
         const char * x, const uint8_t * y, float * z, const float * scales, cudaStream_t stream, const float * other = nullptr) {
 #ifdef F8_TMA_AVAILABLE
     if (weight->type == GGML_TYPE_F8_E4M3_B128 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= 1200 && f8_tma_encoder() &&
-        n%128 == 0 && n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && rows%128 == 0 && ldc == rows &&
+        n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && rows%128 == 0 && ldc == rows &&
         (launch_f8_tma_dense<8>(n, rows, cols, x, y, scales, z, stream, other) ||
          launch_f8_tma_dense<6>(n, rows, cols, x, y, scales, z, stream, other))) return true;
 #endif
@@ -2899,8 +2896,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                 !ggml_is_contiguous(node->src[0]) || !ggml_is_contiguous(node) ||
                 node->src[0]->ne[2]*node->src[0]->ne[3] != 1) return false;
         for (auto t : {(const ggml_tensor *)node->src[0], (const ggml_tensor *)node->src[1], node}) {
-            if (!ggml_backend_buffer_is_cuda(t->buffer) ||
-                    ((ggml_backend_cuda_buffer_context *)t->buffer->context)->device != ctx.device) return false;
+            if (!ggml_backend_buffer_is_cuda(t->buffer)) return false;
         }
         return true;
     };
@@ -2955,8 +2951,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         if (other->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || !ggml_are_same_shape(mm, other) || !ggml_are_same_shape(mm, add) ||
                 !ggml_is_contiguous(other) || !ggml_is_contiguous(add) || uintptr_t(other->data)%16 != 0 || uintptr_t(add->data)%16 != 0) return -1;
         for (auto t : {other, add}) {
-            if (!ggml_backend_buffer_is_cuda(t->buffer) ||
-                    ((ggml_backend_cuda_buffer_context *)t->buffer->context)->device != ctx.device) return -1;
+            if (!ggml_backend_buffer_is_cuda(t->buffer)) return -1;
         }
         return f8_readers(cgraph, j + 1, mm) == 1 ? ia : -1;
     };
@@ -3002,7 +2997,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
 #endif
 #ifdef F8_TMA_AVAILABLE
     if (!use_lt && cgraph && dst->src[0]->type == GGML_TYPE_F8_E4M3_B128 && cc >= 1200 && f8_tma_encoder() &&
-        n%128 == 0 && n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0) {
+        n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0) {
         auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
         const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
         if (id < cgraph->n_nodes) {
@@ -3124,8 +3119,7 @@ static int ggml_cuda_f8_norm_chain(ggml_backend_cuda_context & ctx, ggml_tensor 
     if (!w || norm->op_params[1] > 1 || x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(x) || x->ne[0] < 1024 || x->ne[0] > 16384 || x->ne[0]%32 != 0 || x->ne[2]*x->ne[3] != 1) return -1;
     for (auto t : {x, w}) {
-        if (!ggml_backend_buffer_is_cuda(t->buffer) ||
-                ((ggml_backend_cuda_buffer_context *)t->buffer->context)->device != ctx.device) return -1;
+        if (!ggml_backend_buffer_is_cuda(t->buffer)) return -1;
     }
     int j = i;
     do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j]));
@@ -3144,8 +3138,7 @@ static int ggml_cuda_mul_mat_f8_exact(ggml_backend_cuda_context & ctx, const ggm
                 (ggml_get_input_scale(w) == -1.0f && f8_mma_available(cc)) ||
                 !ggml_is_contiguous(w) || !ggml_is_contiguous(node) || w->ne[2]*w->ne[3] != 1) return false;
         for (auto t : {w, src1, node}) {
-            if (!ggml_backend_buffer_is_cuda(t->buffer) ||
-                    ((ggml_backend_cuda_buffer_context *)t->buffer->context)->device != ctx.device) return false;
+            if (!ggml_backend_buffer_is_cuda(t->buffer)) return false;
         }
         return true;
     };
@@ -3430,8 +3423,7 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
     if (!ggml_is_contiguous(dst) || src->nb[0] != sizeof(float)) return false;
     for (auto tensor : {weight, gate, src, ids, (const ggml_tensor *)dst, bias_up, bias_gate}) {
         if (!tensor) continue;
-        if (!ggml_backend_buffer_is_cuda(tensor->buffer) ||
-            ((ggml_backend_cuda_buffer_context *)tensor->buffer->context)->device != ctx.device) return false;
+        if (!ggml_backend_buffer_is_cuda(tensor->buffer)) return false;
     }
     const bool blocked = weight->type == GGML_TYPE_F8_E4M3_B128;
     const int cols = ids->ne[0]*ids->ne[1], experts = weight->ne[2];
@@ -3452,7 +3444,7 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
     if constexpr (G != 0) {
         const int n = src->ne[0], m = dst->ne[0];
         if (next && cc >= 1200 && f8_tma_encoder() && n%128 == 0 && (n/128)%4 == 0 && n/128 <= 256 && m%128 == 0 &&
-            m/128 <= 252 && next->ne[0]%128 == 0 && uintptr_t(activations.get())%16 == 0 &&
+            m/128 <= 252 && next->ne[0]%128 == 0 &&
             size_t(blocked ? std::max(f8_tma_shared<4, true, true>(n/128), f8_tma_shared<8, false, true>((m/128+3)/4*4)) :
                 std::max(f8_tma_shared<6, true>(n/128), f8_tma_shared<8, false>((m/128+3)/4*4))) <= ggml_cuda_info().devices[ctx.device].smpbo) {
             tma = true;
@@ -3578,10 +3570,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     if ((src0->type == GGML_TYPE_F8_E4M3_KS || src0->type == GGML_TYPE_F8_E4M3_B128) && src1->ne[2] <= 8 &&
         ggml_backend_buffer_is_cuda(src0->buffer) && ggml_backend_buffer_is_cuda(src1->buffer) &&
-        ggml_backend_buffer_is_cuda(dst->buffer) &&
-        ((ggml_backend_cuda_buffer_context *)src0->buffer->context)->device == ctx.device &&
-        ((ggml_backend_cuda_buffer_context *)src1->buffer->context)->device == ctx.device &&
-        ((ggml_backend_cuda_buffer_context *)dst->buffer->context)->device == ctx.device) {
+        ggml_backend_buffer_is_cuda(dst->buffer)) {
         const bool aligned = ggml_cuda_f8_aligned(src0, src1);
         const dim3 grid(aligned ? (src0->ne[1] + 7)/8 : src0->ne[1], ids->ne[0], ids->ne[1]);
         auto launch = [&](auto kernel) {
@@ -3840,8 +3829,6 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
             (next->src[0]->type == GGML_TYPE_F8_E4M3_KS || next->src[0]->type == GGML_TYPE_F8_E4M3_B128) &&
             f8_w8a8(src0_1, cc) && f8_w8a8(src0_2, cc) && f8_w8a8(next->src[0], cc) &&
             ggml_backend_buffer_is_cuda(next->src[0]->buffer) && ggml_backend_buffer_is_cuda(next->buffer) &&
-            ((ggml_backend_cuda_buffer_context *)next->src[0]->buffer->context)->device == ctx.device &&
-            ((ggml_backend_cuda_buffer_context *)next->buffer->context)->device == ctx.device &&
             ggml_is_contiguous(next) && !(dst->flags & GGML_TENSOR_FLAG_OUTPUT) &&
             f8_readers(graph, i + 1, next->src[1]) == 1) {
             fused = next;
@@ -3849,8 +3836,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         ggml_tensor * sum = nullptr, * add = nullptr;
         const ggml_tensor * residual = nullptr;
         const auto local = [&](const ggml_tensor * t) {
-            return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_backend_buffer_is_cuda(t->buffer) &&
-                ((ggml_backend_cuda_buffer_context *)t->buffer->context)->device == ctx.device;
+            return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_backend_buffer_is_cuda(t->buffer);
         };
         const auto apart = [](const ggml_tensor * a, const ggml_tensor * b) {
             const char * pa = (const char *)a->data, * pb = (const char *)b->data;
@@ -3877,7 +3863,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
                     narrow ? &narrow : nullptr)) {
             CUDA_CHECK(cudaGetLastError());
             if (!narrow) return i + 1;
-            const int64_t n = ggml_nelements(sum);
+            const int n = ggml_nelements(sum);
             f8_moe_sum<<<(n + 255)/256, 256, 0, ctx.stream()>>>(fused->ne[1], sum->ne[0], n, narrow, (const float *)sum->src[1]->data,
                     add ? (const float *)residual->data : nullptr, (float *)(add ? add : sum)->data);
             CUDA_CHECK(cudaGetLastError());
@@ -3900,8 +3886,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         for (auto tensor : {src0_1, src0_2, src1, ids, (const ggml_tensor *)dst,
                            (const ggml_tensor *)dst->src[4], (const ggml_tensor *)dst->src[5]}) {
             if (!tensor) continue;
-            same_device = same_device && ggml_backend_buffer_is_cuda(tensor->buffer) &&
-                ((ggml_backend_cuda_buffer_context *)tensor->buffer->context)->device == ctx.device;
+            same_device = same_device && ggml_backend_buffer_is_cuda(tensor->buffer);
         }
         if (same_device) {
             const auto unary = (ggml_unary_op)dst->op_params[0];
