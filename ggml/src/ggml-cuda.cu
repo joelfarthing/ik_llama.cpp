@@ -5493,18 +5493,21 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             auto src0_1 = node->src[0];
             auto src0_2 = node->src[1];
             auto src1   = node->src[2];
+            const auto one_launch = [](const ggml_tensor * w) {
+                return ggml_is_quantized(w->type) || w->type == GGML_TYPE_F8_E4M3_KS || w->type == GGML_TYPE_F8_E4M3_B128;
+            };
             if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->type != GGML_TYPE_F32 ||
-                !ggml_is_quantized(src0_1->type) || (src0_2 && !ggml_is_quantized(src0_2->type))) {
+                !one_launch(src0_1) || (src0_2 && !one_launch(src0_2))) {
                 use_cuda_graph = false;
             } else {
                 if (i < cgraph->n_nodes-1) {
                     auto next = cgraph->nodes[i+1];
-                    if (next->op == GGML_OP_MUL_MAT_ID && ggml_is_quantized(next->src[0]->type)) {
+                    if (next->op == GGML_OP_MUL_MAT_ID && one_launch(next->src[0])) {
                         ++i;
                     }
                     else if (next->op == GGML_OP_HADAMARD && i < cgraph->n_nodes-2) {
                         next = cgraph->nodes[i+2];
-                        if (next->op == GGML_OP_MUL_MAT_ID && ggml_is_quantized(next->src[0]->type)) {
+                        if (next->op == GGML_OP_MUL_MAT_ID && one_launch(next->src[0])) {
                             i += 2;
                         }
                     }
