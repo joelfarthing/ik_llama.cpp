@@ -2707,14 +2707,15 @@ class ModelOptModel(Model):
                 merged_name, expert = self._expert_part(name)
                 if merged_name:
                     parts = expert_parts.setdefault(merged_name, {})
-                    parts[expert] = (raw, input_scale)
+                    parts[expert] = (lambda name=name, gen=gen, sgen=self.model_tensors[scale_name], scale2=scale2:
+                                     self._pack_nvfp4(name, gen(), sgen(), scale2), input_scale)
                     self._tag_prec_a4(name, self.map_tensor_name(merged_name))
                     if len(parts) != self.hparams["num_experts"]:
                         consumed.update((name, scale_name, base + ".weight_scale_2", base + ".input_scale"))
                         continue
-                    blocks = tuple(parts[i][0] for i in range(self.hparams["num_experts"]))
-                    chunks = [lambda block=block: gguf.LazyNumpyTensor.to_eager(block) for block in blocks]
-                    raw = gguf.LazyChunkedTensor(chunks, (len(blocks), *blocks[0].shape), np.uint8)
+                    chunks = [lambda pack=parts[i][0]: gguf.LazyNumpyTensor.to_eager(pack())
+                              for i in range(self.hparams["num_experts"])]
+                    raw = gguf.LazyChunkedTensor(chunks, (len(chunks), *raw.shape), np.uint8)
                     input_scale = torch.cat([parts[i][1].float().reshape(-1) for i in range(self.hparams["num_experts"])])
                     del expert_parts[merged_name]
                     new_name = self.map_tensor_name(merged_name)
