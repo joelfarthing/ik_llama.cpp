@@ -652,27 +652,16 @@ static void split_units_and_columns(int nunit, int nrow, int Ny, int max_units, 
 }
 
 static void mul_mat_f8_ks_repacked(MulMat& mm, int n, const void * vx, size_t bx,
-        const void * scales, size_t scale_stride, int typeB, const DataInfo& info, int nrc_x, int last_y) {
-    const int nrc_y = last_y - info.cur_y;
-    std::vector<float> values(size_t(nrc_x)*(nrc_y + 1));
-    auto row_scales = values.data() + size_t(nrc_x)*nrc_y;
-    for (int ix = 0; ix < nrc_x; ++ix) {
-        memcpy(row_scales + ix, (const char *)scales + ix*scale_stride, sizeof(float));
-    }
-    const char * cy = info.src1_row(0);
-    size_t by = info.by;
-    std::vector<char> rows;
-    if (info.row_mapping) {
-        by = ggml_row_size(ggml_type(typeB), n);
-        rows.resize(by*nrc_y);
-        for (int iy = 0; iy < nrc_y; ++iy) memcpy(rows.data() + iy*by, info.src1_row(iy), by);
-        cy = rows.data();
-    }
-    DataInfo local{values.data(), cy, size_t(nrc_x), by, 0, 1, nullptr, 0};
-    mm.mul_mat_NxM(n, vx, bx, local, nrc_x, nrc_y);
-    for (int iy = 0; iy < nrc_y; ++iy) {
-        float * dst = info.dst_row(iy);
-        for (int ix = 0; ix < nrc_x; ++ix) dst[ix] = values[size_t(iy)*nrc_x + ix]*row_scales[ix];
+        const void * scales, size_t scale_stride, DataInfo info, int nrc_x, int last_y) {
+    const DataInfo out = info;
+    mm.mul_mat_NxM(n, vx, bx, info, nrc_x, last_y);
+    for (int iy = 0; iy < last_y - out.cur_y; ++iy) {
+        float * dst = out.dst_row(iy);
+        for (int ix = 0; ix < nrc_x; ++ix) {
+            float scale;
+            memcpy(&scale, (const char *)scales + ix*scale_stride, sizeof(scale));
+            dst[ix] *= scale;
+        }
     }
 }
 
@@ -717,7 +706,7 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
                 DataInfo info{C + ix, (const char *)B, (size_t)stride_C, row_size_qy, iy, 1, nullptr, 0};
                 if (typeA == GGML_TYPE_F8_E4M3_KS) {
                     mul_mat_f8_ks_repacked(mm, ne00, f.data(), row_size_dq,
-                            (const char *)A + ix*strideA, strideA, typeB, info, nrc_x, iy + nrc_y);
+                            (const char *)A + ix*strideA, strideA, info, nrc_x, iy + nrc_y);
                 } else {
                     mm.mul_mat_NxM(ne00, f.data(), row_size_dq, info, nrc_x, iy + nrc_y);
                 }
@@ -796,7 +785,7 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
             DataInfo info{C + ix, (const char *)B, (size_t)stride_C, row_size_qy, first_y, 1, nullptr, 0};
             if (typeA == GGML_TYPE_F8_E4M3_KS) {
                 mul_mat_f8_ks_repacked(mm, ne00, f.data(), row_size_qx,
-                        (const char *)A + ix*strideA, strideA, typeB, info, nrc_x, last_y);
+                        (const char *)A + ix*strideA, strideA, info, nrc_x, last_y);
             } else {
                 mm.mul_mat_NxM(ne00, f.data(), row_size_qx, info, nrc_x, last_y);
             }
@@ -991,7 +980,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
             }
             if (typeA == GGML_TYPE_F8_E4M3_KS) {
                 mul_mat_f8_ks_repacked(mm, ne00, f.data(), row_size_qx,
-                        (const char *)A + (first_x + ix)*strideA, strideA, typeB, this_info, this_nrc_x, Ny);
+                        (const char *)A + (first_x + ix)*strideA, strideA, this_info, this_nrc_x, Ny);
             } else {
                 mm.mul_mat_NxM(ne00, f.data(), row_size_qx, this_info, this_nrc_x, Ny);
             }
