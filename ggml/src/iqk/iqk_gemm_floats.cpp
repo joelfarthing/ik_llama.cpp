@@ -1188,6 +1188,9 @@ struct F8 : F8Base {
                 _mm512_castsi512_ps(_mm512_set1_epi32(0x7fc00000)));
         return _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(v), sign));
     }
+    static inline void decode_bf16(const uint8_t * x, uint16_t * y) {
+        _mm256_storeu_si256((__m256i *)y, _mm512_cvtepi32_epi16(_mm512_srli_epi32(_mm512_castps_si512(decode(x)), 16)));
+    }
     static inline Data add(Data a, Data b) { return _mm512_add_ps(a, b); }
 #elif defined __AVX2__
     static inline Data zero() { return _mm256_setzero_ps(); }
@@ -1198,13 +1201,17 @@ struct F8 : F8Base {
         bits = _mm_or_si128(bits, _mm_and_si128(nan, _mm_set1_epi16(0x7c00)));
         return _mm256_mul_ps(_mm256_cvtph_ps(bits), _mm256_set1_ps(256));
     }
+    static inline void decode_bf16(const uint8_t * x, uint16_t * y) {
+        const auto v = _mm256_srli_epi32(_mm256_castps_si256(decode(x)), 16);
+        _mm_storeu_si128((__m128i *)y, _mm_packus_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1)));
+    }
     static inline Data add(Data a, Data b) { return _mm256_add_ps(a, b); }
 #else
     static inline Data zero() {
         const auto z = vdupq_n_f32(0);
         return {{z, z, z, z}};
     }
-    static inline Data decode(const uint8_t * x) {
+    static inline uint16x8x2_t decode_bf16(const uint8_t * x) {
         const uint8x16_t hi_fix = {0, 0, 0, 0, 0, 0, 0, 0x3c, 0x3c, 7, 7, 7, 0, 0, 0, 0};
         const uint8x16_t lo_fix = {0, 0, 0, 0, 0, 0, 0, 0x30, 0, 0x10, 0xa0, 0xf0, 0x40, 0x70, 0x20, 0x10};
         const auto q = vld1q_u8(x);
@@ -1212,12 +1219,19 @@ struct F8 : F8Base {
         const auto index = vandq_u8(vaddq_u8(q, vdupq_n_u8(8)), vdupq_n_u8(127));
         const auto hi = veorq_u8(vqtbl1q_u8(hi_base, vshrq_n_u8(q, 4)), vqtbl1q_u8(hi_fix, index));
         const auto lo = veorq_u8(vshlq_n_u8(q, 4), vqtbl1q_u8(lo_fix, index));
-        const auto b0 = vreinterpretq_u16_u8(vzip1q_u8(lo, hi));
-        const auto b1 = vreinterpretq_u16_u8(vzip2q_u8(lo, hi));
-        return {{vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b0), 16)),
-                 vreinterpretq_f32_u32(vshll_high_n_u16(b0, 16)),
-                 vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b1), 16)),
-                 vreinterpretq_f32_u32(vshll_high_n_u16(b1, 16))}};
+        return {{vreinterpretq_u16_u8(vzip1q_u8(lo, hi)), vreinterpretq_u16_u8(vzip2q_u8(lo, hi))}};
+    }
+    static inline void decode_bf16(const uint8_t * x, uint16_t * y) {
+        const auto b = decode_bf16(x);
+        vst1q_u16(y, b.val[0]);
+        vst1q_u16(y + 8, b.val[1]);
+    }
+    static inline Data decode(const uint8_t * x) {
+        const auto b = decode_bf16(x);
+        return {{vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b.val[0]), 16)),
+                 vreinterpretq_f32_u32(vshll_high_n_u16(b.val[0], 16)),
+                 vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b.val[1]), 16)),
+                 vreinterpretq_f32_u32(vshll_high_n_u16(b.val[1], 16))}};
     }
 #endif
 };
@@ -1341,6 +1355,39 @@ bool iqk_set_kernels_f8(int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>&
         IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_f8, true, kernels);
         return true;
     }
+    return false;
+}
+
+bool iqk_convert_f8(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x) {
+    if (typeA == GGML_TYPE_F8_E4M3_KS) {
+        const int meta = ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).row_meta_size;
+        for (int row = 0; row < nrc_x; ++row) {
+            const auto * x = (const uint8_t *)vx + row*bx + meta;
+            auto * y = (uint16_t *)vy + row*stride_y;
+            int i = 0;
+            for (; i + F8::k_step <= n; i += F8::k_step) F8::decode_bf16(x + i, y + i);
+            for (; i < n; ++i) {
+                const float value = F8::decode(x[i]);
+                uint32_t bits;
+                memcpy(&bits, &value, sizeof(bits));
+                y[i] = bits >> 16;
+            }
+        }
+        return true;
+    }
+#if defined __AVX2__ && !defined __AVX512F__
+    if (typeA == GGML_TYPE_F8_E4M3_B128) {
+        for (int row = 0; row < nrc_x; ++row) {
+            const auto * x = (const uint8_t *)vx + row*bx;
+            auto * y = (float *)vy + row*stride_y;
+            for (int ib = 0; ib < n/128; ++ib, x += 132, y += 128) {
+                const auto scale = _mm256_broadcast_ss((const float *)x);
+                for (int i = 0; i < 128; i += 8) _mm256_storeu_ps(y + i, _mm256_mul_ps(F8::decode(x + 4 + i), scale));
+            }
+        }
+        return true;
+    }
+#endif
     return false;
 }
 

@@ -509,23 +509,9 @@ static work_buffer_t & thread_local_work_buffer() {
 }
 
 bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x) {
-    if (typeA == GGML_TYPE_F8_E4M3_KS) {
-        for (int row = 0; row < nrc_x; ++row) {
-            ggml_fp8_e4m3_to_bf16_row((const ggml_fp8_e4m3_t *)((const char *)vx + row*bx + ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).row_meta_size),
-                    (ggml_bf16_t *)vy + row*stride_y, n);
-        }
-        return true;
+    if (typeA == GGML_TYPE_F8_E4M3_KS || typeA == GGML_TYPE_F8_E4M3_B128) {
+        return iqk_convert_f8(typeA, n, vx, bx, vy, stride_y, nrc_x);
     }
-
-#if defined __AVX2__ && !defined __AVX512F__
-    if (typeA == GGML_TYPE_F8_E4M3_B128) {
-        const auto to_float = ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_B128).to_float;
-        for (int row = 0; row < nrc_x; ++row) {
-            to_float((const char *)vx + row*bx, (float *)vy + row*stride_y, n);
-        }
-        return true;
-    }
-#endif
 
 
     switch (typeA) {
