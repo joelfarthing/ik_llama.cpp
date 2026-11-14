@@ -286,8 +286,9 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
     auto load = [&](int k0, int s) {
         if (k0 < n) {
             if constexpr (!tail) {
-                for (int i = tid; i < BM*(BK/16+1); i += NW*32) {
-                    const int r = i/(BK/16+1), j = i%(BK/16+1);
+                constexpr int chunks = BK/16 + blocked;
+                for (int i = tid; i < BM*chunks; i += NW*32) {
+                    const int r = i/chunks, j = i%chunks;
                     const char * row = x + size_t(first_row+r)*row_bytes;
                     const char * begin;
                     if constexpr (blocked) begin = row + size_t(k0/128)*132 + 4 + k0%128;
@@ -456,14 +457,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
 #pragma unroll
                         for (int l = 0; l < 4; ++l) {
                             const int row = warp_row+16*i+threadIdx.x/4+8*(l%2);
-                            int shift = 0;
-                            if constexpr (!tail) {
-                                const char * ptr = x + size_t(first_row+row)*row_bytes;
-                                if constexpr (blocked) ptr += size_t(k0/128)*132 + 4 + k0%128;
-                                else ptr += ggml_cuda_f8_row::row_meta_size + k0;
-                                shift = (uintptr_t(ptr)%16)/4;
-                            }
-                            at[i][l] = codes[(s*BM+row)*code_stride+shift+k/4+threadIdx.x%4+4*(l/2)];
+                            at[i][l] = codes[(s*BM+row)*code_stride+k/4+threadIdx.x%4+4*(l/2)];
                         }
                     }
 #pragma unroll
@@ -519,10 +513,8 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     for (int l = 0; l < at[i].ne; ++l) {
                         const int row = warp_row+16*i+at[i].get_i(l);
                         int shift = 0;
-                        if constexpr (!tail) {
-                            const char * ptr = x + size_t(first_row+row)*row_bytes;
-                            if constexpr (blocked) ptr += size_t(k0/128)*132 + 4 + k0%128;
-                            else ptr += ggml_cuda_f8_row::row_meta_size + k0;
+                        if constexpr (blocked && !tail) {
+                            const char * ptr = x + size_t(first_row+row)*row_bytes + size_t(k0/128)*132 + 4 + k0%128;
                             shift = (uintptr_t(ptr)%16)/2;
                         }
                         const uint16_t v = ((const uint16_t *)(codes + (s*BM+row)*code_stride))[shift+k+at[i].get_j(l)];
