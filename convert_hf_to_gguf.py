@@ -2697,10 +2697,8 @@ class ModelOptModel(Model):
                 scale2 = self.model_tensors.get(base + ".weight_scale_2", lambda: torch.tensor(1.0))()
                 input_scale = self.model_tensors.get(base + ".input_scale", lambda: torch.tensor(1.0))()
                 raw = self._pack_nvfp4(name, weight, scale, scale2)
-                m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
-                if m:
-                    expert = int(m[1])
-                    merged_name = name[:m.start()] + f".experts.{m[2]}.weight"
+                merged_name, expert = self._expert_part(name)
+                if merged_name:
                     parts = expert_parts.setdefault(merged_name, {})
                     parts[expert] = (raw, input_scale)
                     self._tag_prec_a4(name, self.map_tensor_name(merged_name))
@@ -2736,12 +2734,16 @@ class ModelOptModel(Model):
         if self._modelopt_experts:
             raise ValueError(f"Incomplete expert groups: {list(self._modelopt_experts)}")
 
-    def modify_tensors(self, data_torch, name, bid):
+    @staticmethod
+    def _expert_part(name):
         m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
-        if m:
-            merged_name = name[:m.start()] + f".experts.{m[2]}.weight"
+        return (name[:m.start()] + f".experts.{m[2]}.weight", int(m[1])) if m else (None, None)
+
+    def modify_tensors(self, data_torch, name, bid):
+        merged_name, expert = self._expert_part(name)
+        if merged_name:
             parts = self._modelopt_experts.setdefault(merged_name, {})
-            parts[int(m[1])] = data_torch
+            parts[expert] = data_torch
             n_experts = self.hparams["num_experts"]
             if len(parts) == n_experts:
                 yield self.map_tensor_name(merged_name), FP8Tensor.stack([parts[i] for i in range(n_experts)])
