@@ -2785,7 +2785,7 @@ static bool launch_f8_tma_dense(int n, int rows, int cols, const char * x, const
 static bool launch_f8_w8a8(const ggml_tensor * weight, int n, int rows, int cols, int ldc,
         const char * x, const uint8_t * y, float * z, const float * scales, cudaStream_t stream, const float * other = nullptr) {
 #ifdef F8_TMA_AVAILABLE
-    if (weight->type == GGML_TYPE_F8_E4M3_B128 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= 1200 && f8_tma_encoder() &&
+    if (weight->type == GGML_TYPE_F8_E4M3_B128 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= 1200 &&
         n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && rows%128 == 0 && ldc == rows &&
         (launch_f8_tma_dense<8>(n, rows, cols, x, y, scales, z, stream, other) ||
          launch_f8_tma_dense<6>(n, rows, cols, x, y, scales, z, stream, other))) return true;
@@ -2996,7 +2996,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
     }
 #endif
 #ifdef F8_TMA_AVAILABLE
-    if (!use_lt && cgraph && dst->src[0]->type == GGML_TYPE_F8_E4M3_B128 && cc >= 1200 && f8_tma_encoder() &&
+    if (!use_lt && cgraph && dst->src[0]->type == GGML_TYPE_F8_E4M3_B128 && cc >= 1200 &&
         n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0) {
         auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
         const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
@@ -3443,7 +3443,7 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
     bool tma = false;
     if constexpr (G != 0) {
         const int n = src->ne[0], m = dst->ne[0];
-        if (next && cc >= 1200 && f8_tma_encoder() && n%128 == 0 && (n/128)%4 == 0 && n/128 <= 256 && m%128 == 0 &&
+        if (next && cc >= 1200 && n%128 == 0 && (n/128)%4 == 0 && n/128 <= 256 && m%128 == 0 &&
             m/128 <= 252 && next->ne[0]%128 == 0 &&
             size_t(blocked ? std::max(f8_tma_shared<4, true, true>(n/128), f8_tma_shared<8, false, true>((m/128+3)/4*4)) :
                 std::max(f8_tma_shared<6, true>(n/128), f8_tma_shared<8, false>((m/128+3)/4*4))) <= ggml_cuda_info().devices[ctx.device].smpbo) {

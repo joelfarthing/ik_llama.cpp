@@ -645,27 +645,15 @@ static __global__ void f8_moe_sum(int used, int m, int n, const nv_bfloat16 * __
     dst[i] = residual ? sum + residual[i] : sum;
 }
 
-#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12000 && !defined(_WIN32)
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12000 && !defined(_WIN32)
 #define F8_TMA_AVAILABLE
 #include <cuda.h>
-#include <dlfcn.h>
-
-using f8_tma_encode_t = CUresult (*)(CUtensorMap *, CUtensorMapDataType, cuuint32_t, void *, const cuuint64_t *, const cuuint64_t *,
-        const cuuint32_t *, const cuuint32_t *, CUtensorMapInterleave, CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
-
-static f8_tma_encode_t f8_tma_encoder() {
-    static const f8_tma_encode_t encoder = []() -> f8_tma_encode_t {
-        void * lib = dlopen("libcuda.so.1", RTLD_NOW);
-        return lib ? (f8_tma_encode_t)dlsym(lib, "cuTensorMapEncodeTiled") : nullptr;
-    }();
-    return encoder;
-}
 
 static bool f8_tma_map(CUtensorMap & map, CUtensorMapDataType type, const void * data, uint64_t d0, uint64_t d1, uint64_t stride,
         uint32_t b0, uint32_t b1) {
     const cuuint64_t dim[2] = {d0, d1}, strides[1] = {stride};
     const cuuint32_t box[2] = {b0, b1}, step[2] = {1, 1};
-    return f8_tma_encoder()(&map, type, 2, const_cast<void *>(data), dim, strides, box, step, CU_TENSOR_MAP_INTERLEAVE_NONE,
+    return cuTensorMapEncodeTiled(&map, type, 2, const_cast<void *>(data), dim, strides, box, step, CU_TENSOR_MAP_INTERLEAVE_NONE,
             CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
