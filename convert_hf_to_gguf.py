@@ -2632,7 +2632,7 @@ class ModelOptModel(Model):
         if self.fp8_dequant:
             chunks = [lambda gen=self.model_tensors[name]: (LazyTorchTensor.to_eager(gen()).float() * scale.float()).numpy()
                       for name in shards]
-            qtype = gguf.GGMLQuantizationType[self.ftype.name.removeprefix("MOSTLY_").removeprefix("ALL_")]
+            qtype = gguf.GGMLQuantizationType[self.ftype.name.partition("_")[2]]
             data = gguf.LazyChunkedTensor(chunks, shape, np.float32).quantize(qtype)
         else:
             def pack(gen):

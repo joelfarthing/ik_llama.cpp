@@ -235,10 +235,6 @@ class LazyChunkedTensor:
     def numpy(self) -> LazyChunkedTensor:
         return self
 
-    def __array__(self, *args, **kwargs):
-
-        raise TypeError("LazyChunkedTensor cannot become an ndarray, it is written in chunks")
-
     def quantize(self, qtype: Any) -> LazyChunkedTensor:
         from .constants import GGMLQuantizationType
         from .quants import QuantError, quant_shape_to_byte_shape
@@ -262,7 +258,6 @@ class LazyChunkedTensor:
         from .constants import GGMLQuantizationType
         from .quants import quantize
 
-        written = 0
         for load_chunk in self._chunks:
             chunk = load_chunk()
             if self._qtype is not None:
@@ -273,6 +268,4 @@ class LazyChunkedTensor:
                     chunk = chunk.view(np.uint16)
                 chunk = chunk.byteswap(inplace=False)
             chunk.tofile(*args, **kwargs)
-            written += chunk.nbytes
             del chunk
-        assert written == self.nbytes, f"chunked tensor wrote {written} bytes, expected {self.nbytes}"

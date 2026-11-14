@@ -321,7 +321,6 @@ class MODEL_ARCH(IntEnum):
 
 class MODEL_TENSOR(IntEnum):
     ATTN_QKV_GATE = auto()
-    CLS_OUT = auto()
     HC_ATTN_DOWN = auto()
     HC_ATTN_DOWN_INJECT = auto()
     HC_ATTN_INJECT = auto()
@@ -622,7 +621,6 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_QKV_GATE: 'blk.{bid}.attn_qkv_gate',
-    MODEL_TENSOR.CLS_OUT: 'cls.output',
     MODEL_TENSOR.HC_ATTN_DOWN: 'blk.{bid}.hc_attn_down',
     MODEL_TENSOR.HC_ATTN_DOWN_INJECT: 'blk.{bid}.hc_attn_down_inject',
     MODEL_TENSOR.HC_ATTN_INJECT: 'blk.{bid}.hc_attn_inject',
@@ -906,7 +904,6 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,
-        MODEL_TENSOR.CLS_OUT,
         MODEL_TENSOR.ATTN_NORM,
         MODEL_TENSOR.ATTN_Q,
         MODEL_TENSOR.ATTN_Q_NORM,
