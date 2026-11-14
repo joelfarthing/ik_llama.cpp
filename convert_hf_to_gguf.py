@@ -65,22 +65,11 @@ class FP8Tensor:
     def swapaxes(self, axis0, axis1):
         return FP8Tensor(self.data.swapaxes(axis0, axis1), self.qtype)
 
-    def dequantize(self):
-        data = self.data
-        if self.qtype == gguf.GGMLQuantizationType.F8_E4M3_B128:
-            data = data.reshape(*data.shape[:-1], -1, 132)
-        scale = data[..., :4].contiguous().view(torch.float32)
-        offset = gguf.GGML_ROW_META_SIZES.get(self.qtype, 4)
-        return (data[..., offset:].contiguous().view(torch.float8_e4m3fn).float() * scale).reshape(self.shape)
-
     @classmethod
     def stack(cls, tensors):
-        if not any(isinstance(t, cls) for t in tensors):
+        if not isinstance(tensors[0], cls):
             return torch.stack(tensors, dim=0)
-        if all(isinstance(t, cls) and t.qtype == tensors[0].qtype for t in tensors):
-            return cls(torch.stack([t.data for t in tensors], dim=0), tensors[0].qtype)
-        logger.warning("FP8 expert stack has mixed layouts or dtypes; dequantizing the stack")
-        return torch.stack([t.dequantize() if isinstance(t, cls) else t for t in tensors], dim=0)
+        return cls(torch.stack([t.data for t in tensors], dim=0), tensors[0].qtype)
 
 
 class Model:
