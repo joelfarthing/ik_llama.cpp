@@ -2800,14 +2800,11 @@ static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const flo
 
 #ifdef F8_TMA_AVAILABLE
 template <int RN>
-static bool launch_f8_tma_dense(ggml_backend_cuda_context & ctx, int n, int rows, int cols, const char * x, const uint8_t * y,
+static bool launch_f8_tma_dense(int n, int rows, int cols, const char * x, const uint8_t * y,
         const float * scales, float * z, cudaStream_t stream, const float * other = nullptr) {
     if (f8_tma_shared<RN, false, true>(n/128) > (int)ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) return false;
-    ggml_cuda_pool_alloc<int32_t> route(ctx.pool(ggml_cuda_get_device()), cols + 4);
-    f8_dense_routing<<<(cols+255)/256, 256, 0, stream>>>(route.get(), route.get() + cols, route.get() + cols + 2, cols, 16*RN);
     const size_t stride = ggml_cuda_f8_block::row_size(n);
-    const f8_moe_routing routing{route.get(), route.get() + cols, route.get() + cols + 2, 1, stride, stride*rows, nullptr, 0,
-            nullptr, nullptr, nullptr, false};
+    const f8_moe_routing routing{nullptr, nullptr, nullptr, 1, stride, stride*rows, nullptr, 0, nullptr, nullptr, nullptr, false};
     return other ?
         launch_f8_tma<RN, false, true, true>(n, rows, cols, x, nullptr, y, scales, n/128, z, nullptr, nullptr, nullptr, 0, routing,
             nullptr, stream, 8, other) :
@@ -2816,15 +2813,13 @@ static bool launch_f8_tma_dense(ggml_backend_cuda_context & ctx, int n, int rows
 }
 #endif
 
-static bool launch_f8_w8a8(ggml_backend_cuda_context & ctx, const ggml_tensor * weight, int n, int rows, int cols, int ldc,
+static bool launch_f8_w8a8(const ggml_tensor * weight, int n, int rows, int cols, int ldc,
         const char * x, const uint8_t * y, float * z, const float * scales, cudaStream_t stream, const float * other = nullptr) {
 #ifdef F8_TMA_AVAILABLE
     if (weight->type == GGML_TYPE_F8_E4M3_B128 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= 1200 && f8_tma_encoder() &&
         n%128 == 0 && n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && rows%128 == 0 && ldc == rows &&
-        (launch_f8_tma_dense<8>(ctx, n, rows, cols, x, y, scales, z, stream, other) ||
-         launch_f8_tma_dense<6>(ctx, n, rows, cols, x, y, scales, z, stream, other))) return true;
-#else
-    GGML_UNUSED(ctx);
+        (launch_f8_tma_dense<8>(n, rows, cols, x, y, scales, z, stream, other) ||
+         launch_f8_tma_dense<6>(n, rows, cols, x, y, scales, z, stream, other))) return true;
 #endif
     if (other) return false;
     if (weight->type == GGML_TYPE_F8_E4M3_KS) {
@@ -2854,7 +2849,7 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
             ggml_cuda_pool_alloc<uint8_t> activations(ctx.pool(ggml_cuda_get_device()), size_t(src1_ncols)*n);
             ggml_cuda_pool_alloc<float> scales(ctx.pool(ggml_cuda_get_device()), size_t(src1_ncols)*((n+G-1)/G));
             f8_quantize<G><<<dim3((n+4*G-1)/(4*G),src1_ncols),128,0,stream>>>(src1_ddf_i, activations.get(), scales.get(), n, src1->ne[0]);
-            launch_f8_w8a8(ctx, src0, n, nrows, src1_ncols, ldc, src0_dd_i, activations.get(), dst_dd_i, scales.get(), stream);
+            launch_f8_w8a8(src0, n, nrows, src1_ncols, ldc, src0_dd_i, activations.get(), dst_dd_i, scales.get(), stream);
             return;
         }
     }
@@ -3053,20 +3048,17 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                 f8_tma_shared<6, false, true>(m/128) <= limit) {
                 ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
                 ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*(m/128));
-                ggml_cuda_pool_alloc<int32_t> route(ctx.pool(), cols + 4);
-                f8_dense_routing<<<(cols+255)/256, 256, 0, stream>>>(route.get(), route.get() + cols, route.get() + cols + 2, cols, 64);
                 const size_t stride = ggml_cuda_f8_block::row_size(n);
-                const f8_moe_routing routing{route.get(), route.get() + cols, route.get() + cols + 2, 1, stride, stride*m, nullptr, 0,
-                        nullptr, nullptr, nullptr, false};
+                const f8_moe_routing routing{nullptr, nullptr, nullptr, 1, stride, stride*m, nullptr, 0, nullptr, nullptr, nullptr, false};
                 const int ia = add_after(id);
                 const float * other = ia >= 0 ? (const float *)other_of(cgraph->nodes[ia], down)->data : nullptr;
                 float * out = (float *)(ia >= 0 ? cgraph->nodes[ia] : down)->data;
                 if (launch_f8_tma<4, true, true>(n, m, cols, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
                             activations.get(), scales.get(), n/128, nullptr, nullptr, codes.get(), out_scales.get(), m/128, routing,
                             nullptr, stream, 8) &&
-                    (launch_f8_tma_dense<8>(ctx, m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
+                    (launch_f8_tma_dense<8>(m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
                             out, stream, other) ||
-                     launch_f8_tma_dense<6>(ctx, m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
+                     launch_f8_tma_dense<6>(m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
                             out, stream, other))) {
                     CUDA_CHECK(cudaGetLastError());
                     return ia >= 0 ? ia : id;
@@ -3089,15 +3081,15 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                 compatible(down, unary) && down->src[0]->type == GGML_TYPE_F8_E4M3_B128 &&
                 f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
                 f8_readers(cgraph, iu + 1, unary) == 1) {
-                launch_f8_w8a8(ctx, up->src[0], n, m, cols, m, (const char *)up->src[0]->data, activations.get(),
+                launch_f8_w8a8(up->src[0], n, m, cols, m, (const char *)up->src[0]->data, activations.get(),
                         (float *)up->data, scales.get(), stream);
-                launch_f8_w8a8(ctx, gate->src[0], n, m, cols, m, (const char *)gate->src[0]->data, activations.get(),
+                launch_f8_w8a8(gate->src[0], n, m, cols, m, (const char *)gate->src[0]->data, activations.get(),
                         (float *)gate->data, scales.get(), stream);
                 ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
                 ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*((m+G-1)/G));
                 f8_silu_quantize<G><<<dim3((m+4*G-1)/(4*G), cols), 128, 0, stream>>>((const float *)gate->data, (const float *)up->data,
                         codes.get(), out_scales.get(), m, m);
-                launch_f8_w8a8(ctx, down->src[0], m, down->ne[0], cols, down->ne[0], (const char *)down->src[0]->data,
+                launch_f8_w8a8(down->src[0], m, down->ne[0], cols, down->ne[0], (const char *)down->src[0]->data,
                         codes.get(), (float *)down->data, out_scales.get(), stream);
                 CUDA_CHECK(cudaGetLastError());
                 return id;
@@ -3127,13 +3119,13 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
 #endif
         {
             const int ia = add_after(node_n);
-            if (ia >= 0 && launch_f8_w8a8(ctx, weight, n, weight->ne[1], cols, dst->ne[0],
+            if (ia >= 0 && launch_f8_w8a8(weight, n, weight->ne[1], cols, dst->ne[0],
                         (const char *)weight->data, activations.get(), (float *)cgraph->nodes[ia]->data, scales.get(), stream,
                         (const float *)other_of(cgraph->nodes[ia], dst)->data)) {
                 CUDA_CHECK(cudaGetLastError());
                 return ia;
             }
-            launch_f8_w8a8(ctx, weight, n, weight->ne[1], cols, dst->ne[0],
+            launch_f8_w8a8(weight, n, weight->ne[1], cols, dst->ne[0],
                     (const char *)weight->data, activations.get(), (float *)dst->data, scales.get(), stream);
             done = true;
         }

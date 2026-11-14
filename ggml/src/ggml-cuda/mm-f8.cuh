@@ -690,23 +690,12 @@ static __global__ void f8_moe_tiles_all(const int32_t * bounds, int32_t * tiles_
     tiles_b[experts] = b;
 }
 
-static __global__ void f8_dense_routing(int32_t * rows, int32_t * bounds, int32_t * tiles, int cols, int width) {
-    const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < cols) rows[i] = i;
-    if (i == 0) {
-        bounds[0] = 0;
-        bounds[1] = cols;
-        tiles[0] = 0;
-        tiles[1] = (cols+width-1)/width;
-    }
-}
-
 template <int RN, bool UG, bool BLK = false, bool ADD = false>
 static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, int expert_rows,
         const char * __restrict__ x, const char * __restrict__ xg, float * __restrict__ z, nv_bfloat16 * __restrict__ zb,
         uint8_t * __restrict__ codes, float * __restrict__ out_scales, int out_stride, f8_moe_routing routing, const char * bias_gate,
         const __grid_constant__ CUtensorMap ma, const __grid_constant__ CUtensorMap mg, const __grid_constant__ CUtensorMap mb,
-        const __grid_constant__ CUtensorMap ms, int SG, int CG, const float * other) {
+        const __grid_constant__ CUtensorMap ms, int SG, int CG, int cols, const float * other) {
 #if __CUDA_ARCH__ >= 900
     constexpr int RM = 2, WMB = 4, WNB = 2, BM = WMB*16*RM, BN = WNB*8*RN, BK = 128, NA = UG ? 2 : 1, NW = WMB*WNB, PA = BLK ? 144 : BK;
     const int J = BLK ? (routing.row_stride%16 == 0 ? 1 : routing.row_stride%8 == 0 ? 2 : 4) : 1, JR = BM/J;
@@ -721,15 +710,18 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
     } else {
         GGML_UNUSED(CG);
     }
-    if (by >= routing.tiles[routing.experts]) return;
-    int expert = 0, hi = routing.experts;
-    while (expert + 1 < hi) {
-        const int mid = (expert + hi)/2;
-        if (routing.tiles[mid] <= by) expert = mid;
-        else hi = mid;
-    }
-    const int first_col = routing.bounds[expert] + (by-routing.tiles[expert])*BN;
-    const int ncols = routing.bounds[expert+1]-first_col;
+    int expert = 0, first_col = by*BN, ncols = cols-first_col;
+    if (routing.tiles) {
+        if (by >= routing.tiles[routing.experts]) return;
+        int hi = routing.experts;
+        while (expert + 1 < hi) {
+            const int mid = (expert + hi)/2;
+            if (routing.tiles[mid] <= by) expert = mid;
+            else hi = mid;
+        }
+        first_col = routing.bounds[expert] + (by-routing.tiles[expert])*BN;
+        ncols = routing.bounds[expert+1]-first_col;
+    } else if (ncols <= 0) return;
     extern __shared__ __align__(128) uint8_t smem[];
     uint8_t * sA = smem, * sB = smem + 2*NA*BM*PA;
     float * sS = (float *)(sB + 2*BN*BK);
@@ -786,7 +778,7 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
 #pragma unroll
                     for (int l = 0; l < 2; ++l) {
                         const int c = wn*8*RN + 8*j + 2*t4 + l;
-                        res[i][j][2*h+l] = c < ncols ? other[size_t(routing.rows[first_col+c])*M + row0 + rp] : 0.0f;
+                        res[i][j][2*h+l] = c < ncols ? other[size_t(routing.rows ? routing.rows[first_col+c] : first_col+c)*M + row0 + rp] : 0.0f;
                     }
                 }
             }
@@ -913,7 +905,7 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
                             if (bias_gate) gate += bias_g;
                             hs[c*BM + rp] = gate * value / (1.0f + expf(-gate));
                         } else {
-                            const size_t o = size_t(routing.rows[first_col+c])*M + r;
+                            const size_t o = size_t(routing.rows ? routing.rows[first_col+c] : first_col+c)*M + r;
                             if constexpr (ADD) value = __fadd_rn(value, res[i][j][2*h+l]);
                             if (zb) zb[o] = __float2bfloat16(value);
                             else z[o] = value;
@@ -933,7 +925,7 @@ static __global__ void __launch_bounds__(256, 1) mul_mat_f8_tma(int K, int M, in
     }
 #else
     GGML_UNUSED(K); GGML_UNUSED(M); GGML_UNUSED(expert_rows); GGML_UNUSED(x); GGML_UNUSED(xg); GGML_UNUSED(z); GGML_UNUSED(zb); GGML_UNUSED(codes);
-    GGML_UNUSED(out_scales); GGML_UNUSED(out_stride); GGML_UNUSED(routing); GGML_UNUSED(bias_gate); GGML_UNUSED(SG); GGML_UNUSED(CG); GGML_UNUSED(other);
+    GGML_UNUSED(out_scales); GGML_UNUSED(out_stride); GGML_UNUSED(routing); GGML_UNUSED(bias_gate); GGML_UNUSED(SG); GGML_UNUSED(CG); GGML_UNUSED(cols); GGML_UNUSED(other);
     NO_DEVICE_CODE;
 #endif
 }
@@ -965,7 +957,7 @@ static bool launch_f8_tma(int K, int M, int cols, const char * x, const char * x
         limit[id] = bytes;
     }
     mul_mat_f8_tma<RN, UG, BLK, ADD><<<cg > 0 ? dim3(cg, (M/128)*(((cols+BN-1)/BN+cg-1)/cg)) : dim3(M/128, (cols+BN-1)/BN+routing.experts), 256, bytes, stream>>>(K, M, expert_rows, x, xg, z, zb,
-            codes, out_scales, out_stride, routing, bias_gate, ma, mg, mb, ms, SG, cg, other);
+            codes, out_scales, out_stride, routing, bias_gate, ma, mg, mb, ms, SG, cg, cols, other);
     return true;
 }
 #endif
