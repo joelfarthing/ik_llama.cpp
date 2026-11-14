@@ -6608,6 +6608,12 @@ bool create_tensors_helper::create_tensors() {
             throw std::runtime_error("unknown architecture");
     }
 
+    for (int i = 0; i < (int)model.hparams.n_layer; ++i) {
+        const int unused = llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_NOT_REQUIRED;
+        ml.create_tensor(nullptr, tn(LLM_TENSOR_ATTN_K, "k_scale", i), {1}, unused);
+        ml.create_tensor(nullptr, tn(LLM_TENSOR_ATTN_V, "v_scale", i), {1}, unused);
+    }
+
     // Tensor overrides to the CPU normally drop mmap so those weights land in pinned host memory.
     // On a box whose CPU-side weights exceed RAM that is impossible, and GGML_CUDA_NO_PINNED, the
     // documented escape, also turns off every pinned staging buffer. GGML_CUDA_NO_PINNED_WEIGHTS

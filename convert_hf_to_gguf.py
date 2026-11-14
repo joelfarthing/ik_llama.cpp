@@ -294,7 +294,7 @@ class Model:
         scales: dict[str, Tensor] = {}
         for name, data in self.get_tensors():
             if name.endswith((".input_scale", ".input_scale_inv", ".activation_scale", ".activation_scale_inv",
-                              ".output_scale", ".k_scale", ".v_scale", ".input_zero_point")):
+                              ".output_scale", ".input_zero_point")):
                 continue
             if name.endswith((".weight_scale", ".weight_scale_inv")):
                 weight_name = name.rsplit(".", 1)[0] + ".weight"
@@ -405,6 +405,10 @@ class Model:
         for name, data_torch in chain(self.generate_extra_tensors(), self.get_fp8_tensors()):
             # we don't need these
             if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")):
+                continue
+            if name.endswith((".k_scale", ".v_scale")):
+                if (new_name := self.tensor_map.get_name(name, (".k_scale", ".v_scale"))) is not None:
+                    self.gguf_writer.add_tensor(new_name, LazyTorchTensor.to_eager(data_torch).float().reshape(1).numpy())
                 continue
 
             old_dtype = data_torch.dtype
