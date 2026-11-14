@@ -2728,7 +2728,7 @@ class ModelOptModel(Model):
             consumed.update(ple_shards)
             consumed.add(scale_name)
         for name in list(self.model_tensors):
-            if name in consumed or name.endswith((".input_scale", ".k_scale", ".v_scale")):
+            if name in consumed or name.endswith(".input_scale"):
                 del self.model_tensors[name]
         super().prepare_tensors()
         if self._modelopt_experts:
