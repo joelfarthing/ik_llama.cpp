@@ -527,7 +527,7 @@ static constexpr int f8_pp_shared() {
 template <typename layout, int BN, int NW, int stages, int BK, int G = 0>
 static void launch_f8_pp(int n, int rows, int cols, int ldc, const char * x, const f8_activation<G> * y, float * z, cudaStream_t stream, const float * activation_scales = nullptr) {
     constexpr int bytes = f8_pp_shared<BN, stages, BK, G>();
-    const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0 || uintptr_t(y)%16 != 0;
+    const bool tail = n%BK != 0 || rows%128 != 0 || uintptr_t(x)%16 != 0;
     auto kernel = tail ? mul_mat_f8_pp<layout, BN, NW, stages, true, BK, false, G> : mul_mat_f8_pp<layout, BN, NW, stages, false, BK, false, G>;
     if (tail) {
         CUDA_SET_SHARED_MEMORY_LIMIT(kernel, bytes);

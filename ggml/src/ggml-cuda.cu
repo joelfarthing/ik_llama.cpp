@@ -3135,7 +3135,7 @@ static int ggml_cuda_mul_mat_f8_exact(ggml_backend_cuda_context & ctx, const ggm
         const ggml_tensor * w = node->src[0];
         if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 || node->op_params[0] != GGML_PREC_DEFAULT ||
                 (w->type != GGML_TYPE_F8_E4M3_KS && w->type != GGML_TYPE_F8_E4M3_B128) ||
-                (ggml_get_input_scale(w) == -1.0f && f8_mma_available(cc)) ||
+                f8_w8a8(w, cc) ||
                 !ggml_is_contiguous(w) || !ggml_is_contiguous(node) || w->ne[2]*w->ne[3] != 1) return false;
         for (auto t : {w, src1, node}) {
             if (!ggml_backend_buffer_is_cuda(t->buffer)) return false;
@@ -3170,7 +3170,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         const ggml_cgraph * cgraph, int node_n) {
 
     if (src0->type == GGML_TYPE_F8_E4M3_KS || src0->type == GGML_TYPE_F8_E4M3_B128) {
-        if (ggml_get_input_scale(src0) == -1.0f && f8_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
+        if (f8_w8a8(src0, ggml_cuda_info().devices[ctx.device].cc)) {
             const int last = ggml_cuda_mul_mat_f8_reuse(ctx, src1, dst, cgraph, node_n);
             if (last >= 0) return last;
             ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_f8_e4m3<true>, nullptr);
@@ -3550,7 +3550,7 @@ static bool ggml_cuda_mul_mat_f8_id(ggml_backend_cuda_context & ctx, const ggml_
         const ggml_tensor * src, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * gate = nullptr,
         const ggml_tensor * bias_up = nullptr, const ggml_tensor * bias_gate = nullptr, float * up = nullptr,
         ggml_tensor * next = nullptr, nv_bfloat16 ** narrow = nullptr) {
-    if (ggml_get_input_scale(weight) == -1.0f && f8_mma_available(ggml_cuda_info().devices[ctx.device].cc) &&
+    if (f8_w8a8(weight, ggml_cuda_info().devices[ctx.device].cc) &&
             (!gate || ggml_get_input_scale(gate) == -1.0f)) {
         return ggml_cuda_mul_mat_f8_id_impl<f8_activation_group>(ctx, weight, src, ids, dst, gate, bias_up, bias_gate, up, next, narrow);
     }
