@@ -989,6 +989,7 @@ struct ggml_backend_cuda_context {
 #if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
     std::unique_ptr<ggml_cuda_f8_lt_context> f8_lt;
 #endif
+    std::unordered_map<const ggml_tensor *, int> f8_readers;
 
     int   fusion = GGML_CUDA_FUSION;
     int   offload_batch_size = GGML_CUDA_MIN_BATCH_OFFLOAD;

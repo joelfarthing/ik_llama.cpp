@@ -2871,20 +2871,22 @@ static int f8_next(const ggml_cgraph * graph, int j) {
     return j;
 }
 
-static int f8_readers(const ggml_cgraph * graph, int first, const ggml_tensor * t) {
+static int f8_readers(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, const ggml_tensor * t) {
     if (t->view_src || (t->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_CROSS_SPLIT))) return -1;
-    int readers = 0;
-    for (int j = first; j < graph->n_nodes; ++j) {
-        const ggml_tensor * node = graph->nodes[j];
-        if (node->view_src == t) return -1;
-        for (int k = 0; k < GGML_MAX_SRC; ++k) {
-            if (node->src[k] && (node->src[k] == t || node->src[k]->view_src == t)) {
-                ++readers;
-                break;
+    auto & readers = ctx.f8_readers;
+    if (readers.empty()) {
+        for (int j = 0; j < graph->n_nodes; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (node->view_src) readers[node->view_src] = -1;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (!node->src[k]) continue;
+                int & n = readers[node->src[k]->view_src ? node->src[k]->view_src : node->src[k]];
+                if (n >= 0) ++n;
             }
         }
     }
-    return readers;
+    const auto found = readers.find(t);
+    return found == readers.end() ? 0 : found->second;
 }
 
 static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggml_tensor * src1,
@@ -2921,7 +2923,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
                 if (src && (src == x || src->view_src == x)) live = true;
             }
         }
-        if (!live || f8_readers(cgraph, node_n, norm) != chain) return -1;
+        if (!live || f8_readers(ctx, cgraph, norm) != chain) return -1;
     }
     ggml_cuda_pool_alloc<uint8_t> activations(ctx.pool(), size_t(cols)*n);
     ggml_cuda_pool_alloc<float> scales(ctx.pool(), size_t(cols)*(use_lt ? 1 : (n+G-1)/G));
@@ -2952,7 +2954,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         for (auto t : {other, add}) {
             if (!ggml_backend_buffer_is_cuda(t->buffer)) return -1;
         }
-        return f8_readers(cgraph, j + 1, mm) == 1 ? ia : -1;
+        return f8_readers(ctx, cgraph, mm) == 1 ? ia : -1;
     };
     auto other_of = [&](const ggml_tensor * add, const ggml_tensor * mm) { return add->src[0] == mm ? add->src[1] : add->src[0]; };
     ggml_tensor * second = nullptr, * unary = nullptr, * down = nullptr, * up = nullptr, * gate = nullptr;
@@ -2972,8 +2974,8 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
             unary->op == GGML_OP_FUSED_MUL_UNARY && unary->src[0] == gate && unary->src[1] == up &&
             (ggml_unary_op)unary->op_params[0] == GGML_UNARY_OP_SILU && *(const float *)(unary->op_params + 1) < 1e-6f &&
             compatible(down, unary) && supported(down) &&
-            f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
-            f8_readers(cgraph, iu + 1, unary) == 1;
+            f8_readers(ctx, cgraph, dst) == 1 && f8_readers(ctx, cgraph, second) == 1 &&
+            f8_readers(ctx, cgraph, unary) == 1;
     };
     auto b128 = [](const ggml_tensor * node) { return node->src[0]->type == GGML_TYPE_F8_E4M3_B128; };
 #ifdef GGML_CUDA_F8_LT
@@ -3802,7 +3804,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
             f8_w8a8(src0_1, cc) && f8_w8a8(src0_2, cc) && f8_w8a8(next->src[0], cc) &&
             ggml_backend_buffer_is_cuda(next->src[0]->buffer) && ggml_backend_buffer_is_cuda(next->buffer) &&
             ggml_is_contiguous(next) && !(dst->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-            f8_readers(graph, i + 1, next->src[1]) == 1) {
+            f8_readers(ctx, graph, next->src[1]) == 1) {
             fused = next;
         }
         ggml_tensor * sum = nullptr, * add = nullptr;
@@ -3817,13 +3819,13 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         if (fused && i + 2 < graph->n_nodes) {
             ggml_tensor * node = graph->nodes[i + 2];
             if (node->op == GGML_OP_MUL_MULTI_ADD && node->src[0] == fused && !node->src[2] && node->src[1]->ne[0] == 1 &&
-                local(node) && local(node->src[1]) && f8_readers(graph, i + 2, fused) == 1) {
+                local(node) && local(node->src[1]) && f8_readers(ctx, graph, fused) == 1) {
                 sum = node;
                 node = i + 3 < graph->n_nodes ? graph->nodes[i + 3] : nullptr;
                 if (node && node->op == GGML_OP_ADD && (node->src[0] == sum) != (node->src[1] == sum)) {
                     residual = node->src[node->src[0] == sum ? 1 : 0];
                     if (ggml_are_same_shape(residual, sum) && local(node) && local(residual) && apart(node, sum->src[1]) &&
-                        f8_readers(graph, i + 3, sum) == 1) {
+                        f8_readers(ctx, graph, sum) == 1) {
                         add = node;
                     }
                 }
@@ -5641,6 +5643,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->f8_readers.clear();
 
 #ifdef USE_CUDA_GRAPH
     cuda_ctx->cur_graph = nullptr;
