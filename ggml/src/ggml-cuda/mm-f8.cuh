@@ -572,7 +572,9 @@ static __global__ void f8_moe_histogram(const char * ids, int32_t * counts, int3
     atomicAdd(counts + blockIdx.x*experts+id, 1);
 }
 
-static __global__ void f8_moe_prefix(int32_t * counts, int32_t * bounds, int experts, int chunks) {
+static __global__ void f8_moe_prefix(int32_t * counts, int32_t * bounds, int32_t * tiles, int experts, int chunks, int w0, int w1, int w2) {
+    extern __shared__ int32_t size[];
+    const int width[3] = {w0, w1, w2};
     for (int e = threadIdx.x; e < experts; e += blockDim.x) {
         int sum = 0;
         for (int c = 0; c < chunks; ++c) {
@@ -580,12 +582,18 @@ static __global__ void f8_moe_prefix(int32_t * counts, int32_t * bounds, int exp
             counts[c*experts+e] = sum;
             sum += count;
         }
-        bounds[e+1] = sum;
+        size[e] = sum;
+        for (int i = 0; i < 3 && width[i]; ++i) size[(i+1)*experts+e] = (sum+width[i]-1)/width[i];
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        bounds[0] = 0;
-        for (int e = 0; e < experts; ++e) bounds[e+1] += bounds[e];
+    for (int e = threadIdx.x; e <= experts; e += blockDim.x) {
+        int rows = 0, count[3] = {0, 0, 0};
+        for (int j = 0; j < e; ++j) {
+            rows += size[j];
+            for (int i = 0; i < 3 && width[i]; ++i) count[i] += size[(i+1)*experts+j];
+        }
+        bounds[e] = rows;
+        for (int i = 0; i < 3 && width[i]; ++i) tiles[i*(experts+1)+e] = count[i];
     }
 }
 
@@ -609,15 +617,6 @@ static __global__ void f8_moe_zero_invalid(const char * ids, const int32_t * bou
             if (up) up[size_t(col)*rows+row] = 0;
         }
     }
-}
-
-static __global__ void f8_moe_tiles(const int32_t * bounds, int32_t * tiles, int experts, int width) {
-    int count = 0;
-    for (int e = 0; e < experts; ++e) {
-        tiles[e] = count;
-        count += (bounds[e+1]-bounds[e]+width-1)/width;
-    }
-    tiles[experts] = count;
 }
 
 template <int G = 0>
@@ -675,19 +674,6 @@ static bool f8_tma_map(CUtensorMap & map, CUtensorMapDataType type, const void *
 template <int RN, bool UG, bool BLK = false>
 static constexpr int f8_tma_shared(int groups) {
     return std::max(2*((UG ? 2 : 1)*(BLK ? 144 : 128)+16*RN)*128 + 16*RN*groups*4 + 24, UG ? 16*RN*128*4 : 0);
-}
-
-static __global__ void f8_moe_tiles_all(const int32_t * bounds, int32_t * tiles_a, int32_t * tiles_b, int experts, int wa, int wb) {
-    int a = 0, b = 0;
-    for (int e = 0; e < experts; ++e) {
-        tiles_a[e] = a;
-        tiles_b[e] = b;
-        const int size = bounds[e+1]-bounds[e];
-        a += (size+wa-1)/wa;
-        b += (size+wb-1)/wb;
-    }
-    tiles_a[experts] = a;
-    tiles_b[experts] = b;
 }
 
 template <int RN, bool UG, bool BLK = false, bool ADD = false>

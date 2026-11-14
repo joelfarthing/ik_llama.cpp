@@ -3467,23 +3467,12 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
     auto rows = routing_data.get();
     auto bounds = rows + cols;
     auto tiles = bounds + experts + 1;
-    auto counts = tiles + experts + 1;
+    auto counts = tiles + 3*(experts + 1);
     auto ranks = counts + size_t(chunks)*experts;
-#ifdef F8_TMA_AVAILABLE
-    auto tiles_ug = ranks + cols;
-    auto tiles_dn = tiles_ug + experts + 1;
-#endif
-    f8_moe_histogram<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks,
-            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
-    f8_moe_prefix<<<1,256,0,stream>>>(counts, bounds, experts, chunks);
-    f8_moe_scatter<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks, bounds, rows,
-            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
-    f8_moe_tiles<<<1,1,0,stream>>>(bounds, tiles, experts, wide ? 64 : 32);
-    f8_moe_zero_invalid<<<std::min(cols, 128),256,0,stream>>>((const char *)ids->data, bounds,
-            (float *)(next ? next->data : dst->data), gate && !next ? up : nullptr, (next ? next : dst)->ne[0],
-            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     ggml_cuda_pool_alloc<f8_activation<G>> activations(ctx.pool(), size_t(cols)*src->ne[0]);
 #ifdef F8_TMA_AVAILABLE
+    auto tiles_ug = tiles + experts + 1;
+    auto tiles_dn = tiles_ug + experts + 1;
     bool tma = false;
     if constexpr (G != 0) {
         const int n = src->ne[0], m = dst->ne[0];
@@ -3495,10 +3484,20 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
             for (auto w : {weight, gate, (const ggml_tensor *)next->src[0]}) {
                 if (w->type != weight->type || uintptr_t(w->data)%16 != 0 || (!blocked && w->nb[1]%16 != 0) || w->nb[2]%w->nb[1] != 0) tma = false;
             }
-            if (tma) f8_moe_tiles_all<<<1,1,0,stream>>>(bounds, tiles_ug, tiles_dn, experts, blocked ? 64 : 96, 128);
         }
     }
+    const int width_ug = tma ? (blocked ? 64 : 96) : 0;
+#else
+    const int width_ug = 0;
 #endif
+    f8_moe_histogram<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks,
+            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
+    f8_moe_prefix<<<1,256,4*experts*sizeof(int32_t),stream>>>(counts, bounds, tiles, experts, chunks, wide ? 64 : 32, width_ug, 128);
+    f8_moe_scatter<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks, bounds, rows,
+            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
+    f8_moe_zero_invalid<<<std::min(cols, 128),256,0,stream>>>((const char *)ids->data, bounds,
+            (float *)(next ? next->data : dst->data), gate && !next ? up : nullptr, (next ? next : dst)->ne[0],
+            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     auto run = [&](const float * scales) {
         auto multiply = [&](const ggml_tensor * w, const ggml_tensor * bias, float * output, int n, int m,
                 const f8_activation<G> * acts, const float * act_scales, int mode = 0, uint8_t * codes = nullptr, float * out_scales = nullptr) {
