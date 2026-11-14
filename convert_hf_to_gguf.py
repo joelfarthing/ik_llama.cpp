@@ -2723,9 +2723,9 @@ class ModelOptModel(Model):
                     new_name = self.map_tensor_name(merged_name)
                 else:
                     new_name = self.map_tensor_name(name)
+                    self._tag_prec_a4(name, new_name)
                 self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.NVFP4_KS)
                 self.gguf_writer.add_tensor(new_name.removesuffix(".weight") + ".input_scale", input_scale.float().reshape(-1).numpy())
-                self._tag_prec_a4(name, new_name)
             else:
                 raise ValueError(f"Unsupported ModelOpt weight {name}: {weight.dtype}")
             consumed.update((name, scale_name, base + ".weight_scale_2", base + ".input_scale"))
