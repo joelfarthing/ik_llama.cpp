@@ -20,7 +20,7 @@ static bool f8_lt_eligible(const ggml_tensor * node, int cc) {
         uintptr_t(w->data)%16 == 0 && uintptr_t(node->data)%16 == 0;
 }
 
-static __global__ void f8_lt_quantize(const float * input, uint8_t * output, float * scales, int k, size_t stride) {
+static __global__ void f8_lt_quantize(const float * input, uint8_t * output, float * scales, int k, int stride) {
     __shared__ float maxima[8];
     __shared__ float scale;
     const float * x = input + size_t(blockIdx.x)*stride;

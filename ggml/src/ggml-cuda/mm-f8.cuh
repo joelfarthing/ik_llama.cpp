@@ -76,7 +76,7 @@ static __device__ void f8_quantize_group(const float * input, uint8_t * output, 
 }
 
 template <int G>
-static __global__ void f8_quantize(const float * input, uint8_t * output, float * scales, int n, size_t stride) {
+static __global__ void f8_quantize(const float * input, uint8_t * output, float * scales, int n, int stride) {
     const int group = blockIdx.x*4 + threadIdx.x/32;
     if (group < (n+G-1)/G) {
         f8_quantize_group<G>(input + blockIdx.y*stride, output + size_t(blockIdx.y)*n,
@@ -85,7 +85,7 @@ static __global__ void f8_quantize(const float * input, uint8_t * output, float 
 }
 
 template <int G>
-static __global__ void f8_silu_quantize(const float * gate, const float * up, uint8_t * output, float * scales, int n, size_t stride) {
+static __global__ void f8_silu_quantize(const float * gate, const float * up, uint8_t * output, float * scales, int n, int stride) {
     const int group = blockIdx.x*4 + threadIdx.x/32;
     if (group < (n+G-1)/G) {
         f8_quantize_group<G>(up + blockIdx.y*stride, output + size_t(blockIdx.y)*n,
@@ -95,7 +95,7 @@ static __global__ void f8_silu_quantize(const float * gate, const float * up, ui
 
 template <int G>
 static __global__ void f8_norm_quantize(const float * x, const float * w, uint8_t * output, float * scales,
-        int k, size_t stride, float eps) {
+        int k, int stride, float eps) {
 #if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080 && __CUDA_ARCH__ >= 890
     __shared__ float shared[G ? 512 : 32];
     const float * xr = x + size_t(blockIdx.x)*stride;
@@ -209,7 +209,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     const int r = i/chunks, j = i%chunks;
                     const char * row = x + size_t(first_row+r)*row_bytes;
                     const char * begin;
-                    if constexpr (blocked) begin = row + size_t(k0/128)*132 + 4 + k0%128;
+                    if constexpr (blocked) begin = row + k0/128*132 + 4 + k0%128;
                     else begin = row + ggml_cuda_f8_row::row_meta_size + k0;
                     const char * src = (const char *)(uintptr_t(begin) & ~uintptr_t(15)) + 16*j;
                     f8_pp_copy<16>(codes + (s*BM+r)*code_stride + 4*j, src, min(16, int(begin+BK-src)));
@@ -222,7 +222,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                     const char * row = x + size_t(first_row + r)*row_bytes;
                     const char * src = x;
                     if (valid) {
-                        if constexpr (blocked) src = row + size_t(k/128)*132 + 4 + k%128;
+                        if constexpr (blocked) src = row + k/128*132 + 4 + k%128;
                         else src = row + ggml_cuda_f8_row::row_meta_size + k;
                     }
                     if (tail && valid && uintptr_t(src)%4 != 0) {
@@ -275,7 +275,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
             if constexpr (blocked && G != 0) {
                 for (int r = tid; r < BM; r += NW*32) {
                     const bool valid = !tail || first_row+r < rows;
-                    const char * src = valid ? x + size_t(first_row+r)*row_bytes + size_t(k0/128)*132 : x;
+                    const char * src = valid ? x + size_t(first_row+r)*row_bytes + k0/128*132 : x;
                     f8_pp_copy<4>(scales+s*BM+r, src, valid ? 4 : 0);
                 }
             } else if constexpr (blocked) {
@@ -307,9 +307,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
 #pragma unroll
                     for (int l = 0; l < 2; ++l) {
                         const int row = warp_row+16*i+threadIdx.x/4+8*l;
-                        const char * ptr = x + size_t(first_row+row)*row_bytes;
-                        if constexpr (blocked) ptr += size_t(k0/128)*132 + 4 + k0%128;
-                        else ptr += ggml_cuda_f8_row::row_meta_size + k0;
+                        const char * ptr = x + size_t(first_row+row)*row_bytes + k0/128*132 + 4 + k0%128;
                         shifts[i][l] = (uintptr_t(ptr)%16)/4;
                     }
                 }
@@ -432,7 +430,7 @@ static __global__ void __launch_bounds__(NW*32, 1) mul_mat_f8_pp(
                         const int row = warp_row+16*i+at[i].get_i(l);
                         int shift = 0;
                         if constexpr (blocked && !tail) {
-                            const char * ptr = x + size_t(first_row+row)*row_bytes + size_t(k0/128)*132 + 4 + k0%128;
+                            const char * ptr = x + size_t(first_row+row)*row_bytes + k0/128*132 + 4 + k0%128;
                             shift = (uintptr_t(ptr)%16)/2;
                         }
                         const uint16_t v = ((const uint16_t *)(codes + (s*BM+row)*code_stride))[shift+k+at[i].get_j(l)];

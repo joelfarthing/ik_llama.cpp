@@ -37,10 +37,10 @@ struct ggml_cuda_f8_block {
         return (const ggml_fp8_e4m3_t *)((const char *)block + sizeof(float));
     }
     static __device__ __forceinline__ float scale(const void * row, int col) {
-        return ggml_cuda_f8_row::scale((const char *)row + size_t(col/128)*132);
+        return ggml_cuda_f8_row::scale((const char *)row + col/128*132);
     }
     static __device__ __forceinline__ ggml_fp8_e4m3_t code(const void * row, int col) {
-        return codes((const char *)row + size_t(col/128)*132)[col%128];
+        return codes((const char *)row + col/128*132)[col%128];
     }
     static __host__ __device__ size_t row_size(int n) { return size_t(n/128)*132; }
 };

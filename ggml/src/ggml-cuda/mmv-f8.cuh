@@ -139,7 +139,7 @@ static __device__ __forceinline__ float dot_f8_e4m3_b128(int n, const void * row
         }
         sum = warp_reduce_sum(sum);
     } else for (int b = first; b < n/128; b += step) {
-        const void * block = (const char *)row + size_t(b)*132;
+        const void * block = (const char *)row + b*132;
         const auto * x = ggml_cuda_f8_block::codes(block);
         uint32_t codes;
         if (uintptr_t(x) % alignof(uint32_t) == 0) codes = *(const uint32_t *)(x + 4*lane);
