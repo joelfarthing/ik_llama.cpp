@@ -2867,6 +2867,11 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
     }
 }
 
+static int f8_next(const ggml_cgraph * graph, int j) {
+    do ++j; while (j < graph->n_nodes && ggml_is_noop(graph->nodes[j]));
+    return j;
+}
+
 static int f8_readers(const ggml_cgraph * graph, int first, const ggml_tensor * t) {
     if (t->view_src || (t->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_CROSS_SPLIT))) return -1;
     int readers = 0;
@@ -2907,7 +2912,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         for (int j = node_n; j < cgraph->n_nodes && compatible(cgraph->nodes[j], src1) && f8_lt_supported(ctx, cgraph->nodes[j]) == use_lt;) {
             ++chain;
             last = j;
-            do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j]));
+            j = f8_next(cgraph, j);
         }
         const ggml_tensor * x = norm->src[0]->view_src ? norm->src[0]->view_src : norm->src[0];
         bool live = x->op == GGML_OP_NONE || (x->flags & GGML_TENSOR_FLAG_OUTPUT);
@@ -2938,8 +2943,7 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
     auto add_after = [&](int j) {
         if (!cgraph) return -1;
         const ggml_tensor * mm = cgraph->nodes[j];
-        int ia = j;
-        do ++ia; while (ia < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[ia]));
+        const int ia = f8_next(cgraph, j);
         if (ia >= cgraph->n_nodes) return -1;
         const ggml_tensor * add = cgraph->nodes[ia];
         if (add->op != GGML_OP_ADD || (add->src[0] != mm && add->src[1] != mm) || add->src[0] == add->src[1]) return -1;
@@ -2952,112 +2956,88 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         return f8_readers(cgraph, j + 1, mm) == 1 ? ia : -1;
     };
     auto other_of = [&](const ggml_tensor * add, const ggml_tensor * mm) { return add->src[0] == mm ? add->src[1] : add->src[0]; };
+    ggml_tensor * second = nullptr, * unary = nullptr, * down = nullptr, * up = nullptr, * gate = nullptr;
+    int id = 0;
+    const int m = dst->ne[0];
+    auto ffn = [&](auto supported) {
+        const int ig = f8_next(cgraph, node_n), iu = f8_next(cgraph, ig);
+        id = f8_next(cgraph, iu);
+        if (id >= cgraph->n_nodes) return false;
+        second = cgraph->nodes[ig];
+        unary = cgraph->nodes[iu];
+        down = cgraph->nodes[id];
+        const bool swapped = unary->src[0] == dst && unary->src[1] == second;
+        up = swapped ? second : dst;
+        gate = swapped ? dst : second;
+        return compatible(second, src1) && supported(second) && second->ne[0] == m &&
+            unary->op == GGML_OP_FUSED_MUL_UNARY && unary->src[0] == gate && unary->src[1] == up &&
+            (ggml_unary_op)unary->op_params[0] == GGML_UNARY_OP_SILU && *(const float *)(unary->op_params + 1) < 1e-6f &&
+            compatible(down, unary) && supported(down) &&
+            f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
+            f8_readers(cgraph, iu + 1, unary) == 1;
+    };
+    auto b128 = [](const ggml_tensor * node) { return node->src[0]->type == GGML_TYPE_F8_E4M3_B128; };
 #ifdef GGML_CUDA_F8_LT
-    if (use_lt && cgraph && (!norm || chain == 2)) {
-        auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
-        const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
-        if (id < cgraph->n_nodes) {
-            ggml_tensor * second = cgraph->nodes[ig], * unary = cgraph->nodes[iu], * down = cgraph->nodes[id];
-            const bool swapped = unary->src[0] == dst && unary->src[1] == second;
-            ggml_tensor * up = swapped ? second : dst, * gate = swapped ? dst : second;
-            const int m = dst->ne[0];
-            if (compatible(second, src1) && f8_lt_supported(ctx, second) && second->ne[0] == m &&
-                unary->op == GGML_OP_FUSED_MUL_UNARY && unary->src[0] == gate && unary->src[1] == up &&
-                (ggml_unary_op)unary->op_params[0] == GGML_UNARY_OP_SILU && *(const float *)(unary->op_params + 1) < 1e-6f &&
-                compatible(down, unary) && f8_lt_supported(ctx, down) &&
-                f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
-                f8_readers(cgraph, iu + 1, unary) == 1 &&
-                m*sizeof(float) + 64 <= (size_t)ggml_cuda_info().devices[ctx.device].smpbo) {
-                auto & lt = f8_lt_context(ctx);
-                ggml_cuda_pool_alloc<float> row_scales(ctx.pool(), 2*m);
-                ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
-                ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), cols);
-                const int ia = add_after(id);
-                ggml_cuda_pool_alloc<nv_bfloat16> narrow(ctx.pool());
-                if (ia >= 0 && lt.get(down->src[0]->ne[1], m, cols, down->ne[0], true).supported) narrow.alloc(size_t(cols)*down->ne[0]);
-                if (lt.up_gate(m, n, cols, m, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
-                            activations.get(), scales.get(), (float *)up->data, (float *)gate->data,
-                            row_scales.get(), codes.get(), out_scales.get(), stream) &&
-                    (ia >= 0 ?
-                     lt.launch_add(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
-                            codes.get(), out_scales.get(), (float *)down->data, (const float *)other_of(cgraph->nodes[ia], down)->data,
-                            (float *)cgraph->nodes[ia]->data, stream, narrow.get()) :
-                     lt.launch(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
-                            codes.get(), out_scales.get(), (float *)down->data, stream))) {
-                    CUDA_CHECK(cudaGetLastError());
-                    return ia >= 0 ? ia : id;
-                }
-            }
+    if (use_lt && cgraph && (!norm || chain == 2) && ffn([&](const ggml_tensor * node) { return f8_lt_supported(ctx, node); }) &&
+        m*sizeof(float) + 64 <= (size_t)ggml_cuda_info().devices[ctx.device].smpbo) {
+        auto & lt = f8_lt_context(ctx);
+        ggml_cuda_pool_alloc<float> row_scales(ctx.pool(), 2*m);
+        ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
+        ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), cols);
+        const int ia = add_after(id);
+        ggml_cuda_pool_alloc<nv_bfloat16> narrow(ctx.pool());
+        if (ia >= 0 && lt.get(down->src[0]->ne[1], m, cols, down->ne[0], true).supported) narrow.alloc(size_t(cols)*down->ne[0]);
+        if (lt.up_gate(m, n, cols, m, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
+                    activations.get(), scales.get(), (float *)up->data, (float *)gate->data,
+                    row_scales.get(), codes.get(), out_scales.get(), stream) &&
+            (ia >= 0 ?
+             lt.launch_add(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
+                    codes.get(), out_scales.get(), (float *)down->data, (const float *)other_of(cgraph->nodes[ia], down)->data,
+                    (float *)cgraph->nodes[ia]->data, stream, narrow.get()) :
+             lt.launch(down->src[0]->ne[1], m, cols, down->ne[0], (const char *)down->src[0]->data,
+                    codes.get(), out_scales.get(), (float *)down->data, stream))) {
+            CUDA_CHECK(cudaGetLastError());
+            return ia >= 0 ? ia : id;
         }
     }
 #endif
 #ifdef F8_TMA_AVAILABLE
-    if (!use_lt && cgraph && dst->src[0]->type == GGML_TYPE_F8_E4M3_B128 && cc >= 1200 &&
-        n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0) {
-        auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
-        const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
-        if (id < cgraph->n_nodes) {
-            ggml_tensor * second = cgraph->nodes[ig], * unary = cgraph->nodes[iu], * down = cgraph->nodes[id];
-            const bool swapped = unary->src[0] == dst && unary->src[1] == second;
-            ggml_tensor * up = swapped ? second : dst, * gate = swapped ? dst : second;
-            const int m = dst->ne[0], limit = ggml_cuda_info().devices[ctx.device].smpbo;
-            if (compatible(second, src1) && second->src[0]->type == GGML_TYPE_F8_E4M3_B128 && second->ne[0] == m &&
-                m%128 == 0 && m/128 <= 252 && ggml_cuda_f8_block::row_size(m)%16 == 0 &&
-                unary->op == GGML_OP_FUSED_MUL_UNARY && unary->src[0] == gate && unary->src[1] == up &&
-                (ggml_unary_op)unary->op_params[0] == GGML_UNARY_OP_SILU && *(const float *)(unary->op_params + 1) < 1e-6f &&
-                compatible(down, unary) && down->src[0]->type == GGML_TYPE_F8_E4M3_B128 && down->ne[0]%128 == 0 &&
-                f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
-                f8_readers(cgraph, iu + 1, unary) == 1 && f8_tma_shared<4, true, true>(n/128) <= limit &&
-                f8_tma_shared<6, false, true>(m/128) <= limit) {
-                ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
-                ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*(m/128));
-                const size_t stride = ggml_cuda_f8_block::row_size(n);
-                const f8_moe_routing routing{nullptr, nullptr, nullptr, 1, stride, stride*m, nullptr, 0, nullptr, nullptr, nullptr, false};
-                const int ia = add_after(id);
-                const float * other = ia >= 0 ? (const float *)other_of(cgraph->nodes[ia], down)->data : nullptr;
-                float * out = (float *)(ia >= 0 ? cgraph->nodes[ia] : down)->data;
-                if (launch_f8_tma<4, true, true>(n, m, cols, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
-                            activations.get(), scales.get(), n/128, nullptr, nullptr, codes.get(), out_scales.get(), m/128, routing,
-                            nullptr, stream, 8) &&
-                    (launch_f8_tma_dense<8>(m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
-                            out, stream, other) ||
-                     launch_f8_tma_dense<6>(m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
-                            out, stream, other))) {
-                    CUDA_CHECK(cudaGetLastError());
-                    return ia >= 0 ? ia : id;
-                }
-            }
+    if (const int limit = ggml_cuda_info().devices[ctx.device].smpbo; !use_lt && cgraph && b128(dst) && cc >= 1200 &&
+        n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && m%128 == 0 && m/128 <= 252 && ggml_cuda_f8_block::row_size(m)%16 == 0 &&
+        f8_tma_shared<4, true, true>(n/128) <= limit && f8_tma_shared<6, false, true>(m/128) <= limit &&
+        ffn(b128) && down->ne[0]%128 == 0) {
+        ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
+        ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*(m/128));
+        const size_t stride = ggml_cuda_f8_block::row_size(n);
+        const f8_moe_routing routing{nullptr, nullptr, nullptr, 1, stride, stride*m, nullptr, 0, nullptr, nullptr, nullptr, false};
+        const int ia = add_after(id);
+        const float * other = ia >= 0 ? (const float *)other_of(cgraph->nodes[ia], down)->data : nullptr;
+        float * out = (float *)(ia >= 0 ? cgraph->nodes[ia] : down)->data;
+        if (launch_f8_tma<4, true, true>(n, m, cols, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
+                    activations.get(), scales.get(), n/128, nullptr, nullptr, codes.get(), out_scales.get(), m/128, routing,
+                    nullptr, stream, 8) &&
+            (launch_f8_tma_dense<8>(m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
+                    out, stream, other) ||
+             launch_f8_tma_dense<6>(m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
+                    out, stream, other))) {
+            CUDA_CHECK(cudaGetLastError());
+            return ia >= 0 ? ia : id;
         }
     }
 #endif
-    if (!use_lt && cgraph && dst->src[0]->type == GGML_TYPE_F8_E4M3_B128 && cc < 1200) {
-        auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
-        const int ig = step(node_n), iu = ig < cgraph->n_nodes ? step(ig) : ig, id = iu < cgraph->n_nodes ? step(iu) : iu;
-        if (id < cgraph->n_nodes) {
-            ggml_tensor * second = cgraph->nodes[ig], * unary = cgraph->nodes[iu], * down = cgraph->nodes[id];
-            const bool swapped = unary->src[0] == dst && unary->src[1] == second;
-            ggml_tensor * up = swapped ? second : dst, * gate = swapped ? dst : second;
-            const int m = dst->ne[0];
-            if (compatible(second, src1) && second->src[0]->type == GGML_TYPE_F8_E4M3_B128 && second->ne[0] == m &&
-                unary->op == GGML_OP_FUSED_MUL_UNARY && unary->src[0] == gate && unary->src[1] == up &&
-                (ggml_unary_op)unary->op_params[0] == GGML_UNARY_OP_SILU && *(const float *)(unary->op_params + 1) < 1e-6f &&
-                compatible(down, unary) && down->src[0]->type == GGML_TYPE_F8_E4M3_B128 &&
-                f8_readers(cgraph, node_n + 1, dst) == 1 && f8_readers(cgraph, node_n + 1, second) == 1 &&
-                f8_readers(cgraph, iu + 1, unary) == 1) {
-                launch_f8_w8a8(up->src[0], n, m, cols, m, (const char *)up->src[0]->data, activations.get(),
-                        (float *)up->data, scales.get(), stream);
-                launch_f8_w8a8(gate->src[0], n, m, cols, m, (const char *)gate->src[0]->data, activations.get(),
-                        (float *)gate->data, scales.get(), stream);
-                ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
-                ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*((m+G-1)/G));
-                f8_silu_quantize<G><<<dim3((m+4*G-1)/(4*G), cols), 128, 0, stream>>>((const float *)gate->data, (const float *)up->data,
-                        codes.get(), out_scales.get(), m, m);
-                launch_f8_w8a8(down->src[0], m, down->ne[0], cols, down->ne[0], (const char *)down->src[0]->data,
-                        codes.get(), (float *)down->data, out_scales.get(), stream);
-                CUDA_CHECK(cudaGetLastError());
-                return id;
-            }
-        }
+    if (!use_lt && cgraph && b128(dst) && cc < 1200 && ffn(b128)) {
+        launch_f8_w8a8(up->src[0], n, m, cols, m, (const char *)up->src[0]->data, activations.get(),
+                (float *)up->data, scales.get(), stream);
+        launch_f8_w8a8(gate->src[0], n, m, cols, m, (const char *)gate->src[0]->data, activations.get(),
+                (float *)gate->data, scales.get(), stream);
+        ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
+        ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*((m+G-1)/G));
+        f8_silu_quantize<G><<<dim3((m+4*G-1)/(4*G), cols), 128, 0, stream>>>((const float *)gate->data, (const float *)up->data,
+                codes.get(), out_scales.get(), m, m);
+        launch_f8_w8a8(down->src[0], m, down->ne[0], cols, down->ne[0], (const char *)down->src[0]->data,
+                codes.get(), (float *)down->data, out_scales.get(), stream);
+        CUDA_CHECK(cudaGetLastError());
+        return id;
     }
     for (;;) {
         const auto * weight = dst->src[0];
@@ -3101,9 +3081,8 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         }
         CUDA_CHECK(cudaGetLastError());
         if (!cgraph) break;
-        int next = node_n+1;
-        while (next < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[next])) ++next;
-        if (next == cgraph->n_nodes || !compatible(cgraph->nodes[next], src1) || f8_lt_supported(ctx, cgraph->nodes[next]) != use_lt) break;
+        const int next = f8_next(cgraph, node_n);
+        if (next >= cgraph->n_nodes || !compatible(cgraph->nodes[next], src1) || f8_lt_supported(ctx, cgraph->nodes[next]) != use_lt) break;
         node_n = next;
         dst = cgraph->nodes[node_n];
     }
@@ -3117,8 +3096,7 @@ static int ggml_cuda_f8_norm_chain(ggml_backend_cuda_context & ctx, ggml_tensor 
     for (auto t : {x, w}) {
         if (!ggml_backend_buffer_is_cuda(t->buffer)) return -1;
     }
-    int j = i;
-    do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j]));
+    const int j = f8_next(cgraph, i);
     if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_MUL_MAT || cgraph->nodes[j]->src[1] != norm ||
             !f8_w8a8(cgraph->nodes[j]->src[0], ggml_cuda_info().devices[ctx.device].cc)) return -1;
     return ggml_cuda_mul_mat_f8_reuse(ctx, norm, cgraph->nodes[j], cgraph, j, norm);
@@ -3138,10 +3116,9 @@ static int ggml_cuda_mul_mat_f8_exact(ggml_backend_cuda_context & ctx, const ggm
         }
         return true;
     };
-    auto step = [&](int j) { do ++j; while (j < cgraph->n_nodes && ggml_is_noop(cgraph->nodes[j])); return j; };
     if (!cgraph || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[1] <= 8 || src1->ne[2]*src1->ne[3] != 1 ||
             !new_mma_available(cc) || !compatible(dst)) return -1;
-    if (const int next = step(node_n); next >= cgraph->n_nodes || !compatible(cgraph->nodes[next])) return -1;
+    if (const int next = f8_next(cgraph, node_n); next >= cgraph->n_nodes || !compatible(cgraph->nodes[next])) return -1;
     const int n = src1->ne[0], cols = src1->ne[1];
     auto stream = ctx.stream();
     ggml_cuda_pool_alloc<half> activations(ctx.pool(), size_t(cols)*n);
@@ -3154,7 +3131,7 @@ static int ggml_cuda_mul_mat_f8_exact(ggml_backend_cuda_context & ctx, const ggm
             launch_f8_pp<ggml_cuda_f8_block>(cc, n, w->ne[1], cols, dst->ne[0], (const char *)w->data, activations.get(), (float *)dst->data, stream);
         }
         CUDA_CHECK(cudaGetLastError());
-        const int next = step(node_n);
+        const int next = f8_next(cgraph, node_n);
         if (next >= cgraph->n_nodes || !compatible(cgraph->nodes[next])) break;
         node_n = next;
         dst = cgraph->nodes[node_n];
