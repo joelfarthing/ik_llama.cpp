@@ -51,20 +51,9 @@ static __device__ __forceinline__ float ggml_cuda_f8_value(const void * row, int
 }
 
 template <typename layout>
-static __global__ void scale_f8_rows(const void * x, float * y, int n, int rows, int cols, int ldc) {
-    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-    if (i < int64_t(rows)*cols) {
-        const int row = i % rows;
-        y[(i/rows)*ldc + row] *= layout::scale((const char *)x + row*layout::row_size(n));
-    }
-}
-
-template <typename layout, typename dst_t, bool scaled = std::is_same_v<dst_t, float>>
-static __global__ void convert_f8_rows(const void * vx, dst_t * y, int64_t n, int ne0) {
+static __global__ void convert_f8_rows(const void * vx, float * y, int64_t n, int ne0) {
     const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
     if (i >= n) return;
     const void * row = (const char *)vx + (i/ne0)*layout::row_size(ne0);
-    float value = ggml_cuda_f8_e4m3_to_float(layout::code(row, i % ne0));
-    if constexpr (scaled) value *= layout::scale(row, i % ne0);
-    y[i] = dst_t(value);
+    y[i] = ggml_cuda_f8_e4m3_to_float(layout::code(row, i % ne0)) * layout::scale(row, i % ne0);
 }

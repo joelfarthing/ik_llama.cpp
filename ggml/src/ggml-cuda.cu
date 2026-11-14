@@ -1825,25 +1825,6 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     const int compute_capability = ggml_cuda_info().devices[id].cc;
 
-    if (src0->type == GGML_TYPE_F8_E4M3_KS && dst->op_params[0] == GGML_PREC_DEFAULT) {
-        ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(id), row_diff*ne00);
-        ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(id), src1_ncols*ne10);
-        ggml_get_to_fp16_cuda(src0->type)(src0_dd_i, src0_f16.get(), row_diff, ne00, stream);
-        ggml_get_to_fp16_cuda(src1->type)(src1_ddf_i, src1_f16.get(), src1_ncols, ne10, stream);
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        ctx.cublas_handle(id, stream);
-        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                row_diff, src1_ncols, ne10,
-                &alpha, src0_f16.get(), CUDA_R_16F, ne00,
-                        src1_f16.get(), CUDA_R_16F, ne10,
-                &beta,  dst_dd_i,       CUDA_R_32F, ldc,
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        scale_f8_rows<ggml_cuda_f8_row><<<(row_diff*src1_ncols + 255)/256, 256, 0, stream>>>(
-                src0_dd_i, dst_dd_i, ne00, row_diff, src1_ncols, ldc);
-        return;
-    }
-
     if (src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
 
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
@@ -1963,12 +1944,7 @@ static void ggml_cuda_op_mul_mat_cublas(
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
             GGML_ASSERT(to_fp32_cuda != nullptr);
             src0_ddq_as_f32.alloc(row_diff*ne00);
-            if (src0->type == GGML_TYPE_F8_E4M3_KS) {
-                convert_f8_rows<ggml_cuda_f8_row, float, false><<<(row_diff*ne00 + 255)/256, 256, 0, stream>>>(
-                        src0_dd_i, src0_ddq_as_f32.get(), row_diff*ne00, ne00);
-            } else {
-                to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff, ne00, stream);
-            }
+            to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff, ne00, stream);
         }
         if (src1->type != GGML_TYPE_F32) {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
@@ -1990,10 +1966,6 @@ static void ggml_cuda_op_mul_mat_cublas(
                     &alpha, src0_ddf_i,  ne00,
                             src1_ddf1_i, ne10,
                     &beta,  dst_dd_i,    ldc));
-        if (src0->type == GGML_TYPE_F8_E4M3_KS) {
-            scale_f8_rows<ggml_cuda_f8_row><<<(row_diff*src1_ncols + 255)/256, 256, 0, stream>>>(
-                    src0_dd_i, dst_dd_i, ne00, row_diff, src1_ncols, ldc);
-        }
     }
 
     GGML_UNUSED(dst);
