@@ -2628,9 +2628,10 @@ class ModelOptModel(Model):
         shapes = [self.model_tensors[name]().shape for name in shards]
         self._ple_row_dim = shapes[0][-1]
         shape = (sum(shape[0] for shape in shapes), self._ple_row_dim)
-        scale = LazyTorchTensor.to_eager(scale)
-        if self.fp8_dequant:
-            chunks = [lambda gen=self.model_tensors[name]: (LazyTorchTensor.to_eager(gen()).float() * scale.float()).numpy()
+        scale = LazyTorchTensor.to_eager(scale()) if scale else None
+        if self.fp8_dequant or scale is None:
+            factor = 1 if scale is None else scale.float()
+            chunks = [lambda gen=self.model_tensors[name]: (LazyTorchTensor.to_eager(gen()).float() * factor).numpy()
                       for name in shards]
             qtype = gguf.GGMLQuantizationType[self.ftype.name.partition("_")[2]]
             data = gguf.LazyChunkedTensor(chunks, shape, np.float32).quantize(qtype)
@@ -2724,7 +2725,7 @@ class ModelOptModel(Model):
         if ple_shards:
             ple_shards.sort(key=lambda n: int(n.rpartition('.shard_')[2].split('.')[0]))
             scale_name = ple_shards[0].split('.shard_')[0] + '.weight_scale'
-            self._write_fp8_ple(ple_shards, self.model_tensors[scale_name]())
+            self._write_fp8_ple(ple_shards, self.model_tensors.get(scale_name))
             consumed.update(ple_shards)
             consumed.add(scale_name)
         for name in list(self.model_tensors):
