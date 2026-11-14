@@ -2769,10 +2769,9 @@ static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const flo
 
 #ifdef F8_TMA_AVAILABLE
 template <int RN>
-static bool launch_f8_tma_dense(int n, int rows, int cols, const char * x, const uint8_t * y,
+static bool launch_f8_tma_dense(int n, int rows, int cols, const char * x, size_t stride, const uint8_t * y,
         const float * scales, float * z, cudaStream_t stream, const float * other = nullptr) {
     if (f8_tma_shared<RN, false, true>(n/128) > (int)ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) return false;
-    const size_t stride = ggml_cuda_f8_block::row_size(n);
     const f8_moe_routing routing{nullptr, nullptr, nullptr, 1, stride, stride*rows, nullptr, 0, nullptr, nullptr, nullptr, false};
     return other ?
         launch_f8_tma<RN, false, true, true>(n, rows, cols, x, nullptr, y, scales, n/128, z, nullptr, nullptr, nullptr, 0, routing,
@@ -2786,9 +2785,9 @@ static bool launch_f8_w8a8(const ggml_tensor * weight, int n, int rows, int cols
         const char * x, const uint8_t * y, float * z, const float * scales, cudaStream_t stream, const float * other = nullptr) {
 #ifdef F8_TMA_AVAILABLE
     if (weight->type == GGML_TYPE_F8_E4M3_B128 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= 1200 &&
-        n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && rows%128 == 0 && ldc == rows &&
-        (launch_f8_tma_dense<8>(n, rows, cols, x, y, scales, z, stream, other) ||
-         launch_f8_tma_dense<6>(n, rows, cols, x, y, scales, z, stream, other))) return true;
+        n/128 <= 256 && weight->nb[1]%16 == 0 && rows%128 == 0 && ldc == rows &&
+        (launch_f8_tma_dense<8>(n, rows, cols, x, weight->nb[1], y, scales, z, stream, other) ||
+         launch_f8_tma_dense<6>(n, rows, cols, x, weight->nb[1], y, scales, z, stream, other))) return true;
 #endif
     if (other) return false;
     if (weight->type == GGML_TYPE_F8_E4M3_KS) {
@@ -3003,12 +3002,12 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
 #endif
 #ifdef F8_TMA_AVAILABLE
     if (const int limit = ggml_cuda_info().devices[ctx.device].smpbo; !use_lt && cgraph && b128(dst) && cc >= 1200 &&
-        n/128 <= 256 && ggml_cuda_f8_block::row_size(n)%16 == 0 && m%128 == 0 && m/128 <= 252 && ggml_cuda_f8_block::row_size(m)%16 == 0 &&
+        n/128 <= 256 && dst->src[0]->nb[1]%16 == 0 && m%128 == 0 && m/128 <= 252 &&
         f8_tma_shared<4, true, true>(n/128) <= limit && f8_tma_shared<6, false, true>(m/128) <= limit &&
-        ffn(b128) && down->ne[0]%128 == 0) {
+        ffn(b128) && down->src[0]->nb[1]%16 == 0 && down->ne[0]%128 == 0) {
         ggml_cuda_pool_alloc<uint8_t> codes(ctx.pool(), size_t(cols)*m);
         ggml_cuda_pool_alloc<float> out_scales(ctx.pool(), size_t(cols)*(m/128));
-        const size_t stride = ggml_cuda_f8_block::row_size(n);
+        const size_t stride = dst->src[0]->nb[1];
         const f8_moe_routing routing{nullptr, nullptr, nullptr, 1, stride, stride*m, nullptr, 0, nullptr, nullptr, nullptr, false};
         const int ia = add_after(id);
         const float * other = ia >= 0 ? (const float *)other_of(cgraph->nodes[ia], down)->data : nullptr;
@@ -3016,10 +3015,10 @@ static int ggml_cuda_mul_mat_f8_reuse(ggml_backend_cuda_context & ctx, const ggm
         if (launch_f8_tma<4, true, true>(n, m, cols, (const char *)up->src[0]->data, (const char *)gate->src[0]->data,
                     activations.get(), scales.get(), n/128, nullptr, nullptr, codes.get(), out_scales.get(), m/128, routing,
                     nullptr, stream, 8) &&
-            (launch_f8_tma_dense<8>(m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
-                    out, stream, other) ||
-             launch_f8_tma_dense<6>(m, down->ne[0], cols, (const char *)down->src[0]->data, codes.get(), out_scales.get(),
-                    out, stream, other))) {
+            (launch_f8_tma_dense<8>(m, down->ne[0], cols, (const char *)down->src[0]->data, down->src[0]->nb[1], codes.get(),
+                    out_scales.get(), out, stream, other) ||
+             launch_f8_tma_dense<6>(m, down->ne[0], cols, (const char *)down->src[0]->data, down->src[0]->nb[1], codes.get(),
+                    out_scales.get(), out, stream, other))) {
             CUDA_CHECK(cudaGetLastError());
             return ia >= 0 ? ia : id;
         }
