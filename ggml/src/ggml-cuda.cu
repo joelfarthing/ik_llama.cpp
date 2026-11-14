@@ -2809,23 +2809,23 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const char * src0_dd_i, const float * src1_ddf_i, const char * src1_ddq_i, float * dst_dd_i,
         int64_t row_low, int64_t row_high, int64_t src1_ncols, int64_t src1_padded_row_size, cudaStream_t stream) {
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const int nrows = row_high - row_low;
+    const int ldc = id == ctx.device ? dst->ne[0] : nrows;
     if constexpr (w8a8) {
         if (src1_ncols > 8 && dst->op_params[0] == GGML_PREC_DEFAULT && f8_mma_available(cc)) {
             constexpr int G = f8_activation_group;
-            const int n = src0->ne[0], nrows = row_high-row_low;
-            const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
-            ggml_cuda_pool_alloc<uint8_t> activations(ctx.pool(ggml_cuda_get_device()), size_t(src1_ncols)*n);
-            ggml_cuda_pool_alloc<float> scales(ctx.pool(ggml_cuda_get_device()), size_t(src1_ncols)*((n+G-1)/G));
+            const int n = src0->ne[0];
+            ggml_cuda_pool_alloc<uint8_t> activations(ctx.pool(id), size_t(src1_ncols)*n);
+            ggml_cuda_pool_alloc<float> scales(ctx.pool(id), size_t(src1_ncols)*((n+G-1)/G));
             f8_quantize<G><<<dim3((n+4*G-1)/(4*G),src1_ncols),128,0,stream>>>(src1_ddf_i, activations.get(), scales.get(), n, src1->ne[0]);
             launch_f8_w8a8(src0, n, nrows, src1_ncols, ldc, src0_dd_i, activations.get(), dst_dd_i, scales.get(), stream);
             return;
         }
     }
     if (src1_ncols > 8 && dst->op_params[0] == GGML_PREC_DEFAULT && new_mma_available(cc)) {
-        const int nrows = row_high - row_low;
-        const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
-        ggml_cuda_pool_alloc<half> activations(ctx.pool(ggml_cuda_get_device()), src1_ncols*src1->ne[0]);
+        ggml_cuda_pool_alloc<half> activations(ctx.pool(id), src1_ncols*src1->ne[0]);
         ggml_get_to_fp16_cuda(GGML_TYPE_F32)(src1_ddf_i, activations.get(), src1_ncols, src1->ne[0], stream);
         if (src0->type == GGML_TYPE_F8_E4M3_KS) {
             launch_f8_pp<ggml_cuda_f8_row>(cc, src0->ne[0], nrows, src1_ncols, ldc, src0_dd_i, activations.get(), dst_dd_i, stream);
@@ -2835,8 +2835,6 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
         return;
     }
     if (src0->type == GGML_TYPE_F8_E4M3_B128) {
-        const int nrows = row_high - row_low;
-        const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
         auto launch = [&](auto kernel) {
             kernel<<<dim3(nrows, src1_ncols), 256, 0, stream>>>(src0->ne[0], ldc, src0_dd_i, src1_ddf_i, dst_dd_i, src1->ne[0]);
         };
@@ -2846,8 +2844,6 @@ static void ggml_cuda_op_mul_mat_f8_e4m3(
             launch(mul_mat_vec_f8_e4m3_b128<false>);
         }
     } else if (src1_ncols <= 8) {
-        const int nrows = row_high - row_low;
-        const int ldc = ggml_cuda_get_device() == ctx.device ? dst->ne[0] : nrows;
         const dim3 grid(nrows, src1_ncols);
         if (src0->ne[0] % 16 == 0 && uintptr_t(src0_dd_i) % 16 == 0 && uintptr_t(src1_ddf_i) % 16 == 0) {
             const int threads = size_t(src0->ne[0])*nrows > 32*1024*1024 ? 256 : 128;
