@@ -5568,19 +5568,6 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
         }
     }
 
-    if (cuda_graph_update_required) {
-        graph->f8_w8a8 = false;
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            const auto * node = cgraph->nodes[i];
-            if (node->op == GGML_OP_MUL_MAT &&
-                    (node->src[0]->type == GGML_TYPE_F8_E4M3_KS || node->src[0]->type == GGML_TYPE_F8_E4M3_B128) &&
-                    ggml_get_input_scale(node->src[0]) == -1.0f) {
-                graph->f8_w8a8 = true;
-                break;
-            }
-        }
-    }
-
     graph->uid = cgraph->uid;
 
     return cuda_graph_update_required;
@@ -5744,7 +5731,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     if (use_cuda_graph && cuda_graph_update_required) {
 #ifdef GGML_CUDA_F8_LT
-        if (graph->f8_w8a8) f8_lt_prepare(*cuda_ctx, cgraph);
+        f8_lt_prepare(*cuda_ctx, cgraph);
 #endif
         // Start CUDA graph capture
         // Why are we protecting an atomic_int with a mutex?

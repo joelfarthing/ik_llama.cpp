@@ -40,7 +40,6 @@ struct ggml_cuda_graph {
     int number_consecutive_updates = 0;
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
     bool use_cpy_indirection = false;
-    bool f8_w8a8 = false;
     std::vector<char *> cpy_dest_ptrs;
     char ** dest_ptrs_d = nullptr;
     int dest_ptrs_size = 0;
