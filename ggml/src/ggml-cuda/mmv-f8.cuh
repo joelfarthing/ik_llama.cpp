@@ -137,7 +137,6 @@ static __device__ __forceinline__ float dot_f8_e4m3_b128(int n, const void * row
             }
             sum = fmaf(partial[0] + partial[1] + partial[2] + partial[3], scale, sum);
         }
-        sum = warp_reduce_sum(sum);
     } else for (int b = first; b < n/128; b += step) {
         const void * block = (const char *)row + b*132;
         const auto * x = ggml_cuda_f8_block::codes(block);
@@ -151,9 +150,9 @@ static __device__ __forceinline__ float dot_f8_e4m3_b128(int n, const void * row
         partial = fmaf(w0.y, a[1], partial);
         partial = fmaf(w1.x, a[2], partial);
         partial = fmaf(w1.y, a[3], partial);
-        partial = warp_reduce_sum(partial);
-        if (lane == 0) sum = fmaf(partial, ggml_cuda_f8_row::scale(block), sum);
+        sum = fmaf(partial, ggml_cuda_f8_row::scale(block), sum);
     }
+    sum = warp_reduce_sum(sum);
     if constexpr (warp) return sum;
     __shared__ float tmp[8];
     if (lane == 0) tmp[first] = sum;
