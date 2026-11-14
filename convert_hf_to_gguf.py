@@ -2627,6 +2627,7 @@ class ModelOptModel(Model):
             packed = data if isinstance(data, FP8Tensor) else self._convert_fp8(
                 new_name, data.view(torch.float8_e4m3fn), scale, None, transforms_done=True)
             self.gguf_writer.add_tensor(new_name, packed.numpy(self.is_big_endian), raw_dtype=packed.qtype)
+            self._fp8_types.add(packed.qtype)
 
     def _write_fp8_ple(self, shards, scale):
         if len(shards) != self.hparams["split_ngram_parts"]:
@@ -2649,6 +2650,7 @@ class ModelOptModel(Model):
             chunks = [lambda gen=self.model_tensors[name]: pack(gen) for name in shards]
             qtype = gguf.GGMLQuantizationType.F8_E4M3_KS
             data = gguf.LazyChunkedTensor(chunks, gguf.quant_shape_to_byte_shape(shape, qtype), np.uint8)
+            self._fp8_types.add(qtype)
         self.gguf_writer.add_tensor("per_layer_token_embd.weight", data, raw_dtype=qtype)
 
     def _convert_fp8_mtp(self, name, weight, scale):
