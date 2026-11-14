@@ -3002,7 +3002,6 @@ class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
         self._mtp_fc: dict[str, Tensor] = {}
 
@@ -3086,10 +3085,6 @@ class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
         if name.endswith("ple_embedding.ngram_heads_vocab_sizes"):
             return
 
-        if ".ngram_embedding.shard_" in name:
-            yield from self._place_ple_shard(data_torch, name)
-            return
-
         if name.endswith((".nextn_fc_embedding.weight", ".nextn_fc_hidden.weight")):
             self._mtp_fc[name.rsplit(".", 2)[1]] = data_torch
             if len(self._mtp_fc) < 2:
@@ -3145,11 +3140,6 @@ class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
             raise ValueError(f"MTP projection missing its other half: {sorted(self._mtp_fc)}")
         if self._merge_parts:
             raise ValueError(f"merged weights missing a half: {sorted((bid, t.name) for bid, t in self._merge_parts)}")
-        n_parts = self.hparams.get("split_ngram_parts", 0)
-        if self._ple_shards and len(self._ple_shards) != n_parts:
-            raise ValueError(
-                f"got {len(self._ple_shards)} PLE embedding shards, expected {n_parts}"
-            )
 
     _SHARED_INPUT_MERGES = (
         (gguf.MODEL_TENSOR.HC_ATTN_DOWN_INJECT, (gguf.MODEL_TENSOR.HC_ATTN_DOWN, gguf.MODEL_TENSOR.HC_ATTN_INJECT), False),
@@ -3161,13 +3151,6 @@ class Qwen4ExpTextModel(_LinearAttentionVReorderBase):
     def map_tensor_name(self, name, try_suffixes=(".weight", ".bias")):
         mapped = super().map_tensor_name(name, try_suffixes)
         return mapped.replace(".attn_indexer_k_norm", ".indexer.k_norm")
-
-    def _place_ple_shard(self, data_torch, name):
-        idx = int(name.rpartition(".shard_")[2].partition(".")[0])
-        self._ple_shards[idx] = name
-        self._ple_row_dim = int(data_torch.shape[-1])
-        if len(self._ple_shards) == self.hparams["split_ngram_parts"]:
-            yield "per_layer_token_embd.weight", torch.cat([self.model_tensors[self._ple_shards[i]]().float() for i in sorted(self._ple_shards)])
 
 
 @Model.register("FlintForCausalLM")
