@@ -1043,9 +1043,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
 
     }
 
-    if (typeA == GGML_TYPE_F8_E4M3_KS) {
-        if (!iqk_set_kernels_f8(typeA, typeB, mm.funcs, true)) return false;
-    } else if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
+    if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
         return false;
     }
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
@@ -1075,7 +1073,7 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny) {
     switch (typeA) {
         case GGML_TYPE_F8_E4M3_KS:
         case GGML_TYPE_F8_E4M3_B128:
-            return iqk_set_kernels_f8(typeA, typeB, mm.funcs, true);
+            return iqk_set_kernels_f8(typeA, typeB, mm.funcs);
         case GGML_TYPE_F16:
         case GGML_TYPE_F32:
         case GGML_TYPE_BF16:
@@ -1192,7 +1190,6 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int /*Ny*/) {
 
     switch (typeA) {
         case GGML_TYPE_F8_E4M3_KS:
-            return iqk_set_kernels_f8(typeA, typeB, m.funcs, true);
         case GGML_TYPE_F8_E4M3_B128:
             return iqk_set_kernels_f8(typeA, typeB, m.funcs);
         case GGML_TYPE_F16:

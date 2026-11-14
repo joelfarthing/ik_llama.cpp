@@ -1247,9 +1247,8 @@ template <int nrc> struct F8QF32 : QF32Base {
     Data load_tail(int iy, int i) const { return load(y[iy] + 4*i); }
 };
 
-template <int nrc_y>
 void mul_mat_f8_b128_bf16(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
-    constexpr int tile = 5;
+    constexpr int tile = 5, nrc_y = 8;
     for (int ix = 0; ix < nrc_x; ix += tile) {
         const int nx = std::min(tile, nrc_x - ix);
         uint16_t weights[tile][128];
@@ -1264,13 +1263,9 @@ void mul_mat_f8_b128_bf16(int n, const void * vx, size_t bx, const DataInfo& inf
                 memcpy(scale + row, x, sizeof(float));
                 for (int i = 0; i < 128; i += 16) F8::decode_bf16(x + 4 + i, weights[row] + i);
             }
-            if constexpr (nrc_y == 8) {
-                mul_mat_Qx_Qy_T<F8QF32<4>, QBF16>(128, weights, sizeof(weights[0]), local, nx);
-                const DataInfo next{partial + 4*tile, (const char *)(y + 4), tile, 0, 0, 1, nullptr, 0};
-                mul_mat_Qx_Qy_T<F8QF32<4>, QBF16>(128, weights, sizeof(weights[0]), next, nx);
-            } else {
-                mul_mat_Qx_Qy_T<F8QF32<nrc_y>, QBF16>(128, weights, sizeof(weights[0]), local, nx);
-            }
+            mul_mat_Qx_Qy_T<F8QF32<4>, QBF16>(128, weights, sizeof(weights[0]), local, nx);
+            const DataInfo next{partial + 4*tile, (const char *)(y + 4), tile, 0, 0, 1, nullptr, 0};
+            mul_mat_Qx_Qy_T<F8QF32<4>, QBF16>(128, weights, sizeof(weights[0]), next, nx);
             for (int iy = 0; iy < nrc_y; ++iy) {
                 for (int row = 0; row < nx; ++row) sum[iy*tile + row] += partial[iy*tile + row]*scale[row];
                 y[iy] += 128;
@@ -1284,24 +1279,25 @@ void mul_mat_f8_b128_bf16(int n, const void * vx, size_t bx, const DataInfo& inf
 
 #endif
 
-template <bool block_scaled, int nrc_y, bool row_scaled = false>
+template <bool block_scaled, int nrc_y>
 void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
 #ifndef __x86_64__
     if constexpr (block_scaled && nrc_y == 8) {
-        mul_mat_f8_b128_bf16<8>(n, vx, bx, info, nrc_x);
+        mul_mat_f8_b128_bf16(n, vx, bx, info, nrc_x);
         return;
     }
 #endif
     const float * y[nrc_y];
     for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const float *)info.src1_row(iy);
     const int block_size = block_scaled ? 128 : n;
+    const int meta = block_scaled ? sizeof(float) : ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).row_meta_size;
     for (int ix = 0; ix < nrc_x; ++ix) {
         const auto * x = (const uint8_t *)vx + ix*bx;
         float sum[nrc_y] = {};
         for (int ib = 0; ib < n; ib += block_size) {
-            float scale = 1;
-            if constexpr (block_scaled || row_scaled) memcpy(&scale, x, sizeof(scale));
-            x += block_scaled ? sizeof(float) : ggml_internal_get_type_traits(GGML_TYPE_F8_E4M3_KS).row_meta_size;
+            float scale;
+            memcpy(&scale, x, sizeof(scale));
+            x += meta;
             F8::Data acc[nrc_y][2];
             for (int iy = 0; iy < nrc_y; ++iy) acc[iy][0] = acc[iy][1] = F8::zero();
             int i = 0;
@@ -1338,14 +1334,10 @@ void mul_mat_f8(int n, const void * vx, size_t bx, const DataInfo& info, int nrc
 
 }
 
-bool iqk_set_kernels_f8(int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, bool scale_ks) {
+bool iqk_set_kernels_f8(int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels) {
     if (typeB != GGML_TYPE_F32) return false;
     if (typeA == GGML_TYPE_F8_E4M3_KS) {
-        if (scale_ks) {
-            IQK_SET_MUL_MAT_FUNCTIONS_T2(mul_mat_f8, false, true, kernels);
-        } else {
-            IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_f8, false, kernels);
-        }
+        IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_f8, false, kernels);
         return true;
     }
     if (typeA == GGML_TYPE_F8_E4M3_B128) {
@@ -1391,7 +1383,7 @@ bool iqk_convert_f8(int typeA, int n, const void * vx, size_t bx, void * vy, siz
 extern "C" IQK_API void iqk_vec_dot_f8_e4m3_ks(int n, float * s, size_t, const void * x, size_t bx,
         const void * y, size_t by, int) {
     const DataInfo info{s, (const char *)y, 0, by, 0, 1, nullptr, 0};
-    mul_mat_f8<false, 1, true>(n, x, bx, info, 1);
+    mul_mat_f8<false, 1>(n, x, bx, info, 1);
 }
 
 extern "C" IQK_API void iqk_vec_dot_f8_e4m3_b128(int n, float * s, size_t, const void * x, size_t bx,
