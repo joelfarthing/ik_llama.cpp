@@ -56,7 +56,7 @@ static __global__ void k_get_rows_float(
             /*int64_t ne10, int64_t ne11,*/ int64_t ne12, /*int64_t ne13,*/
             /*size_t s0,*/ size_t s1, size_t s2, size_t s3,
             /*size_t nb00,*/ size_t nb01, size_t nb02, size_t nb03,
-            size_t s10, size_t s11, size_t s12) {
+            size_t s10, size_t s11, size_t s12/*, size_t s13*/) {
 
     const int i00 =  blockIdx.y*blockDim.x + threadIdx.x;
     const int i10 =  blockIdx.x*blockDim.y + threadIdx.y;
@@ -115,9 +115,9 @@ static void get_rows_cuda(const ggml_tensor * src0, const ggml_tensor * src1, gg
     GGML_UNUSED(dst);
 }
 
-template<typename src0_t, typename dst_t>
+template<typename src0_t>
 static void get_rows_cuda_float(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-                                const src0_t * src0_dd, const int32_t * src1_dd, dst_t * dst_dd, cudaStream_t stream) {
+                                const src0_t * src0_dd, const int32_t * src1_dd, float * dst_dd, cudaStream_t stream) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -143,7 +143,7 @@ static void get_rows_cuda_float(const ggml_tensor * src0, const ggml_tensor * sr
             /*ne10, ne11,*/ ne12, /*ne13,*/
             /* s0,*/ s1, s2, s3,
             /* nb00,*/ nb01, nb02, nb03,
-            s10, s11, s12);
+            s10, s11, s12/*, s13*/);
 
     GGML_UNUSED(dst);
 }
@@ -185,29 +185,6 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
-
-    if (src0->type == GGML_TYPE_F8_E4M3_B128) {
-        if (dst->type == GGML_TYPE_F16) {
-            get_rows_cuda_float(src0, src1, dst, (const ggml_cuda_f8_block *)src0->data,
-                    (const int32_t *)src1->data, (half *)dst->data, stream);
-        } else {
-            get_rows_cuda_float(src0, src1, dst, (const ggml_cuda_f8_block *)src0->data,
-                    (const int32_t *)src1->data, (float *)dst->data, stream);
-        }
-        return;
-    }
-
-    if (src0->type == GGML_TYPE_F8_E4M3_KS) {
-        if (dst->type == GGML_TYPE_F16) {
-            get_rows_cuda_float(src0, src1, dst, (const ggml_fp8_e4m3_t *)src0->data,
-                    (const int32_t *)src1->data, (half *)dst->data, stream);
-        } else {
-            GGML_ASSERT(dst->type == GGML_TYPE_F32);
-            get_rows_cuda_float(src0, src1, dst, (const ggml_fp8_e4m3_t *)src0->data,
-                    (const int32_t *)src1->data, (float *)dst->data, stream);
-        }
-        return;
-    }
 
     if (dst->type != GGML_TYPE_F32 || dst->op_params[0] == 1) {
         constexpr int k_block_size = 512;
@@ -294,6 +271,12 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             break;
         case GGML_TYPE_NVFP4_KS:
             get_rows_cuda<QK_NVFP4/4, QR_NVFP4, dequantize_nvfp4_ks>(src0, src1, dst, src0_d, src1_i32, dst_d, stream);
+            break;
+        case GGML_TYPE_F8_E4M3_KS:
+            get_rows_cuda_float(src0, src1, dst, (const ggml_fp8_e4m3_t *)src0_d, src1_i32, dst_d, stream);
+            break;
+        case GGML_TYPE_F8_E4M3_B128:
+            get_rows_cuda_float(src0, src1, dst, (const ggml_cuda_f8_block *)src0_d, src1_i32, dst_d, stream);
             break;
         default:
             // TODO: k-quants

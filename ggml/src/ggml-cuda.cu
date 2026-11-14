@@ -5827,75 +5827,6 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         }
     }
 
-    bool has_f8_b128 = op->type == GGML_TYPE_F8_E4M3_B128;
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        has_f8_b128 = has_f8_b128 || (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3_B128);
-    }
-    if ((op->op == GGML_OP_MOE_FUSED_UP_GATE) &&
-        (op->src[0]->type == GGML_TYPE_F8_E4M3_KS || op->src[0]->type == GGML_TYPE_F8_E4M3_B128)) {
-        switch ((ggml_unary_op)op->op_params[0]) {
-            case GGML_UNARY_OP_SILU:
-            case GGML_UNARY_OP_RELU:
-            case GGML_UNARY_OP_GELU:
-            case GGML_UNARY_OP_SIGMOID:
-            case GGML_UNARY_OP_SWIGLU_OAI:
-                return (!op->src[1] || op->src[0]->type == op->src[1]->type) &&
-                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
-            default:
-                return false;
-        }
-    }
-    if (has_f8_b128) {
-        if (op->op == GGML_OP_CPY || op->op == GGML_OP_DUP || op->op == GGML_OP_CONT) {
-            return op->src[0]->type == GGML_TYPE_F8_E4M3_B128 &&
-                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                    op->type == GGML_TYPE_F8_E4M3_B128);
-        }
-        if (op->op == GGML_OP_GET_ROWS) {
-            return op->src[0]->type == GGML_TYPE_F8_E4M3_B128 && op->src[1]->type == GGML_TYPE_I32 &&
-                   op->op_params[0] == 0 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
-                   op->src[0]->nb[0] == 132 && op->src[1]->nb[0] == sizeof(int32_t);
-        }
-        if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
-            return op->src[0]->type == GGML_TYPE_F8_E4M3_B128 && op->src[0]->nb[0] == 132 &&
-                   op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   (op->op == GGML_OP_MUL_MAT_ID || op->src[0]->ne[3] == op->src[1]->ne[3]);
-        }
-        return op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW ||
-               op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE;
-    }
-
-    bool has_f8 = op->type == GGML_TYPE_F8_E4M3_KS;
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        has_f8 = has_f8 || (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3_KS);
-    }
-    if (has_f8) {
-        switch (op->op) {
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                return true;
-            case GGML_OP_CPY:
-            case GGML_OP_DUP:
-            case GGML_OP_CONT:
-                return op->src[0]->type == GGML_TYPE_F8_E4M3_KS &&
-                    (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
-                     op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F8_E4M3_KS);
-            case GGML_OP_GET_ROWS:
-                return op->src[0]->type == GGML_TYPE_F8_E4M3_KS && op->src[1]->type == GGML_TYPE_I32 &&
-                    op->op_params[0] == 0 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
-                    op->src[0]->nb[0] == 1 && op->src[1]->nb[0] == sizeof(int32_t);
-            case GGML_OP_MUL_MAT:
-            case GGML_OP_MUL_MAT_ID:
-                return op->src[0]->type == GGML_TYPE_F8_E4M3_KS && op->src[1]->type == GGML_TYPE_F32 &&
-                    op->type == GGML_TYPE_F32 && (op->op == GGML_OP_MUL_MAT_ID || op->src[0]->ne[3] == op->src[1]->ne[3]);
-            default:
-                return false;
-        }
-    }
-
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -6022,6 +5953,8 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_TQP5:
                     case GGML_TYPE_TQP6:
                     case GGML_TYPE_TQP7:
+                    case GGML_TYPE_F8_E4M3_KS:
+                    case GGML_TYPE_F8_E4M3_B128:
                         return true;
                     default:
                         return false;
@@ -6041,6 +5974,8 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_NVFP4_KS:
+                    case GGML_TYPE_F8_E4M3_KS:
+                    case GGML_TYPE_F8_E4M3_B128:
                         return true;
                     case GGML_TYPE_I32:
                         return op->src[0]->type == op->type;
@@ -6102,6 +6037,10 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 if (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_I32) {
                     // DSA lightning-indexer top_k indices (I32) copy/cont.
                     return true;
+                }
+                if (src0_type == GGML_TYPE_F8_E4M3_KS || src0_type == GGML_TYPE_F8_E4M3_B128) {
+                    return src1_type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                           ggml_are_same_shape(op->src[0], op->src[1]);
                 }
                 if (ggml_is_quantized(src0_type) && (src1_type == GGML_TYPE_F16 || src1_type == GGML_TYPE_F32)) {
                     return true;
