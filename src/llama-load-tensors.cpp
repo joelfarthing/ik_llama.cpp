@@ -6787,7 +6787,7 @@ bool create_tensors_helper::create_tensors() {
                     granularity_kq *= 2; wq_ne1 /= 2;
                 }
                 auto granularity_vo = hparams.n_embd_head_v(il) * gqa_ratio;
-                if (ggml_is_quantized(layer.wo->type)) {
+                if (ggml_blck_size(layer.wo->type) > 1) {
                     auto tt = ggml_internal_get_type_traits(layer.wo->type);
                     if (tt.blck_size > granularity_vo) granularity_vo = tt.blck_size;
                     GGML_ASSERT(granularity_vo % hparams.n_embd_head_v(il) == 0);
@@ -6956,11 +6956,7 @@ bool create_tensors_helper::create_tensors() {
                                  split_tensors.find(layer.ffn_gate) != split_tensors.end() &&
                                  split_tensors.find(layer.ffn_up)   != split_tensors.end();
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
-                    }
+                    int ffn_granularity = std::max<int>(16, ggml_blck_size(layer.ffn_down->type));
                     auto split = create_split(layer.ffn_down->ne[0], ffn_granularity, cur_splits, mem_used);
                     LLAMA_LOG_DEBUG("  split_ffn:"); for ([[maybe_unused]] auto s : split) LLAMA_LOG_DEBUG(" %d", s); LLAMA_LOG_DEBUG("\n");
                     prepare_split_tensors(0, ctx_split, layer.ffn_down, layer.split_ffn_down, split, mem_used);
@@ -6981,11 +6977,7 @@ bool create_tensors_helper::create_tensors() {
                 bool use_split = split_tensors.find(layer.ffn_down_exps) != split_tensors.end() && has_up_gate;
 
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down_exps->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down_exps->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
-                    }
+                    int ffn_granularity = std::max<int>(16, ggml_blck_size(layer.ffn_down_exps->type));
                     ffn_split = create_split(layer.ffn_down_exps->ne[0], ffn_granularity, cur_splits, mem_used);
                     LLAMA_LOG_DEBUG("  split_ffn_exps:"); for ([[maybe_unused]] auto s : ffn_split) LLAMA_LOG_DEBUG(" %d", s);
                     LLAMA_LOG_DEBUG("\n");
@@ -7027,11 +7019,7 @@ bool create_tensors_helper::create_tensors() {
                     throw std::runtime_error(format("split mode graph: layer %d has the shared experts overridden but not the routed experts", il));
                 }
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down_shexp->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down_shexp->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
-                    }
+                    int ffn_granularity = std::max<int>(16, ggml_blck_size(layer.ffn_down_shexp->type));
                     auto split = create_split(layer.ffn_down_shexp->ne[0], ffn_granularity, cur_splits, mem_used);
                     bool ok = true;
                     if (!ffn_split.empty()) {
