@@ -1649,8 +1649,6 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(ggml_fp8_e4m3_t),
         .is_quantized             = false,
         .to_float                 = ggml_fp8_e4m3_to_fp32_row,
-        .vec_dot                  = ggml_vec_dot_f8_e4m3,
-        .vec_dot_type             = GGML_TYPE_BF16,
         .nrows                    = 1,
     },
     [GGML_TYPE_F8_E4M3_B128] = {
