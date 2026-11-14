@@ -550,7 +550,6 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_IN: (
             "model.layers.{bid}.in_proj",
             "backbone.layers.{bid}.mixer.in_proj",
-            'model.layers.{bid}.linear_attn.in_proj_qkvz',
         ),
 
         MODEL_TENSOR.SSM_CONV1D: (
