@@ -603,20 +603,6 @@ static __global__ void f8_moe_scatter(const char * ids, const int32_t * counts, 
     if (id >= 0 && id < experts) rows[bounds[id]+counts[blockIdx.x*experts+id]+ranks[col]] = col;
 }
 
-template <typename T>
-static __global__ void f8_moe_zero_invalid(const char * ids, const int32_t * bounds, T * dst, float * up,
-        int rows, int slots, int tokens, int experts, size_t nb0, size_t nb1) {
-    if (bounds[experts] == slots*tokens) return;
-    for (int col = blockIdx.x; col < slots*tokens; col += gridDim.x) {
-        const int id = *(const int32_t *)(ids + size_t(col/slots)*nb1 + size_t(col%slots)*nb0);
-        if (id >= 0 && id < experts) continue;
-        for (int row = threadIdx.x; row < rows; row += blockDim.x) {
-            dst[size_t(col)*rows+row] = 0;
-            if (up) up[size_t(col)*rows+row] = 0;
-        }
-    }
-}
-
 template <int G = 0>
 static __global__ void f8_moe_convert(const char * src, f8_activation<G> * dst, const int32_t * rows, const int32_t * bounds,
         int experts, int n, int slots, int channels, size_t nb1, size_t nb2, float * activation_scales = nullptr) {

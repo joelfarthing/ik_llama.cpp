@@ -3436,9 +3436,6 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
     f8_moe_prefix<<<1,256,4*experts*sizeof(int32_t),stream>>>(counts, bounds, tiles, experts, chunks, wide ? 64 : 32, width_ug, 128);
     f8_moe_scatter<<<chunks,256,0,stream>>>((const char *)ids->data, counts, ranks, bounds, rows,
             ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
-    f8_moe_zero_invalid<<<std::min(cols, 128),256,0,stream>>>((const char *)ids->data, bounds,
-            (float *)(next ? next->data : dst->data), gate && !next ? up : nullptr, (next ? next : dst)->ne[0],
-            ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
     auto run = [&](const float * scales) {
         auto multiply = [&](const ggml_tensor * w, const ggml_tensor * bias, float * output, int n, int m,
                 const f8_activation<G> * acts, const float * act_scales, int mode = 0, uint8_t * codes = nullptr, float * out_scales = nullptr) {
@@ -3475,10 +3472,6 @@ static bool ggml_cuda_mul_mat_f8_id_impl(ggml_backend_cuda_context & ctx, const 
                             bias_up ? (const char *)bias_up->data : nullptr, bias_up ? bias_up->nb[1] : 0, nullptr, nullptr, nullptr, false};
                     const ggml_tensor * down = next->src[0];
                     f8_moe_routing dn{rows, bounds, tiles_dn, experts, down->nb[1], down->nb[2], nullptr, 0, nullptr, nullptr, nullptr, false};
-                    if (narrow && *narrow) {
-                        f8_moe_zero_invalid<<<std::min(cols, 128),256,0,stream>>>((const char *)ids->data, bounds, (uint16_t *)*narrow,
-                                nullptr, next->ne[0], ids->ne[0], ids->ne[1], experts, ids->nb[0], ids->nb[1]);
-                    }
                     if (blocked) {
                         if (launch_f8_tma<4, true, true>(n, m, cols, (const char *)weight->data, (const char *)gate->data, activations.get(), scales, n/128,
                                     nullptr, nullptr, codes.get(), out_scales.get(), out_stride, ug,
