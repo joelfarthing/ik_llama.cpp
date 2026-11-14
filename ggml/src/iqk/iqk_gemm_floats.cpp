@@ -1262,10 +1262,7 @@ void mul_mat_f8_b128_bf16(int n, const void * vx, size_t bx, const DataInfo& inf
             for (int row = 0; row < nx; ++row) {
                 const auto * x = (const uint8_t *)vx + (ix + row)*bx + ib*132;
                 memcpy(scale + row, x, sizeof(float));
-                for (int i = 0; i < 128; i += 16) {
-                    const auto values = F8::decode(x + 4 + i);
-                    for (int j = 0; j < 4; ++j) vst1_u16(weights[row] + i + 4*j, vshrn_n_u32(vreinterpretq_u32_f32(values.val[j]), 16));
-                }
+                for (int i = 0; i < 128; i += 16) F8::decode_bf16(x + 4 + i, weights[row] + i);
             }
             if constexpr (nrc_y == 8) {
                 mul_mat_Qx_Qy_T<F8QF32<4>, QBF16>(128, weights, sizeof(weights[0]), local, nx);
