@@ -1781,12 +1781,31 @@ static bool llama_kv_cache_init(
     }
 
 
+    auto can_store = [&backends = ctx->backends](ggml_backend_buffer_type_t buft, ggml_type type) {
+        ggml_init_params params = { 4*ggml_tensor_overhead(), nullptr, true };
+        ggml_context * ctx_op = ggml_init(params);
+        ggml_tensor * op = ggml_cpy(ctx_op, ggml_new_tensor_1d(ctx_op, GGML_TYPE_F32, 256), ggml_new_tensor_1d(ctx_op, type, 256));
+        bool ok = false;
+        for (auto * backend : backends) {
+            if (ggml_backend_supports_buft(backend, buft)) {
+                ok = ggml_backend_supports_op(backend, op);
+                break;
+            }
+        }
+        ggml_free(ctx_op);
+        return ok;
+    };
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
         ggml_context * ctx = it.second;
         int ntensor = 0;
         for (auto t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_Q8_KV && !ggml_backend_buft_is_host(buft) && !can_store(buft, t->type)) {
+                LLAMA_LOG_ERROR("%s: the backend of %s cannot store a Q8_KV cache\n", __func__, t->name);
+                return false;
+            }
             ++ntensor;
         }
         if (ntensor > 0) {
