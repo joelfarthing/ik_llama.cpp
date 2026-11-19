@@ -4170,7 +4170,7 @@ void quantize_row_iq6_k_impl(const float * x, void * vy, int n_per_row, const fl
 
 #ifdef __AVX2__
         for (int ib = 0; ib < QK_K/16; ++ib) {
-            auto [d, _, is_shifted] = find_best_scale_avx2<16, 248>(64, iq6nl_values, f_values, k_simple_index_iq6nl, xbl + ib*16,
+            auto [d, _, is_shifted] = find_best_scale_avx2<16, 247>(64, iq6nl_values, f_values, k_simple_index_iq6nl, xbl + ib*16,
                     quant_weights ? quant_weights + QK_K*ibl + 16*ib : nullptr, sigma2, ntry); // , true, 1.0f, true) -> corresponds to not AVX2, but not really better.
             scales[ib] = d;
             if (is_shifted) extra |= (1 << ib);
