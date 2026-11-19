@@ -290,7 +290,6 @@ static inline int num_rows([[maybe_unused]] ggml_type type) {
         case GGML_TYPE_IQ4_XS_R8:
         case GGML_TYPE_Q4_K_R4:
         case GGML_TYPE_Q5_K_R4:
-        case GGML_TYPE_Q8_KV:
         case GGML_TYPE_Q8_KV_R8:
         case GGML_TYPE_Q8_K_R8:
         case GGML_TYPE_Q2_0_R8: return 8;
@@ -328,7 +327,6 @@ static inline int num_rows([[maybe_unused]] ggml_type type) {
         case GGML_TYPE_IQ4_XS_R8:
         case GGML_TYPE_Q4_0_R8:
         case GGML_TYPE_Q8_0_R8:
-        case GGML_TYPE_Q8_KV:
         case GGML_TYPE_Q8_KV_R8:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_Q8_K_R8:
