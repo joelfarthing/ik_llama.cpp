@@ -990,10 +990,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     }
 
     if (np == 1 || threadIdx.y % np == 0) {
-        // The first 2*2*gridDim.x*ncols floats in dstk_fixup are for storing max. values and row sums.
-        // The values after that are for the partial results of the individual blocks.
-        float2 * dstk_fixup_data = dstk_fixup + gridDim.x*(2*ncols) + blockIdx.x*(ncols*(D/2));
-
 #pragma unroll
         for (int stride_k : {WARP_SIZE, WARP_SIZE/2, WARP_SIZE/4}) {
             const int k0_start  = stride_k == WARP_SIZE ? 0 : D/2 - (D/2) % (2*stride_k);
@@ -1042,6 +1038,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     }
 
                     if (is_fixup) {
+                        // The first 2*2*gridDim.x*ncols floats in dstk_fixup are for storing max. values and row sums.
+                        // The values after that are for the partial results of the individual blocks.
+                        float2 * dstk_fixup_data = dstk_fixup + gridDim.x*(2*ncols) + blockIdx.x*(ncols*(D/2));
                         dstk_fixup_data[jc_dst*(D/2) + k] = dstk_val;
                     } else {
                         dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(D/2) + k] = dstk_val;
@@ -1572,7 +1571,9 @@ void launch_fattn_mma(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        dst_tmp_meta.alloc(((size_t) blocks_num.x) * ncols * (2 + D/2));
+        if (use_stream_k) {
+            dst_tmp_meta.alloc(((size_t) blocks_num.x) * ncols * (2 + D/2));
+        }
     } else {
         GGML_ASSERT(K->ne[1] % KQ_row_granularity == 0);
         const int ntiles_KQ = K->ne[1] / KQ_row_granularity; // Max. number of parallel blocks limited by tensor size.

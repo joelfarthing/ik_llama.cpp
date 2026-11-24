@@ -1535,10 +1535,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         __syncthreads();
 
         if (np == 1 || threadIdx.y % np == 0) {
-            // The first 2*2*gridDim.x*ncols floats in dstk_fixup are for storing max. values and row sums.
-            // The values after that are for the partial results of the individual blocks.
-            float2 * dstk_fixup_data = dstk_fixup + gridDim.x*(2*ncols) + blockIdx.x*(ncols*(DV/2));
-
 #pragma unroll
             for (int stride_k : {WARP_SIZE, WARP_SIZE/2, WARP_SIZE/4}) {
                 const int k0_start  = stride_k == WARP_SIZE ? 0 : nbatch_combine - nbatch_combine % (2*stride_k);
@@ -1587,6 +1583,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         }
 
                         if (is_fixup) {
+                            // The first 2*2*gridDim.x*ncols floats in dstk_fixup are for storing max. values and row sums.
+                            // The values after that are for the partial results of the individual blocks.
+                            float2 * dstk_fixup_data = dstk_fixup + gridDim.x*(2*ncols) + blockIdx.x*(ncols*(DV/2));
                             dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = dstk_val;
                         } else {
                             dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k] = dstk_val;
@@ -2140,19 +2139,22 @@ static void launch_fattn_new_mma(
     dim3 blocks_num;
     if (stream_k) {
         // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
-        const int max_blocks = max_blocks_per_sm*nsm;
+        const bool check_ada_tiles = cc >= CC_ADA_LOVELACE && Q->ne[1] > 1 && K->ne[2] > 1;
+        const int max_blocks = max_blocks_per_sm * (check_ada_tiles ? nsm_actual : nsm);
         const int tiles_nwaves = (ntiles_total + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_total / (max_blocks*tiles_nwaves);
 
-        const int nblocks_stream_k = max_blocks;
+        const int nblocks_stream_k = max_blocks_per_sm*nsm;
 
-        const bool use_stream_k = cc >= CC_ADA_LOVELACE || tiles_efficiency_percent < 75;
+        const bool use_stream_k = (cc >= CC_ADA_LOVELACE && !check_ada_tiles) || tiles_efficiency_percent < 75;
 
         blocks_num.x = use_stream_k ? nblocks_stream_k : ntiles_total;
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        dst_tmp_meta.alloc(((size_t) blocks_num.x) * ncols * (2 + DV/2));
+        if (use_stream_k) {
+            dst_tmp_meta.alloc(((size_t) blocks_num.x) * ncols * (2 + DV/2));
+        }
     } else {
         GGML_ASSERT(K->ne[1] % KQ_row_granularity == 0);
         const int ntiles_KQ = n_kv / KQ_row_granularity; // Max. number of parallel blocks limited by tensor size.
