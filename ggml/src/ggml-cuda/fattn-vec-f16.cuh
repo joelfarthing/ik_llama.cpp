@@ -6,6 +6,7 @@
 //
 
 #include "common.cuh"
+#include "fattn-rel-bias-col.cuh"
 #include "fattn-vec-common.cuh"
 
 template<int Dk, int Dv, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool use_rel_bias> // Dk, Dv == K, V head sizes
@@ -195,6 +196,12 @@ static __global__ void flash_attn_vec_ext_f16(
     //if (KV_min_max && threadIdx.x == 0 && head == 0) {
     //    printf("gridDims = %u, %u, %u, ncols = %d, head = %d, blockIdx.x = %d, blockIdx.y = %d, bounds = %d, %d, ne11 = %d, nb11 = %d, blockIdx.y*Dk = %d\n", gridDim.x, gridDim.y, gridDim.z, ncols, head, blockIdx.x, blockIdx.y, KV_min_max[sequence*gridDim.x + blockIdx.x].x, KV_min_max[sequence*gridDim.x + blockIdx.x].y, ne11, nb11, blockIdx.y*Dk);
     //}
+    __shared__ float bias_shared[use_rel_bias ? ncols*Dk : 1];
+    fattn_rel_bias_column rb_col[ncols];
+    if constexpr (use_rel_bias) {
+        fattn_rel_bias_cols(rel_bias, rb_col, ic0, 1, ne01, head);
+    }
+
     K     += (first_y + blockIdx.y*Dk) * nb11;
     V     += (first_y + blockIdx.y*Dk) * nb21;
     maskh += (first_y + blockIdx.y*Dk);
@@ -217,6 +224,11 @@ static __global__ void flash_attn_vec_ext_f16(
             for (int j = 0; j < ncols; ++j) {
                 maskh_shared[j*Dk + tid] = slopeh*maskh[j*ne11 + tid];
             }
+        }
+        if constexpr (use_rel_bias) {
+            fattn_rel_bias_fill_tile(rel_bias, rb_col, k_VKQ_0, Dk, bias_shared, Dk, tid, Dk);
+        }
+        if (use_rel_bias || mask) {
             __syncthreads();
         }
 
@@ -240,8 +252,7 @@ static __global__ void flash_attn_vec_ext_f16(
                 sum += maskh_shared[j*Dk + i_KQ];
 
                 if constexpr (use_rel_bias) {
-                    const int iq = ic0 + j < ne01 ? ic0 + j : ne01 - 1;
-                    sum = __float2half(__half2float(sum) + rel_bias.get(iq, head, k_VKQ_0 + i_KQ));
+                    sum = __float2half(__half2float(sum) + bias_shared[j*Dk + i_KQ]);
                 }
 
                 if (ncols == 1) {

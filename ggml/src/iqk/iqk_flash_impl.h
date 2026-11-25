@@ -10,16 +10,24 @@
 #include <cstddef>
 
 struct IQKRelBias {
-    const float * table;
+    const float * rs;
+    const float * w;
     const int32_t * pos_q;
     const int32_t * pos_k;
     size_t row_stride;
+    int rs_stride;
+    int w_stride;
+    int distance_stride;
     int pos_q_stride;
-    int32_t max_distance;
+    int pos_k_stride;
+    int kd;
+    uint32_t last;
     int key_offset = 0;
 
+    inline float dot(const float * row, int distance) const;
+
     void advance_rows(int n) {
-        table += n*row_stride;
+        rs += n*row_stride;
         pos_q += n*pos_q_stride;
     }
 };

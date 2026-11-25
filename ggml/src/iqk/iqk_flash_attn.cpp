@@ -269,10 +269,11 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     if (type_q != 0 || type_mask != 1 || max_bias > 0) return false;
 
     auto indexer = dst->src[5];
-    auto table = dst->src[6];
+    auto rs = dst->src[6];
     auto pos_q = dst->src[7];
     auto pos_k = dst->src[8];
-    if (table && (Dk != 128 || Dv != 128)) return false;
+    auto w = dst->src[9];
+    if (rs && (Dk != 128 || Dv != 128)) return false;
 
     if (indexer && indexer->type == GGML_TYPE_I32) {
         // an unsupported K/V type must reach the abort below, as without the indexer, not the generic indexer path
@@ -413,8 +414,8 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
         }
     }
 
-    if (auto type_k = ggml_type(int_type_k_in), type_v = ggml_type(int_type_v); !are_kv_types_supported(type_k, type_v, table != nullptr)) {
-        if (table) return false;
+    if (auto type_k = ggml_type(int_type_k_in), type_v = ggml_type(int_type_v); !are_kv_types_supported(type_k, type_v, rs != nullptr)) {
+        if (rs) return false;
         if (ith == 0) {
             fprintf(stderr, "\n==================== K cache %s coupled with V cache %s is not a supported combination on the CPU backend.\n",
                     ggml_type_name(type_k), ggml_type_name(type_v));
@@ -435,6 +436,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
         GGML_ABORT("Fatal error");
     }
 
+    const int pos_k_stride = pos_k ? int(pos_k->nb[0]/sizeof(int32_t)) : 0;
     auto key_positions = pos_k ? (const int32_t *)pos_k->data : nullptr;
     if (n_swa > 0 && mask) {
         constexpr int kMinBatch = 256;
@@ -445,7 +447,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             k = (const char *)k + int64_t(first)*stride_k;
             v = (const char *)v + int64_t(first)*stride_v;
             mask = (const uint16_t *)mask + first;
-            if (key_positions) key_positions += first;
+            if (key_positions) key_positions += first*pos_k_stride;
             nek1 -= first;
         }
     }
@@ -456,7 +458,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     int rv3 = neq3/nev3;
 
     int first_k = 0, last_k = nek1;
-    if (neq3 == 1 && rk2 > 1 && neq1 == 1 && (nek1 > 256 || table) && mask) {
+    if (neq3 == 1 && rk2 > 1 && neq1 == 1 && (nek1 > 256 || rs) && mask) {
         // This is a quick hack for SWA models.
         // Given that the mask is the same for all layers, ideally we should determine the
         // cache bounds once, and reuse for the whole graph. But even with this simple hack
@@ -481,16 +483,19 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             k = (const void *)((const char *)k + first_k*stride_k);
             v = (const void *)((const char *)v + first_k*stride_v);
             mask = (const void *)((const uint16_t *)mask + first_k);
-            if (key_positions) key_positions += first_k;
+            if (key_positions) key_positions += first_k*pos_k_stride;
             nek1 = last_k - first_k;
         }
     }
 
     auto bias_for = [&](int row, int head, int key, bool packed_heads) -> IQKRelBias {
-        if (!table) return {};
-        auto data = (const char *)table->data + row*table->nb[2] + head*table->nb[1];
-        return {(const float *)data, (const int32_t *)pos_q->data + row, key_positions + key,
-                table->nb[packed_heads ? 1 : 2]/sizeof(float), packed_heads ? 0 : 1, int32_t(table->ne[0] - 1)};
+        if (!rs) return {};
+        auto data = (const char *)rs->data + row*rs->nb[2] + head*rs->nb[1];
+        const int pos_q_stride = int(pos_q->nb[0]/sizeof(int32_t));
+        return {(const float *)data, (const float *)w->data, (const int32_t *)pos_q->data + row*pos_q_stride,
+                key_positions + key*pos_k_stride, rs->nb[packed_heads ? 1 : 2]/sizeof(float),
+                int(rs->nb[0]/sizeof(float)), int(w->nb[0]/sizeof(float)), int(w->nb[1]/sizeof(float)),
+                packed_heads ? 0 : pos_q_stride, pos_k_stride, int(rs->ne[0]), uint32_t(w->ne[1] - 1)};
     };
 
     int int_type_k = int_type_k_in;
@@ -520,7 +525,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     // (especially when combining the results from the threads).
     // So, for now, making it work just for MLA (nek2 = 1).
     // I think it would also speed up things for GQA, but I'm leaving this for another day.
-    if (neq3 == 1 && rk2 > 1 && neq1 == 1 && nth >= 1 && nek1/32 > 1 && nek2 == 1 && !(table && sinks)) {
+    if (neq3 == 1 && rk2 > 1 && neq1 == 1 && nth >= 1 && nek1/32 > 1 && nek2 == 1 && !(rs && sinks)) {
         int nstep_k = nek1/32;
         if (nstep_k >= 4*nth) {
             int nstep_k_per_thread = (nstep_k + nth - 1)/nth;

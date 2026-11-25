@@ -6,6 +6,7 @@
 //
 
 #include "common.cuh"
+#include "fattn-rel-bias-col.cuh"
 #include "fattn-common.cuh"
 
 #ifdef FP16_MMA_AVAILABLE
@@ -192,6 +193,11 @@ static __global__ void flash_attn_ext_f16(
 
     __syncthreads();
 
+    fattn_rel_bias_column rb_col[ncols/nwarps];
+    if constexpr (use_rel_bias) {
+        fattn_rel_bias_cols(rel_bias, rb_col, ic0 + threadIdx.y, nwarps, ne01, blockIdx.y);
+    }
+
     // Iterate over ne11 == previous tokens:
     for (int k_VKQ_0 = ip*FATTN_KQ_STRIDE; k_VKQ_0 < ne11; k_VKQ_0 += parallel_blocks*FATTN_KQ_STRIDE) {
         // Calculate tile of KQ:
@@ -244,8 +250,7 @@ static __global__ void flash_attn_ext_f16(
 
                     KQ_f_tmp[k0/WARP_SIZE] += mask ? __half2float(slopeh*maskh[j*(nb31/sizeof(half)) + k_VKQ_0 + k]) : 0.0f;
                     if constexpr (use_rel_bias) {
-                        const int iq = ic0 + j < ne01 ? ic0 + j : ne01 - 1;
-                        KQ_f_tmp[k0/WARP_SIZE] += rel_bias.get(iq, blockIdx.y, k_VKQ_0 + k);
+                        KQ_f_tmp[k0/WARP_SIZE] += fattn_rel_bias_get(rel_bias, rb_col[j0/nwarps], k_VKQ_0 + k);
                     }
                     KQ_max_new = max(KQ_max_new, KQ_f_tmp[k0/WARP_SIZE]);
                 }
@@ -301,12 +306,11 @@ static __global__ void flash_attn_ext_f16(
 
                     KQ2_tmp[k0/WARP_SIZE] += mask ? slope2*mask2[j*(nb31/sizeof(half2)) + k_VKQ_0/2 + k] : make_half2(0.0f, 0.0f);
                     if constexpr (use_rel_bias) {
-                        const int iq = ic0 + j < ne01 ? ic0 + j : ne01 - 1;
                         const int ik = k_VKQ_0 + 2*k;
                         const float2 score = __half22float2(KQ2_tmp[k0/WARP_SIZE]);
                         KQ2_tmp[k0/WARP_SIZE] = make_half2(
-                            score.x + rel_bias.get(iq, blockIdx.y, ik),
-                            score.y + rel_bias.get(iq, blockIdx.y, ik + 1));
+                            score.x + fattn_rel_bias_get(rel_bias, rb_col[j0/nwarps], ik),
+                            score.y + fattn_rel_bias_get(rel_bias, rb_col[j0/nwarps], ik + 1));
                     }
                     KQ_max_new = ggml_cuda_hmax2(KQ_max_new, KQ2_tmp[k0/WARP_SIZE]);
                 }

@@ -6,6 +6,7 @@
 //
 
 #include "common.cuh"
+#include "fattn-rel-bias-col.cuh"
 #include "fattn-common.cuh"
 #include "fattn-tile-f32.cuh"
 
@@ -140,6 +141,11 @@ static __global__ void flash_attn_tile_ext_f32(
 
     __syncthreads();
 
+    fattn_rel_bias_column rb_col[ncols/nwarps];
+    if constexpr (use_rel_bias) {
+        fattn_rel_bias_cols(rel_bias, rb_col, ic0 + threadIdx.y, nwarps, ne01, blockIdx.y);
+    }
+
     const int k_start = parallel_blocks == 1 ? 0 : ip*FATTN_KQ_STRIDE_TILE_F32;
     for (int k_VKQ_0 = k_start; k_VKQ_0 < ne11; k_VKQ_0 += parallel_blocks*FATTN_KQ_STRIDE_TILE_F32) {
         // Calculate KQ tile and keep track of new maximum KQ values:
@@ -213,8 +219,7 @@ static __global__ void flash_attn_tile_ext_f32(
 
                 sum[i_KQ_0/WARP_SIZE][j_KQ_0/nwarps] += mask ? slope*__half2float(maskh[j_KQ*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
                 if constexpr (use_rel_bias) {
-                    const int iq = ic0 + j_KQ < ne01 ? ic0 + j_KQ : ne01 - 1;
-                    sum[i_KQ_0/WARP_SIZE][j_KQ_0/nwarps] += rel_bias.get(iq, blockIdx.y, k_VKQ_0 + i_KQ);
+                    sum[i_KQ_0/WARP_SIZE][j_KQ_0/nwarps] += fattn_rel_bias_get(rel_bias, rb_col[j_KQ_0/nwarps], k_VKQ_0 + i_KQ);
                 }
 
                 kqmax_new[j_KQ_0/nwarps] = fmaxf(kqmax_new[j_KQ_0/nwarps], sum[i_KQ_0/WARP_SIZE][j_KQ_0/nwarps]);

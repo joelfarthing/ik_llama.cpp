@@ -6,6 +6,7 @@
 //
 
 #include "common.cuh"
+#include "fattn-rel-bias-col.cuh"
 #include "fattn-common.cuh"
 #include "fattn-tile-f16.cuh"
 
@@ -117,6 +118,11 @@ static __global__ void flash_attn_tile_ext_f16(
 
     __syncthreads();
 
+    fattn_rel_bias_column rb_col[ncols/nwarps];
+    if constexpr (use_rel_bias) {
+        fattn_rel_bias_cols(rel_bias, rb_col, ic0 + threadIdx.y, nwarps, ne01, blockIdx.y);
+    }
+
     const int k_start = parallel_blocks == 1 ? 0 : ip*FATTN_KQ_STRIDE_TILE_F16;
     for (int k_VKQ_0 = k_start; k_VKQ_0 < ne11; k_VKQ_0 += parallel_blocks*FATTN_KQ_STRIDE_TILE_F16) {
         // Calculate KQ tile and keep track of new maximum KQ values:
@@ -187,8 +193,7 @@ static __global__ void flash_attn_tile_ext_f16(
                 }
                 sum += mask ? slopeh*maskh[j_KQ*stride_mask + k_VKQ_0 + i_KQ] : __float2half(0.0f);
                 if constexpr (use_rel_bias) {
-                    const int iq = ic0 + j_KQ < ne01 ? ic0 + j_KQ : ne01 - 1;
-                    sum = __float2half(__half2float(sum) + rel_bias.get(iq, blockIdx.y, k_VKQ_0 + i_KQ));
+                    sum = __float2half(__half2float(sum) + fattn_rel_bias_get(rel_bias, rb_col[j_KQ_0/nwarps], k_VKQ_0 + i_KQ));
                 }
 
                 kqmax_new[j_KQ_0/nwarps] = ggml_cuda_hmax(kqmax_new[j_KQ_0/nwarps], sum);
@@ -509,6 +514,11 @@ static __global__ void flash_attn_tile_ext_f16_fabsum(
 
     __syncthreads();
 
+    fattn_rel_bias_column rb_col[ncols/nwarps];
+    if constexpr (use_rel_bias) {
+        fattn_rel_bias_cols(rel_bias, rb_col, ic0 + threadIdx.y, nwarps, ne01, blockIdx.y);
+    }
+
     const int k_start = parallel_blocks == 1 ? 0 : ip*FATTN_KQ_STRIDE_TILE_F16;
     for (int k_VKQ_0 = k_start; k_VKQ_0 < ne11; k_VKQ_0 += parallel_blocks*FATTN_KQ_STRIDE_TILE_F16) {
         // Calculate KQ tile and keep track of new maximum KQ values:
@@ -589,8 +599,7 @@ static __global__ void flash_attn_tile_ext_f16_fabsum(
                 }
                 sum += mask ? slopef*__half2float(maskh[j_KQ*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
                 if constexpr (use_rel_bias) {
-                    const int iq = ic0 + j_KQ < ne01 ? ic0 + j_KQ : ne01 - 1;
-                    sum += rel_bias.get(iq, blockIdx.y, k_VKQ_0 + i_KQ);
+                    sum += fattn_rel_bias_get(rel_bias, rb_col[j_KQ_0/nwarps], k_VKQ_0 + i_KQ);
                 }
 
                 kqmax_new[j_KQ_0/nwarps] = fmaxf(kqmax_new[j_KQ_0/nwarps], sum);

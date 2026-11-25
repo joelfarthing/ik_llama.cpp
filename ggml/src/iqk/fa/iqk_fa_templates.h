@@ -31,6 +31,30 @@
 
 // clang-format off
 
+inline float IQKRelBias::dot(const float * row, int distance) const {
+    const float * weight = w + size_t(distance)*distance_stride;
+    if (rs_stride == 1 && w_stride == 1 && kd%4 == 0) {
+#ifdef __AVX2__
+        auto sum = _mm_setzero_ps();
+        for (int d = 0; d < kd; d += 4) {
+            sum = _mm_fmadd_ps(_mm_loadu_ps(row + d), _mm_loadu_ps(weight + d), sum);
+        }
+        return hsum_float_4(sum);
+#else
+        auto sum = vdupq_n_f32(0.0f);
+        for (int d = 0; d < kd; d += 4) {
+            sum = vfmaq_f32(sum, vld1q_f32(row + d), vld1q_f32(weight + d));
+        }
+        return vaddvq_f32(sum);
+#endif
+    }
+    float sum = 0.0f;
+    for (int d = 0; d < kd; ++d) {
+        sum += row[d*rs_stride] * weight[d*w_stride];
+    }
+    return sum;
+}
+
 namespace {
 
 // Compute effective K boundary by scanning ALL query rows (union-of-masks).
@@ -743,8 +767,16 @@ struct NoRelBias {
     void advance_rows(int) {}
 };
 
+template <int q_step, typename Bias>
+struct RelBiasTail {
+    float tail[q_step];
+};
+
+template <int q_step>
+struct RelBiasTail<q_step, NoRelBias> {};
+
 template <int q_step_in, int k_step_in, typename Bias>
-struct FlashMS : Bias {
+struct FlashMS : Bias, RelBiasTail<q_step_in, Bias> {
     constexpr static int q_step = q_step_in;
     constexpr static int k_step = k_step_in;
 // Something goes wrong when storing and manipulating K*Q as fp16.
@@ -761,12 +793,12 @@ struct FlashMS : Bias {
     FlashMS(float scale, float softcap, Bias bias) : Bias(bias), vscale(F16::set1(scale)), softcap(softcap), h_inf(GGML_FP32_TO_FP16(-INFINITY)) {}
 
     inline void load_bias(int j, float * values) const {
-        const float * row = this->table + j*this->row_stride;
+        const float * row = this->rs + j*this->row_stride;
         const int32_t q = this->pos_q[j*this->pos_q_stride];
         for (int i = 0; i < k_step; ++i) {
-            const int32_t k = this->pos_k[this->key_offset + i];
-            const int32_t distance = q >= k ? int32_t(std::min(uint32_t(q) - uint32_t(k), uint32_t(this->max_distance))) : this->max_distance;
-            values[i] = row[distance];
+            const int32_t k = this->pos_k[(this->key_offset + i)*this->pos_k_stride];
+            const uint32_t delta = uint32_t(q) - uint32_t(k);
+            values[i] = q >= k && delta < this->last ? this->dot(row, delta) : this->tail[j];
         }
     }
 
@@ -774,7 +806,12 @@ struct FlashMS : Bias {
         if constexpr (!std::is_same_v<Bias, NoRelBias>) this->key_offset = offset;
     }
 
-    inline void init_qstep() {
+    inline void init_qstep(int n = q_step) {
+        if constexpr (!std::is_same_v<Bias, NoRelBias>) {
+            for (int j = 0; j < n; ++j) {
+                this->tail[j] = this->dot(this->rs + j*this->row_stride, this->last);
+            }
+        }
         for (int j = 0; j < q_step; ++j) {
             S[j] = 0; M[j] = -INFINITY;
         }
@@ -1447,7 +1484,7 @@ void compute_helper(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, in
     }
     int n_left = nq1 - q_step*(nq1/q_step);
     if (n_left > 0) {
-        fms.init_qstep();
+        fms.init_qstep(n_left);
         kh.reset_block();
         vh.reset_block();
 #ifdef __aarch64__
@@ -1553,7 +1590,7 @@ void compute_helper_q(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, 
     }
     int n_left = nq1 - q_step*(nq1/q_step);
     if (n_left > 0) {
-        fms.init_qstep();
+        fms.init_qstep(n_left);
         kh.reset_block();
         vh.reset_block();
         HelperQ80::convert<Dk>(n_left, stride_q, q, q8);
@@ -2078,7 +2115,7 @@ struct FlashAttnBF16 {
         }
         int n_left = nq1 - q_step*(nq1/q_step);
         if (n_left > 0) {
-            fms.init_qstep();
+            fms.init_qstep(n_left);
             kh.reset_block();
             vh.reset_block();
             FlashQKbf16<Dk, q_step, k_step, Bias>::convert(n_left, stride_q, q, q_bf16);
