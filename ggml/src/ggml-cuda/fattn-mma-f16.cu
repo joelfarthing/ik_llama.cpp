@@ -159,7 +159,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
             const ggml_tensor * V = dst->src[2];
             // With fewer K/V rows the conversion to f16 can be faster.
             constexpr int min_rows_unpack = 8192;
-            if (Q->ne[1] == 1 && ggml_nrows(K) >= min_rows_unpack && K->type == V->type &&
+            if ((dst->src[6] || (Q->ne[1] == 1 && ggml_nrows(K) >= min_rows_unpack)) && K->type == V->type &&
                     (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) &&
                     cp_async_available(ggml_cuda_info().devices[ctx.device].cc)) {
                 if (K->type == GGML_TYPE_Q8_0) {
