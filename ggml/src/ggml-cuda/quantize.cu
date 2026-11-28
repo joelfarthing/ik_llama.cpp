@@ -83,8 +83,8 @@ static __global__ void quantize_q8_1(const float * __restrict__ x, void * __rest
 }
 
 template <mmq_q8_1_ds_layout ds_layout>
-static __global__ void quantize_mmq_q8_1(
-    const float * __restrict__ x, void * __restrict__ vy, const int64_t kx0, const int64_t kx1, const int64_t kx0_padded) {
+static __device__ __forceinline__ void quantize_mmq_q8_1_row(
+    const float * __restrict__ x, void * __restrict__ vy, const int64_t kx0, const int64_t kx1, const int64_t kx0_padded, const int64_t i1) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -97,12 +97,12 @@ static __global__ void quantize_mmq_q8_1(
 
     const float4 * x4 = (const float4 *) x;
 
-    const int64_t ix1 = kx1*blockIdx.z + blockIdx.y;
+    const int64_t ix1 = kx1*blockIdx.z + i1;
 
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
 
-    const int64_t ib0 = blockIdx.z*((int64_t)gridDim.y*gridDim.x*blockDim.x/QK8_1); // first block of channel
-    const int64_t ib  = ib0 + (ix0 / (4*QK8_1))*kx1 + blockIdx.y;                   // block index in channel
+    const int64_t ib0 = blockIdx.z*(kx1*gridDim.x*blockDim.x/QK8_1);                // first block of channel
+    const int64_t ib  = ib0 + (ix0 / (4*QK8_1))*kx1 + i1;                           // block index in channel
     const int64_t iqs = ix0 % (4*QK8_1);                                            // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
@@ -167,6 +167,14 @@ static __global__ void quantize_mmq_q8_1(
         y[ib].ds4[iqs/32] = make_half2(d, sum);
     } else {
         y[ib].d4[iqs/32]  = d;
+    }
+}
+
+template <mmq_q8_1_ds_layout ds_layout>
+static __global__ void quantize_mmq_q8_1(
+    const float * __restrict__ x, void * __restrict__ vy, const int64_t kx0, const int64_t kx1, const int64_t kx0_padded) {
+    for (int64_t i1 = blockIdx.y; i1 < kx1; i1 += gridDim.y) {
+        quantize_mmq_q8_1_row<ds_layout>(x, vy, kx0, kx1, kx0_padded, i1);
     }
 }
 
@@ -283,7 +291,7 @@ void quantize_mmq_q8_1_cuda(
     GGML_ASSERT(kx0_padded % (4*QK8_1) == 0);
 
     const int64_t block_num_x = (kx0_padded + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
-    const dim3 num_blocks(block_num_x, kx1, channels);
+    const dim3 num_blocks(block_num_x, std::min<int64_t>(kx1, 65535), channels);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_x)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
